@@ -8,3 +8,4 @@ wgpu = "29.0.1"
 # pollster = "0.3"
 bytemuck = { version = "1.25.0", features = ["derive"] }
 pollster = "0.4.0"
+winit = "0.29.0"

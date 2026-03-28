@@ -1,16 +1,19 @@
 use bytemuck::{Pod, Zeroable};
+use winit::{
+    event::*,
+    event_loop::EventLoop,
+    keyboard::{KeyCode, PhysicalKey},
+    window::Window,
+};
 
 const WIDTH: u32 = 8;
 const HEIGHT: u32 = 8;
 const F: u32 = 4;
-const STEPS: u32 = 4;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Uniforms {
-    current: u32,
-    history_len: u32,
-    _pad: [u32; 2],
+    _pad: [u32; 4],
 }
 
 fn main() {
@@ -18,148 +21,73 @@ fn main() {
 }
 
 async fn run() {
+    // ---------- window ----------
+    let event_loop = EventLoop::new().unwrap();
+    let window = Window::new(&event_loop).unwrap();
+
+    // ---------- wgpu ----------
     let instance = wgpu::Instance::default();
+    let surface = instance.create_surface(&window).unwrap();
+
     let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions::default())
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            compatible_surface: Some(&surface),
+            ..Default::default()
+        })
         .await
-        .expect("failed to get adapter");
+        .unwrap();
 
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor::default())
         .await
-        .expect("failed to create device");
+        .unwrap();
 
-    // Read-only history ring: F layers
-    let history = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("history"),
-        size: wgpu::Extent3d {
-            width: WIDTH,
-            height: HEIGHT,
-            depth_or_array_layers: F,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::R32Uint,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::COPY_SRC
-            | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
+    let caps = surface.get_capabilities(&adapter);
+    let format = caps.formats[0];
 
-    // Single scratch output for compute writes
-    let scratch = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("scratch"),
-        size: wgpu::Extent3d {
-            width: WIDTH,
-            height: HEIGHT,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::R32Uint,
-        usage: wgpu::TextureUsages::STORAGE_BINDING
-            | wgpu::TextureUsages::COPY_SRC
-            | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
+    let size = window.inner_size();
 
-    let history_full_view = history.create_view(&wgpu::TextureViewDescriptor {
-        label: Some("history_full_view"),
-        dimension: Some(wgpu::TextureViewDimension::D2Array),
-        ..Default::default()
-    });
+    let mut config = wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format,
+        width: size.width.max(1),
+        height: size.height.max(1),
+        present_mode: wgpu::PresentMode::Fifo,
+        alpha_mode: caps.alpha_modes[0],
+        view_formats: vec![],
+        desired_maximum_frame_latency: 2,
+    };
 
-    let scratch_view = scratch.create_view(&wgpu::TextureViewDescriptor {
-        label: Some("scratch_view"),
-        dimension: Some(wgpu::TextureViewDimension::D2),
-        ..Default::default()
-    });
+    surface.configure(&device, &config);
 
-    let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("uniforms"),
-        size: std::mem::size_of::<Uniforms>() as u64,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("shader"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
-    });
-
-    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("compute_bgl"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Texture {
-                    multisampled: false,
-                    view_dimension: wgpu::TextureViewDimension::D2Array,
-                    sample_type: wgpu::TextureSampleType::Uint,
+    // ---------- textures ----------
+    let textures: Vec<_> = (0..F)
+        .map(|_| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                size: wgpu::Extent3d {
+                    width: WIDTH,
+                    height: HEIGHT,
+                    depth_or_array_layers: 1,
                 },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::StorageTexture {
-                    access: wgpu::StorageTextureAccess::WriteOnly,
-                    format: wgpu::TextureFormat::R32Uint,
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-        ],
-    });
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R32Uint,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+                label: None,
+            })
+        })
+        .collect();
 
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("compute_layout"),
-        bind_group_layouts: &[Some(&bgl)],
-        immediate_size: 0,
-    });
+    let views: Vec<_> = textures
+        .iter()
+        .map(|t| t.create_view(&Default::default()))
+        .collect();
 
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("compute_pipeline"),
-        layout: Some(&pipeline_layout),
-        module: &shader,
-        entry_point: Some("main"),
-        compilation_options: Default::default(),
-        cache: None,
-    });
-
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("compute_bg"),
-        layout: &bgl,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&history_full_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::TextureView(&scratch_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: uniform_buffer.as_entire_binding(),
-            },
-        ],
-    });
-
-    // Seed layer 0 with a bottom row of 1s.
+    // seed first texture
     let mut init = vec![0u32; (WIDTH * HEIGHT) as usize];
     for x in 0..WIDTH {
         init[(0 * WIDTH + x) as usize] = 1;
@@ -167,9 +95,9 @@ async fn run() {
 
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
-            texture: &history,
+            texture: &textures[0],
             mip_level: 0,
-            origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
+            origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
         bytemuck::cast_slice(&init),
@@ -185,121 +113,254 @@ async fn run() {
         },
     );
 
-    // Run frames 1..=STEPS so frame 1 reads seeded layer 0.
-    for frame in 1..=STEPS {
-        let current = frame % F;
+    // ---------- compute ----------
+    let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+        label: None,
+    });
 
-        let uniforms = Uniforms {
-            current,
-            history_len: F,
-            _pad: [0; 2],
-        };
-        queue.write_buffer(&uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+    let compute_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        entries: &[
+            // read
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    multisampled: false,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    sample_type: wgpu::TextureSampleType::Uint,
+                },
+                count: None,
+            },
+            // write
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::R32Uint,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            },
+        ],
+        label: None,
+    });
 
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("sim_encoder"),
+    let compute_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            bind_group_layouts: &[Some(&compute_bgl)],
+            immediate_size: 0,
+            label: None,
         });
 
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("sim_pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(WIDTH.div_ceil(8), HEIGHT.div_ceil(8), 1);
-        }
-
-        // Copy scratch -> selected history layer
-        encoder.copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &scratch,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyTextureInfo {
-                texture: &history,
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: 0,
-                    y: 0,
-                    z: current,
-                },
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d {
-                width: WIDTH,
-                height: HEIGHT,
-                depth_or_array_layers: 1,
-            },
-        );
-
-        queue.submit(Some(encoder.finish()));
-    }
-
-    let last_layer = STEPS % F;
-
-    let padded_bytes_per_row = (WIDTH * 4).div_ceil(256) * 256;
-    let readback_size = padded_bytes_per_row * HEIGHT;
-
-    let read_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("read_buffer"),
-        size: readback_size as u64,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
+    let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        layout: Some(&compute_pipeline_layout),
+        module: &compute_shader,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+        label: None,
     });
 
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("readback_encoder"),
+    // ---------- render ----------
+    let render_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        source: wgpu::ShaderSource::Wgsl(include_str!("render.wgsl").into()),
+        label: None,
     });
 
-    encoder.copy_texture_to_buffer(
-        wgpu::TexelCopyTextureInfo {
-            texture: &history,
-            mip_level: 0,
-            origin: wgpu::Origin3d {
-                x: 0,
-                y: 0,
-                z: last_layer,
+    let render_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                multisampled: false,
+                view_dimension: wgpu::TextureViewDimension::D2,
+                sample_type: wgpu::TextureSampleType::Uint,
             },
-            aspect: wgpu::TextureAspect::All,
+            count: None,
+        }],
+        label: None,
+    });
+
+    let render_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            bind_group_layouts: &[Some(&render_bgl)],
+            immediate_size: 0,
+            label: None,
+        });
+
+    let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        layout: Some(&render_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &render_shader,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: Default::default(),
         },
-        wgpu::TexelCopyBufferInfo {
-            buffer: &read_buffer,
-            layout: wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(padded_bytes_per_row),
-                rows_per_image: Some(HEIGHT),
-            },
-        },
-        wgpu::Extent3d {
-            width: WIDTH,
-            height: HEIGHT,
-            depth_or_array_layers: 1,
-        },
-    );
+        fragment: Some(wgpu::FragmentState {
+            module: &render_shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: Default::default(),
+        depth_stencil: None,
+        multisample: Default::default(),
+        multiview_mask: None,
+        cache: None,
+        label: None,
+    });
 
-    queue.submit(Some(encoder.finish()));
+    let mut frame_count = 0;
+    let mut step_requested = false;
 
-    let slice = read_buffer.slice(..);
-    slice.map_async(wgpu::MapMode::Read, |_| {});
-    device
-        .poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        })
-        .expect("poll failed");
+    event_loop.run(|event, target| {
+        match event {
+            Event::AboutToWait => window.request_redraw(),
 
-    let mapped = slice.get_mapped_range();
-    let words: &[u32] = bytemuck::cast_slice(&mapped);
+            Event::WindowEvent {
+                event: WindowEvent::RedrawRequested,
+                ..
+            } => {
+                let curr = frame_count % F;
+                let next = (frame_count + 1) % F;
 
-    println!("Final grid from layer {last_layer}:");
-    for y in 0..HEIGHT {
-        for x in 0..WIDTH {
-            let idx = (y * (padded_bytes_per_row / 4) + x) as usize;
-            print!("{} ", words[idx]);
+                let frame = match surface.get_current_texture() {
+                    wgpu::CurrentSurfaceTexture::Success(frame)
+                    | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+
+                    wgpu::CurrentSurfaceTexture::Outdated
+                    | wgpu::CurrentSurfaceTexture::Lost => {
+                        surface.configure(&device, &config);
+                        return; // skip this frame
+                    }
+
+                    wgpu::CurrentSurfaceTexture::Timeout
+                    | wgpu::CurrentSurfaceTexture::Occluded => {
+                        return; // nothing to render this frame
+                    }
+
+                    wgpu::CurrentSurfaceTexture::Validation => {
+                        panic!("surface validation error");
+                    }
+                };
+
+                let view = frame
+                    .texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+                let display_idx = if step_requested { next } else { curr };
+
+                let render_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    layout: &render_bgl,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(
+                            &views[display_idx as usize],
+                        ),
+                    }],
+                    label: None,
+                });
+
+                let mut encoder =
+                    device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+
+                // compute
+                if step_requested {
+                    let compute_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        layout: &compute_bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &views[curr as usize],
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &views[next as usize],
+                                ),
+                            },
+                        ],
+                        label: None,
+                    });
+
+                    let mut pass =
+                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+                    pass.set_pipeline(&compute_pipeline);
+                    pass.set_bind_group(0, &compute_bg, &[]);
+                    pass.dispatch_workgroups(WIDTH.div_ceil(8), HEIGHT.div_ceil(8), 1);
+                }
+
+                // render
+                {
+                    let mut rpass =
+                        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            color_attachments: &[Some(
+                                wgpu::RenderPassColorAttachment {
+                                    view: &view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(
+                                            wgpu::Color::BLACK,
+                                        ),
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                    depth_slice: None,
+                                },
+                            )],
+                            ..Default::default()
+                        });
+
+                    rpass.set_pipeline(&render_pipeline);
+                    rpass.set_bind_group(0, &render_bg, &[]);
+                    rpass.draw(0..3, 0..1);
+                }
+
+                queue.submit(Some(encoder.finish()));
+                frame.present();
+
+                if step_requested {
+                    frame_count = next;
+                    step_requested = false;
+                }
+            }
+
+            Event::WindowEvent {
+                event: WindowEvent::KeyboardInput { event, .. },
+                ..
+            } => {
+                if event.state == ElementState::Pressed
+                    && !event.repeat
+                    && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Space))
+                {
+                    step_requested = true;
+                    window.request_redraw();
+                }
+            }
+
+            Event::WindowEvent {
+                event: WindowEvent::Resized(size),
+                ..
+            } => {
+                if size.width > 0 && size.height > 0 {
+                    config.width = size.width;
+                    config.height = size.height;
+                    surface.configure(&device, &config);
+                }
+            }
+
+            Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
+            } => target.exit(),
+
+            _ => {}
         }
-        println!();
-    }
+    }).unwrap();
 }
