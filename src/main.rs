@@ -1,7 +1,4 @@
-mod render;
-mod simulation;
-mod windowing;
-mod allocator;
+use circuits_game::{render, simulation, windowing};
 
 use winit::{
     event::*,
