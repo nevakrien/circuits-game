@@ -44,6 +44,27 @@ impl CameraState {
         self.clamp_offset();
     }
 
+    pub fn view_params(&self) -> [f32; 2] {
+        view_uv_scale(self.surface_size, self.zoom)
+    }
+
+    pub fn surface_to_world_uv(&self, position: [f32; 2]) -> Option<[f32; 2]> {
+        let width = self.surface_size.width.max(1) as f32;
+        let height = self.surface_size.height.max(1) as f32;
+        let uv = [position[0] / width, position[1] / height];
+        let view = self.view_params();
+        let world = [
+            (uv[0] - 0.5) * view[0] + 0.5 + self.offset[0],
+            (uv[1] - 0.5) * view[1] + 0.5 + self.offset[1],
+        ];
+
+        if !(0.0..1.0).contains(&world[0]) || !(0.0..1.0).contains(&world[1]) {
+            return None;
+        }
+
+        Some(world)
+    }
+
     fn clamp_offset(&mut self) {
         let scaled = view_uv_scale(self.surface_size, self.zoom);
         let max_offset_x = (1.0 - scaled[0]).abs() * 0.5;
@@ -177,7 +198,7 @@ impl Renderer {
     }
 
     pub fn update_view_layer(&self, queue: &wgpu::Queue, camera: CameraState, layer: u32) {
-        let uv_scale = view_uv_scale(camera.surface_size, camera.zoom);
+        let uv_scale = camera.view_params();
         queue.write_buffer(
             &self.params_buffer,
             0,
