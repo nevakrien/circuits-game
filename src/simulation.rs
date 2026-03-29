@@ -393,136 +393,69 @@ fn linear_index(x: u32, y: u32, z: u32) -> usize {
 }
 
 fn circuit_cell_for_coord(x: u32, y: u32, z: u32) -> CircuitCell {
-    if let Some(tag) = gate_tag_for_coord(x, y, z) {
-        CircuitCell {
-            tag,
-            data: [0, 0, 0],
-        }
-    } else if is_noop_cell(x, y, z) {
-        CircuitCell {
-            tag: CircuitTag::Noop,
-            data: [0, 0, 0],
-        }
-    } else if is_source_cell(x, y, z) {
-        CircuitCell {
-            tag: CircuitTag::Source,
-            data: [source_value_for_cell(x, z), 0, 0],
-        }
-    } else {
-        CircuitCell {
-            tag: CircuitTag::Wire,
-            data: encode_spatial_id(copy_source_for_cell(x, y, z)),
-        }
+    if z == 0 {
+        return primary_board_cell(x, y);
     }
+
+    noop_cell()
 }
 
 fn encode_spatial_id(coord: (u32, u32, u32)) -> [u8; 3] {
     [coord.0 as u8, coord.1 as u8, coord.2 as u8]
 }
 
-fn source_value_for_cell(x: u32, z: u32) -> u8 {
-    match z {
-        0 => 0xff,
-        1 => match x {
-            1 | 5 => 0xff,
-            3 | 7 => 0x00,
-            _ => 0x00,
-        },
-        2 => match x {
-            0 => 0x00,
-            2 => 0xff,
-            4 | 6 => 0xff,
-            _ => 0x00,
-        },
-        3 => match x {
-            0 | 2 | 6 => 0x00,
-            4 => 0xff,
-            _ => 0x00,
-        },
-        4 => match x {
-            0 | 6 => 0x00,
-            2 | 4 => 0xff,
-            _ => 0x00,
-        },
-        5 => match x {
-            0 | 2 | 6 => 0xff,
-            4 => 0x00,
-            _ => 0x00,
-        },
-        6 => match x {
-            0 | 2 => 0x00,
-            4 | 6 => 0xff,
-            _ => 0x00,
-        },
-        7 => match x {
-            0 | 2 | 4 => 0xff,
-            6 => 0x00,
-            _ => 0x00,
-        },
-        _ => 0xff,
+fn noop_cell() -> CircuitCell {
+    CircuitCell {
+        tag: CircuitTag::Noop,
+        data: [0, 0, 0],
     }
 }
 
-fn copy_source_for_cell(x: u32, y: u32, z: u32) -> (u32, u32, u32) {
-    if y == 0 { (x, y, z) } else { (x, y - 1, z) }
-}
-
-fn gate_tag_for_layer(z: u32) -> Option<CircuitTag> {
-    match z {
-        1 => Some(CircuitTag::Not),
-        2 => Some(CircuitTag::And),
-        3 => Some(CircuitTag::Or),
-        4 => Some(CircuitTag::Xor),
-        5 => Some(CircuitTag::Nand),
-        6 => Some(CircuitTag::Nor),
-        7 => Some(CircuitTag::Xnor),
-        _ => None,
+fn source_cell(value: u8) -> CircuitCell {
+    CircuitCell {
+        tag: CircuitTag::Source,
+        data: [value, 0, 0],
     }
 }
 
-fn gate_columns_for_layer(z: u32) -> &'static [u32] {
-    match z {
-        1 => &[1, 3, 5, 7],
-        2..=7 => &[1, 5],
-        _ => &[],
+fn wire_cell(coord: (u32, u32, u32)) -> CircuitCell {
+    CircuitCell {
+        tag: CircuitTag::Wire,
+        data: encode_spatial_id(coord),
     }
 }
 
-fn source_columns_for_layer(z: u32) -> &'static [u32] {
-    match z {
-        0 => &[0, 1, 2, 3, 4, 5, 6, 7],
-        1 => &[1, 3, 5, 7],
-        2..=7 => &[0, 2, 4, 6],
-        _ => &[],
+fn gate_cell(tag: CircuitTag) -> CircuitCell {
+    CircuitCell {
+        tag,
+        data: [0, 0, 0],
     }
 }
 
-fn is_noop_cell(x: u32, y: u32, z: u32) -> bool {
-    if y == 0 {
-        return !source_columns_for_layer(z).contains(&x);
+fn primary_board_cell(x: u32, y: u32) -> CircuitCell {
+    match (x, y) {
+        (1, 1) => source_cell(0xff),
+        (3, 1) => source_cell(0x00),
+        (5, 1) => source_cell(0xff),
+        (6, 1) => source_cell(0xff),
+        (1, 2) => wire_cell((1, 1, 0)),
+        (3, 2) => wire_cell((3, 1, 0)),
+        (5, 2) => wire_cell((5, 1, 0)),
+        (6, 2) => wire_cell((6, 1, 0)),
+        (2, 3) => gate_cell(CircuitTag::And),
+        (4, 3) => gate_cell(CircuitTag::Or),
+        (6, 3) => gate_cell(CircuitTag::Not),
+        (2, 4) => wire_cell((2, 3, 0)),
+        (4, 4) => wire_cell((4, 3, 0)),
+        (6, 4) => wire_cell((6, 3, 0)),
+        (3, 5) => gate_cell(CircuitTag::Xor),
+        (5, 5) => gate_cell(CircuitTag::Nand),
+        (3, 6) => wire_cell((3, 5, 0)),
+        (4, 6) => wire_cell((3, 6, 0)),
+        (5, 6) => wire_cell((5, 5, 0)),
+        (6, 6) => wire_cell((5, 6, 0)),
+        _ => noop_cell(),
     }
-
-    if y == 1 {
-        return gate_tag_for_layer(z).is_none() || !gate_columns_for_layer(z).contains(&x);
-    }
-
-    !gate_columns_for_layer(z).contains(&x)
-}
-
-fn is_source_cell(x: u32, y: u32, z: u32) -> bool {
-    if y != 0 {
-        return false;
-    }
-
-    source_columns_for_layer(z).contains(&x)
-}
-
-fn gate_tag_for_coord(x: u32, y: u32, z: u32) -> Option<CircuitTag> {
-    if y != 1 || !gate_columns_for_layer(z).contains(&x) {
-        return None;
-    }
-
-    gate_tag_for_layer(z)
 }
 
 #[cfg(test)]

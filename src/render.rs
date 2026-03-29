@@ -7,8 +7,8 @@ const MAX_ZOOM: f32 = 8.0;
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct RenderParams {
-    uv_scale: [f32; 2],
-    uv_offset: [f32; 2],
+    view: [f32; 4],
+    layer: [u32; 4],
 }
 
 #[derive(Clone, Copy)]
@@ -173,12 +173,17 @@ impl Renderer {
     }
 
     pub fn update_view(&self, queue: &wgpu::Queue, camera: CameraState) {
+        self.update_view_layer(queue, camera, 0);
+    }
+
+    pub fn update_view_layer(&self, queue: &wgpu::Queue, camera: CameraState, layer: u32) {
+        let uv_scale = view_uv_scale(camera.surface_size, camera.zoom);
         queue.write_buffer(
             &self.params_buffer,
             0,
             bytemuck::bytes_of(&RenderParams {
-                uv_scale: view_uv_scale(camera.surface_size, camera.zoom),
-                uv_offset: camera.offset,
+                view: [uv_scale[0], uv_scale[1], camera.offset[0], camera.offset[1]],
+                layer: [layer, 0, 0, 0],
             }),
         );
     }

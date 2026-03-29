@@ -27,6 +27,7 @@ async fn run() {
     let simulation = simulation::Simulation::new(&device, &queue);
     let renderer = render::Renderer::new(&device, &queue, config.format, window.inner_size());
     let mut camera = render::CameraState::new(window.inner_size());
+    let mut displayed_layer = 0;
 
     let mut current_buffer = 0;
     let mut step_requested = false;
@@ -62,7 +63,7 @@ async fn run() {
                     camera.zoom_by(1.0 / zoom_step);
                 }
 
-                renderer.update_view(&queue, camera);
+                renderer.update_view_layer(&queue, camera, displayed_layer);
 
                 let next_buffer = (current_buffer + 1) % simulation::CHARGE_BUFFER_COUNT;
 
@@ -126,6 +127,17 @@ async fn run() {
                                 step_requested = true;
                                 window.request_redraw();
                             }
+
+                            if !event.repeat && code == KeyCode::ArrowUp {
+                                displayed_layer = (displayed_layer + 1)
+                                    .min(simulation::BOARD_LAYERS.saturating_sub(1));
+                                window.request_redraw();
+                            }
+
+                            if !event.repeat && code == KeyCode::ArrowDown {
+                                displayed_layer = displayed_layer.saturating_sub(1);
+                                window.request_redraw();
+                            }
                         }
                         ElementState::Released => {
                             pressed_keys.remove(&code);
@@ -141,7 +153,7 @@ async fn run() {
                 if size.width > 0 && size.height > 0 {
                     windowing::resize_surface(&surface, &device, &mut config, size);
                     camera.resize(size);
-                    renderer.update_view(&queue, camera);
+                    renderer.update_view_layer(&queue, camera, displayed_layer);
                 }
             }
 

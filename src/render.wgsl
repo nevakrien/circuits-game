@@ -5,8 +5,8 @@ var charge_tex: texture_3d<u32>;
 var circuit_tex: texture_3d<u32>;
 
 struct RenderParams {
-    uv_scale: vec2<f32>,
-    uv_offset: vec2<f32>,
+    view: vec4<f32>,
+    layer: vec4<u32>,
 }
 
 @group(0) @binding(2)
@@ -257,7 +257,7 @@ fn render_gate(
     var color = base;
     color = mix(color, body_color, body_mask);
     color = mix(color, vec3(0.92, 0.95, 1.0), border_mask * 0.7);
-    color = mix(color, vec3(0.06, 0.07, 0.08), label);
+    color = mix(color, vec3(0.6, 0.07, 0.08), label);
     color += vec3(0.22, 0.28, 0.34) * (charge_level * glow * 0.24);
     return color;
 }
@@ -309,27 +309,17 @@ fn vs_main(@builtin(vertex_index) index: u32) -> VsOut {
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let dims = textureDimensions(circuit_tex);
-    let board_count = dims.z;
-    let cols = max(1u, u32(ceil(sqrt(f32(board_count)))));
-    let rows = max(1u, (board_count + cols - 1u) / cols);
 
-    let uv = (in.uv - vec2(0.5, 0.5)) * render_params.uv_scale
+    let uv = (in.uv - vec2(0.5, 0.5)) * render_params.view.xy
         + vec2(0.5, 0.5)
-        + render_params.uv_offset;
+        + render_params.view.zw;
 
     if (any(uv < vec2(0.0, 0.0)) || any(uv >= vec2(1.0, 1.0))) {
         return vec4(0.0, 0.0, 0.0, 1.0);
     }
-    let tiled_uv = uv * vec2<f32>(f32(cols), f32(rows));
-    let tile = vec2<u32>(tiled_uv);
-    let layer = tile.y * cols + tile.x;
 
-    if (layer >= board_count) {
-        return vec4(0.0, 0.0, 0.0, 1.0);
-    }
-
-    let board_uv = fract(tiled_uv);
-    let cell = board_uv * vec2<f32>(dims.xy);
+    let layer = min(render_params.layer.x, dims.z - 1u);
+    let cell = uv * vec2<f32>(dims.xy);
     let coord = min(vec2<u32>(cell), dims.xy - vec2(1u, 1u));
     let local_uv = fract(cell);
     let centered = local_uv - vec2(0.5, 0.5);
