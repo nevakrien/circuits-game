@@ -4,6 +4,14 @@ var charge_tex: texture_3d<u32>;
 @group(0) @binding(1)
 var circuit_tex: texture_3d<u32>;
 
+struct RenderParams {
+    uv_scale: vec2<f32>,
+    uv_offset: vec2<f32>,
+}
+
+@group(0) @binding(2)
+var<uniform> render_params: RenderParams;
+
 fn byte_channel(coord: vec2<u32>) -> u32 {
     return (coord.y & 1u) * 2u + (coord.x & 1u);
 }
@@ -194,7 +202,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let cols = max(1u, u32(ceil(sqrt(f32(board_count)))));
     let rows = max(1u, (board_count + cols - 1u) / cols);
 
-    let uv = min(in.uv, vec2(0.99999994, 0.99999994));
+    let uv = clamp(
+        (in.uv - vec2(0.5, 0.5)) * render_params.uv_scale
+            + vec2(0.5, 0.5)
+            + render_params.uv_offset,
+        vec2(0.0, 0.0),
+        vec2(0.99999994, 0.99999994),
+    );
     let tiled_uv = uv * vec2<f32>(f32(cols), f32(rows));
     let tile = vec2<u32>(tiled_uv);
     let layer = tile.y * cols + tile.x;

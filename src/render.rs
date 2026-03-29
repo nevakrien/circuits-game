@@ -1,10 +1,84 @@
+use bytemuck::{Pod, Zeroable};
+use winit::dpi::PhysicalSize;
+
+const TARGET_ASPECT_RATIO: f32 = 16.0 / 9.0;
+const MIN_ZOOM: f32 = 1.0;
+const MAX_ZOOM: f32 = 8.0;
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct RenderParams {
+    uv_scale: [f32; 2],
+    uv_offset: [f32; 2],
+}
+
+#[derive(Clone, Copy)]
+pub struct CameraState {
+    surface_size: PhysicalSize<u32>,
+    pub zoom: f32,
+    pub offset: [f32; 2],
+}
+
+impl CameraState {
+    pub fn new(surface_size: PhysicalSize<u32>) -> Self {
+        Self {
+            surface_size,
+            zoom: 1.0,
+            offset: [0.0, 0.0],
+        }
+    }
+
+    pub fn resize(&mut self, surface_size: PhysicalSize<u32>) {
+        self.surface_size = surface_size;
+        self.clamp_offset();
+    }
+
+    pub fn zoom_by(&mut self, factor: f32) {
+        self.zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        self.clamp_offset();
+    }
+
+    pub fn pan_by(&mut self, delta: [f32; 2]) {
+        self.offset[0] += delta[0];
+        self.offset[1] += delta[1];
+        self.clamp_offset();
+    }
+
+    fn clamp_offset(&mut self) {
+        let scaled = view_uv_scale(self.surface_size, self.zoom);
+        let max_offset_x = (1.0 - scaled[0]) * 0.5;
+        let max_offset_y = (1.0 - scaled[1]) * 0.5;
+        self.offset[0] = self.offset[0].clamp(-max_offset_x, max_offset_x);
+        self.offset[1] = self.offset[1].clamp(-max_offset_y, max_offset_y);
+    }
+}
+
+fn view_uv_scale(surface_size: PhysicalSize<u32>, zoom: f32) -> [f32; 2] {
+    let width = surface_size.width.max(1) as f32;
+    let height = surface_size.height.max(1) as f32;
+    let surface_aspect = width / height;
+    let cropped = if surface_aspect > TARGET_ASPECT_RATIO {
+        [1.0, TARGET_ASPECT_RATIO / surface_aspect]
+    } else {
+        [surface_aspect / TARGET_ASPECT_RATIO, 1.0]
+    };
+
+    [cropped[0] / zoom, cropped[1] / zoom]
+}
+
 pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+    params_buffer: wgpu::Buffer,
 }
 
 impl Renderer {
-    pub fn new(device: &wgpu::Device, surface_format: wgpu::TextureFormat) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        surface_format: wgpu::TextureFormat,
+        surface_size: PhysicalSize<u32>,
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("render"),
             source: wgpu::ShaderSource::Wgsl(include_str!("render.wgsl").into()),
@@ -21,9 +95,29 @@ impl Renderer {
             count: None,
         };
 
+        let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("render-params-buffer"),
+            size: std::mem::size_of::<RenderParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("render-bind-group-layout"),
-            entries: &[texture_entry(0), texture_entry(1)],
+            entries: &[
+                texture_entry(0),
+                texture_entry(1),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -58,10 +152,25 @@ impl Renderer {
             cache: None,
         });
 
-        Self {
+        let renderer = Self {
             pipeline,
             bind_group_layout,
-        }
+            params_buffer,
+        };
+
+        renderer.update_view(queue, CameraState::new(surface_size));
+        renderer
+    }
+
+    pub fn update_view(&self, queue: &wgpu::Queue, camera: CameraState) {
+        queue.write_buffer(
+            &self.params_buffer,
+            0,
+            bytemuck::bytes_of(&RenderParams {
+                uv_scale: view_uv_scale(camera.surface_size, camera.zoom),
+                uv_offset: camera.offset,
+            }),
+        );
     }
 
     pub fn draw(
@@ -85,6 +194,10 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::TextureView(circuit_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.params_buffer.as_entire_binding(),
                 },
             ],
         });

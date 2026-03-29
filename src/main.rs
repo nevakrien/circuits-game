@@ -8,6 +8,8 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
 };
 
+use std::collections::HashSet;
+
 fn main() {
     pollster::block_on(run());
 }
@@ -26,10 +28,12 @@ async fn run() {
     let mut config = windowing::configure_surface(&surface, &adapter, &device, window.inner_size());
 
     let simulation = simulation::Simulation::new(&device, &queue);
-    let renderer = render::Renderer::new(&device, config.format);
+    let renderer = render::Renderer::new(&device, &queue, config.format, window.inner_size());
+    let mut camera = render::CameraState::new(window.inner_size());
 
     let mut current_buffer = 0;
     let mut step_requested = false;
+    let mut pressed_keys = HashSet::new();
 
     event_loop
         .run(|event, target| match event {
@@ -39,6 +43,30 @@ async fn run() {
                 event: WindowEvent::RedrawRequested,
                 ..
             } => {
+                let pan_step = 0.01 / camera.zoom;
+                let zoom_step = 1.02;
+
+                if pressed_keys.contains(&KeyCode::KeyW) {
+                    camera.pan_by([0.0, -pan_step]);
+                }
+                if pressed_keys.contains(&KeyCode::KeyS) {
+                    camera.pan_by([0.0, pan_step]);
+                }
+                if pressed_keys.contains(&KeyCode::KeyA) {
+                    camera.pan_by([-pan_step, 0.0]);
+                }
+                if pressed_keys.contains(&KeyCode::KeyD) {
+                    camera.pan_by([pan_step, 0.0]);
+                }
+                if pressed_keys.contains(&KeyCode::KeyQ) {
+                    camera.zoom_by(zoom_step);
+                }
+                if pressed_keys.contains(&KeyCode::KeyE) {
+                    camera.zoom_by(1.0 / zoom_step);
+                }
+
+                renderer.update_view(&queue, camera);
+
                 let next_buffer = (current_buffer + 1) % simulation::CHARGE_BUFFER_COUNT;
 
                 let frame = match surface.get_current_texture() {
@@ -92,12 +120,20 @@ async fn run() {
                 event: WindowEvent::KeyboardInput { event, .. },
                 ..
             } => {
-                if event.state == ElementState::Pressed
-                    && !event.repeat
-                    && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Space))
-                {
-                    step_requested = true;
-                    window.request_redraw();
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    match event.state {
+                        ElementState::Pressed => {
+                            pressed_keys.insert(code);
+
+                            if !event.repeat && code == KeyCode::Space {
+                                step_requested = true;
+                                window.request_redraw();
+                            }
+                        }
+                        ElementState::Released => {
+                            pressed_keys.remove(&code);
+                        }
+                    }
                 }
             }
 
@@ -107,6 +143,8 @@ async fn run() {
             } => {
                 if size.width > 0 && size.height > 0 {
                     windowing::resize_surface(&surface, &device, &mut config, size);
+                    camera.resize(size);
+                    renderer.update_view(&queue, camera);
                 }
             }
 
