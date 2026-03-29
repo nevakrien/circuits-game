@@ -41,12 +41,86 @@ struct VsOut {
     @location(0) uv: vec2<f32>,
 }
 
+const GATE_LABEL_LENGTHS: array<u32, 7> = array<u32, 7>(3u, 3u, 2u, 3u, 4u, 3u, 4u);
+const GATE_LABEL_LETTERS: array<vec4<u32>, 7> = array<vec4<u32>, 7>(
+    vec4<u32>(2u, 3u, 5u, 0u),
+    vec4<u32>(0u, 2u, 1u, 0u),
+    vec4<u32>(3u, 4u, 0u, 0u),
+    vec4<u32>(6u, 3u, 4u, 0u),
+    vec4<u32>(2u, 0u, 2u, 1u),
+    vec4<u32>(2u, 3u, 4u, 0u),
+    vec4<u32>(6u, 2u, 3u, 4u),
+);
+// Glyph columns sourced from Adafruit_GFX classic 5x7 font (glcdfont.c).
+const GATE_GLYPH_ATLAS: array<array<u32, 5>, 7> = array<array<u32, 5>, 7>(
+    array<u32, 5>(0x7Cu, 0x12u, 0x11u, 0x12u, 0x7Cu),
+    array<u32, 5>(0x7Fu, 0x41u, 0x41u, 0x41u, 0x3Eu),
+    array<u32, 5>(0x7Fu, 0x04u, 0x08u, 0x10u, 0x7Fu),
+    array<u32, 5>(0x3Eu, 0x41u, 0x41u, 0x41u, 0x3Eu),
+    array<u32, 5>(0x7Fu, 0x09u, 0x19u, 0x29u, 0x46u),
+    array<u32, 5>(0x03u, 0x01u, 0x7Fu, 0x01u, 0x03u),
+    array<u32, 5>(0x63u, 0x14u, 0x08u, 0x14u, 0x63u),
+);
+
 fn segment_mask(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>, half_width: f32) -> f32 {
     let ab = b - a;
     let t = clamp(dot(p - a, ab) / max(dot(ab, ab), 0.0001), 0.0, 1.0);
     let closest = a + ab * t;
     let distance = length(p - closest);
     return 1.0 - smoothstep(half_width, half_width + 0.02, distance);
+}
+
+fn rounded_box_mask(centered: vec2<f32>, half_size: vec2<f32>, radius: f32, softness: f32) -> f32 {
+    let q = abs(centered) - half_size + vec2(radius, radius);
+    let outside = length(max(q, vec2(0.0, 0.0)));
+    let inside = min(max(q.x, q.y), 0.0);
+    let distance = outside + inside - radius;
+    return 1.0 - smoothstep(0.0, softness, distance);
+}
+
+fn glyph_mask(local_uv: vec2<f32>, glyph_ix: u32) -> f32 {
+    if (any(local_uv < vec2(0.0, 0.0)) || any(local_uv >= vec2(1.0, 1.0))) {
+        return 0.0;
+    }
+
+    let padded_uv = local_uv * vec2(5.8, 7.8) - vec2(0.4, 0.4);
+    if (any(padded_uv < vec2(0.0, 0.0)) || any(padded_uv >= vec2(5.0, 7.0))) {
+        return 0.0;
+    }
+
+    let col = u32(padded_uv.x);
+    let row = u32(padded_uv.y);
+    let bits = GATE_GLYPH_ATLAS[glyph_ix][col];
+    return select(0.0, 1.0, ((bits >> row) & 1u) == 1u);
+}
+
+fn gate_label_mask(local_uv: vec2<f32>, tag: u32) -> f32 {
+    if (tag < 3u || tag > 9u) {
+        return 0.0;
+    }
+
+    let gate_ix = tag - 3u;
+    let len = GATE_LABEL_LENGTHS[gate_ix];
+    let glyphs = GATE_LABEL_LETTERS[gate_ix];
+    let uv = (local_uv - vec2(0.11, 0.17)) / vec2(0.78, 0.66);
+
+    if (any(uv < vec2(0.0, 0.0)) || any(uv >= vec2(1.0, 1.0))) {
+        return 0.0;
+    }
+
+    let glyph_uv = vec2(uv.x * f32(len), uv.y);
+    let ix = min(u32(glyph_uv.x), len - 1u);
+    let char_uv = vec2(fract(glyph_uv.x), glyph_uv.y);
+
+    var glyph_ix = glyphs.x;
+    switch (ix) {
+        case 0u: { glyph_ix = glyphs.x; }
+        case 1u: { glyph_ix = glyphs.y; }
+        case 2u: { glyph_ix = glyphs.z; }
+        default: { glyph_ix = glyphs.w; }
+    }
+
+    return glyph_mask(char_uv, glyph_ix);
 }
 
 fn render_noop(
@@ -154,6 +228,40 @@ fn render_wire(
     return color;
 }
 
+fn render_gate(
+    in: VsOut,
+    dims: vec3<u32>,
+    layer: u32,
+    coord: vec2<u32>,
+    local_uv: vec2<f32>,
+    centered: vec2<f32>,
+    charge: u32,
+    circuit: vec4<u32>,
+    circle: f32,
+    glow: f32,
+) -> vec3<f32> {
+    _ = in;
+    _ = dims;
+    _ = layer;
+    _ = coord;
+    _ = circle;
+
+    let base = vec3(0.035, 0.035, 0.045);
+    let tag = circuit.x & 0xffu;
+    let charge_level = f32(charge) / 255.0;
+    let body_mask = rounded_box_mask(centered, vec2(0.39, 0.27), 0.08, 0.025);
+    let border_mask = body_mask - rounded_box_mask(centered, vec2(0.35, 0.23), 0.07, 0.025);
+    let body_color = mix(vec3(0.24, 0.28, 0.32), vec3(0.92, 0.96, 1.0), charge_level * 0.42);
+    let label = gate_label_mask(local_uv, tag) * body_mask;
+
+    var color = base;
+    color = mix(color, body_color, body_mask);
+    color = mix(color, vec3(0.92, 0.95, 1.0), border_mask * 0.7);
+    color = mix(color, vec3(0.06, 0.07, 0.08), label);
+    color += vec3(0.22, 0.28, 0.34) * (charge_level * glow * 0.24);
+    return color;
+}
+
 fn render_tag(
     in: VsOut,
     dims: vec3<u32>,
@@ -172,6 +280,9 @@ fn render_tag(
         }
         case 2u: {
             return render_wire(in, dims, layer, coord, local_uv, centered, charge, circuit, circle, glow);
+        }
+        case 3u, 4u, 5u, 6u, 7u, 8u, 9u: {
+            return render_gate(in, dims, layer, coord, local_uv, centered, charge, circuit, circle, glow);
         }
         default: {
             return render_noop(in, dims, layer, coord, local_uv, centered, charge, circuit, circle, glow);

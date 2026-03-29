@@ -92,6 +92,68 @@ fn update_wire(
     return read_byte(history, src) & 0xffu;
 }
 
+fn charge_bool(value: bool) -> u32 {
+    return select(0u, 0xffu, value);
+}
+
+fn read_bool(coord: vec3<u32>) -> bool {
+    return (read_byte(history, coord) & 0xffu) != 0u;
+}
+
+fn update_not(
+    dims: vec3<u32>,
+    coord: vec3<u32>,
+    current_charge: u32,
+    circuit: vec4<u32>,
+    payload: vec3<u32>,
+) -> u32 {
+    _ = current_charge;
+    _ = circuit;
+    _ = payload;
+
+    let src = vec3u(coord.x, max(coord.y, 1u) - 1u, coord.z);
+    return charge_bool(!read_bool(min(src, dims - vec3u(1u, 1u, 1u))));
+}
+
+fn update_binary_gate(
+    dims: vec3<u32>,
+    coord: vec3<u32>,
+    current_charge: u32,
+    circuit: vec4<u32>,
+    payload: vec3<u32>,
+) -> u32 {
+    _ = current_charge;
+    _ = payload;
+
+    let sample_y = max(coord.y, 1u) - 1u;
+    let lhs = read_bool(vec3u(max(coord.x, 1u) - 1u, sample_y, coord.z));
+    let rhs = read_bool(vec3u(min(coord.x + 1u, dims.x - 1u), sample_y, coord.z));
+
+    switch (circuit.x & 0xffu) {
+        case 4u: {
+            return charge_bool(lhs && rhs);
+        }
+        case 5u: {
+            return charge_bool(lhs || rhs);
+        }
+        case 6u: {
+            return charge_bool(lhs != rhs);
+        }
+        case 7u: {
+            return charge_bool(!(lhs && rhs));
+        }
+        case 8u: {
+            return charge_bool(!(lhs || rhs));
+        }
+        case 9u: {
+            return charge_bool(lhs == rhs);
+        }
+        default: {
+            return 0u;
+        }
+    }
+}
+
 fn update_tag(
     dims: vec3<u32>,
     coord: vec3<u32>,
@@ -108,6 +170,12 @@ fn update_tag(
         }
         case 2u: {
             return update_wire(dims, coord, current_charge, circuit, payload);
+        }
+        case 3u: {
+            return update_not(dims, coord, current_charge, circuit, payload);
+        }
+        case 4u, 5u, 6u, 7u, 8u, 9u: {
+            return update_binary_gate(dims, coord, current_charge, circuit, payload);
         }
         default: {
             return current_charge;

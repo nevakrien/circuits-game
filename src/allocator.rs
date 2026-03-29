@@ -318,9 +318,7 @@ impl TextureAllocator {
             // Stale / duplicate / mismatched handle. Put the page back into the
             // partial index if it still belongs there, then ignore.
             let page = &self.pages[page_ix];
-            if matches!(page.tag, PageTag::Class(_))
-                && !page.is_full()
-                && !page.is_empty_assigned()
+            if matches!(page.tag, PageTag::Class(_)) && !page.is_full() && !page.is_empty_assigned()
             {
                 self.reindex_partial_page(class_ix, handle.page_id);
             }
@@ -400,10 +398,7 @@ impl TextureAllocator {
     fn slot_xy(&self, class: &SlotClass, slot: u32) -> (u16, u16) {
         let col = slot % class.cols as u32;
         let row = slot / class.cols as u32;
-        (
-            (col * class.w as u32) as u16,
-            (row * class.h as u32) as u16,
-        )
+        ((col * class.w as u32) as u16, (row * class.h as u32) as u16)
     }
 
     fn best_partial_page(&self, class_ix: usize) -> Option<u32> {
@@ -529,9 +524,9 @@ mod tests {
         }
 
         let expected: HashSet<_> = [
-            (0u32, 0u16,   0u16,   512u16, 512u16),
-            (0u32, 512u16, 0u16,   512u16, 512u16),
-            (0u32, 0u16,   512u16, 512u16, 512u16),
+            (0u32, 0u16, 0u16, 512u16, 512u16),
+            (0u32, 512u16, 0u16, 512u16, 512u16),
+            (0u32, 0u16, 512u16, 512u16, 512u16),
             (0u32, 512u16, 512u16, 512u16, 512u16),
         ]
         .into_iter()
@@ -574,9 +569,9 @@ mod tests {
             .collect();
 
         let expected: HashSet<_> = [
-            (0u32, 0u16,   0u16,   512u16, 512u16),
-            (0u32, 512u16, 0u16,   512u16, 512u16),
-            (0u32, 0u16,   512u16, 512u16, 512u16),
+            (0u32, 0u16, 0u16, 512u16, 512u16),
+            (0u32, 512u16, 0u16, 512u16, 512u16),
+            (0u32, 0u16, 512u16, 512u16, 512u16),
             (0u32, 512u16, 512u16, 512u16, 512u16),
         ]
         .into_iter()
@@ -643,10 +638,7 @@ mod tests {
 
     #[test]
     fn multiple_classes_do_not_overlap_ranges_within_the_same_class_usage() {
-        let mut alloc = make_alloc(&[
-            (256, 256),
-            (512, 512),
-        ]);
+        let mut alloc = make_alloc(&[(256, 256), (512, 512)]);
 
         let mut allocs_256 = Vec::new();
         for _ in 0..16 {
@@ -850,11 +842,11 @@ mod tests {
             .collect();
 
         let expected: HashSet<_> = [
-            (0u32, 0u16,   0u16,   256u16, 512u16),
-            (0u32, 256u16, 0u16,   256u16, 512u16),
-            (0u32, 512u16, 0u16,   256u16, 512u16),
-            (0u32, 768u16, 0u16,   256u16, 512u16),
-            (0u32, 0u16,   512u16, 256u16, 512u16),
+            (0u32, 0u16, 0u16, 256u16, 512u16),
+            (0u32, 256u16, 0u16, 256u16, 512u16),
+            (0u32, 512u16, 0u16, 256u16, 512u16),
+            (0u32, 768u16, 0u16, 256u16, 512u16),
+            (0u32, 0u16, 512u16, 256u16, 512u16),
             (0u32, 256u16, 512u16, 256u16, 512u16),
             (0u32, 512u16, 512u16, 256u16, 512u16),
             (0u32, 768u16, 512u16, 256u16, 512u16),

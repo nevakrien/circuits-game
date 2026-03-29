@@ -231,3 +231,35 @@ impl Renderer {
         render_pass.draw(0..3, 0..1);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn create_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::default();
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .await
+            .ok()?;
+
+        adapter
+            .request_device(&wgpu::DeviceDescriptor::default())
+            .await
+            .ok()
+    }
+
+    #[test]
+    fn renderer_initializes_with_headless_device() {
+        let Some((device, queue)) = pollster::block_on(create_headless_device()) else {
+            return;
+        };
+
+        let _renderer = Renderer::new(
+            &device,
+            &queue,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            PhysicalSize::new(128, 128),
+        );
+    }
+}

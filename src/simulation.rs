@@ -1,6 +1,6 @@
 pub const GRID_WIDTH: u32 = 8;
 pub const GRID_HEIGHT: u32 = 8;
-pub const BOARD_LAYERS: u32 = 4;
+pub const BOARD_LAYERS: u32 = 8;
 pub const CHARGE_BUFFER_COUNT: u32 = 2;
 
 const CHARGE_GRID_WIDTH: u32 = GRID_WIDTH.div_ceil(2);
@@ -16,6 +16,13 @@ enum CircuitTag {
     Noop = 0,
     Source = 1,
     Wire = 2,
+    Not = 3,
+    And = 4,
+    Or = 5,
+    Xor = 6,
+    Nand = 7,
+    Nor = 8,
+    Xnor = 9,
 }
 
 #[derive(Clone, Copy)]
@@ -200,7 +207,8 @@ impl Simulation {
         buffer_index: u32,
     ) -> PackedChargeTexels {
         let bytes_per_row = charge_readback_bytes_per_row();
-        let size = u64::from(bytes_per_row) * u64::from(CHARGE_GRID_HEIGHT) * u64::from(BOARD_LAYERS);
+        let size =
+            u64::from(bytes_per_row) * u64::from(CHARGE_GRID_HEIGHT) * u64::from(BOARD_LAYERS);
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("simulation-charge-readback"),
             size,
@@ -248,16 +256,20 @@ impl Simulation {
         receiver.recv().unwrap().unwrap();
 
         let mapped = slice.get_mapped_range();
-        let mut texels = vec![[0u8; 4]; (CHARGE_GRID_WIDTH * CHARGE_GRID_HEIGHT * BOARD_LAYERS) as usize];
+        let mut texels =
+            vec![[0u8; 4]; (CHARGE_GRID_WIDTH * CHARGE_GRID_HEIGHT * BOARD_LAYERS) as usize];
         for z in 0..BOARD_LAYERS as usize {
             for y in 0..CHARGE_GRID_HEIGHT as usize {
                 let src_row_offset = z * CHARGE_GRID_HEIGHT as usize * bytes_per_row as usize
                     + y * bytes_per_row as usize;
-                let dst_row_offset = z * CHARGE_GRID_HEIGHT as usize * CHARGE_GRID_WIDTH as usize + y * CHARGE_GRID_WIDTH as usize;
-                let src_row = &mapped[src_row_offset..src_row_offset + CHARGE_GRID_WIDTH as usize * CHARGE_TEXEL_SIZE as usize];
+                let dst_row_offset = z * CHARGE_GRID_HEIGHT as usize * CHARGE_GRID_WIDTH as usize
+                    + y * CHARGE_GRID_WIDTH as usize;
+                let src_row = &mapped[src_row_offset
+                    ..src_row_offset + CHARGE_GRID_WIDTH as usize * CHARGE_TEXEL_SIZE as usize];
                 for x in 0..CHARGE_GRID_WIDTH as usize {
                     let src = x * CHARGE_TEXEL_SIZE as usize;
-                    texels[dst_row_offset + x].copy_from_slice(&src_row[src..src + CHARGE_TEXEL_SIZE as usize]);
+                    texels[dst_row_offset + x]
+                        .copy_from_slice(&src_row[src..src + CHARGE_TEXEL_SIZE as usize]);
                 }
             }
         }
@@ -381,7 +393,12 @@ fn linear_index(x: u32, y: u32, z: u32) -> usize {
 }
 
 fn circuit_cell_for_coord(x: u32, y: u32, z: u32) -> CircuitCell {
-    if is_noop_cell(x, y, z) {
+    if let Some(tag) = gate_tag_for_coord(x, y, z) {
+        CircuitCell {
+            tag,
+            data: [0, 0, 0],
+        }
+    } else if is_noop_cell(x, y, z) {
         CircuitCell {
             tag: CircuitTag::Noop,
             data: [0, 0, 0],
@@ -389,7 +406,7 @@ fn circuit_cell_for_coord(x: u32, y: u32, z: u32) -> CircuitCell {
     } else if is_source_cell(x, y, z) {
         CircuitCell {
             tag: CircuitTag::Source,
-            data: [source_constant_for_layer(z), 0, 0],
+            data: [source_value_for_cell(x, z), 0, 0],
         }
     } else {
         CircuitCell {
@@ -403,31 +420,93 @@ fn encode_spatial_id(coord: (u32, u32, u32)) -> [u8; 3] {
     [coord.0 as u8, coord.1 as u8, coord.2 as u8]
 }
 
-fn source_constant_for_layer(z: u32) -> u8 {
+fn source_value_for_cell(x: u32, z: u32) -> u8 {
     match z {
         0 => 0xff,
-        1 => 0xc0,
-        2 => 0x80,
-        3 => 0x40,
+        1 => match x {
+            1 | 5 => 0xff,
+            3 | 7 => 0x00,
+            _ => 0x00,
+        },
+        2 => match x {
+            0 => 0x00,
+            2 => 0xff,
+            4 | 6 => 0xff,
+            _ => 0x00,
+        },
+        3 => match x {
+            0 | 2 | 6 => 0x00,
+            4 => 0xff,
+            _ => 0x00,
+        },
+        4 => match x {
+            0 | 6 => 0x00,
+            2 | 4 => 0xff,
+            _ => 0x00,
+        },
+        5 => match x {
+            0 | 2 | 6 => 0xff,
+            4 => 0x00,
+            _ => 0x00,
+        },
+        6 => match x {
+            0 | 2 => 0x00,
+            4 | 6 => 0xff,
+            _ => 0x00,
+        },
+        7 => match x {
+            0 | 2 | 4 => 0xff,
+            6 => 0x00,
+            _ => 0x00,
+        },
         _ => 0xff,
     }
 }
 
 fn copy_source_for_cell(x: u32, y: u32, z: u32) -> (u32, u32, u32) {
-    if y == 0 {
-        (x, y, z)
-    } else {
-        (x, y - 1, z)
+    if y == 0 { (x, y, z) } else { (x, y - 1, z) }
+}
+
+fn gate_tag_for_layer(z: u32) -> Option<CircuitTag> {
+    match z {
+        1 => Some(CircuitTag::Not),
+        2 => Some(CircuitTag::And),
+        3 => Some(CircuitTag::Or),
+        4 => Some(CircuitTag::Xor),
+        5 => Some(CircuitTag::Nand),
+        6 => Some(CircuitTag::Nor),
+        7 => Some(CircuitTag::Xnor),
+        _ => None,
+    }
+}
+
+fn gate_columns_for_layer(z: u32) -> &'static [u32] {
+    match z {
+        1 => &[1, 3, 5, 7],
+        2..=7 => &[1, 5],
+        _ => &[],
+    }
+}
+
+fn source_columns_for_layer(z: u32) -> &'static [u32] {
+    match z {
+        0 => &[0, 1, 2, 3, 4, 5, 6, 7],
+        1 => &[1, 3, 5, 7],
+        2..=7 => &[0, 2, 4, 6],
+        _ => &[],
     }
 }
 
 fn is_noop_cell(x: u32, y: u32, z: u32) -> bool {
-    match z {
-        1 => x == GRID_WIDTH / 2,
-        2 => y == GRID_HEIGHT / 2,
-        3 => x == y || x + y + 1 == GRID_WIDTH,
-        _ => false,
+    if y == 0 {
+        return !source_columns_for_layer(z).contains(&x);
     }
+
+    if y == 1 {
+        return gate_tag_for_layer(z).is_none() || !gate_columns_for_layer(z).contains(&x);
+    }
+
+    !gate_columns_for_layer(z).contains(&x)
 }
 
 fn is_source_cell(x: u32, y: u32, z: u32) -> bool {
@@ -435,13 +514,15 @@ fn is_source_cell(x: u32, y: u32, z: u32) -> bool {
         return false;
     }
 
-    match z {
-        0 => true,
-        1 => x % 2 == 0,
-        2 => x >= GRID_WIDTH / 2,
-        3 => x == GRID_WIDTH / 2,
-        _ => false,
+    source_columns_for_layer(z).contains(&x)
+}
+
+fn gate_tag_for_coord(x: u32, y: u32, z: u32) -> Option<CircuitTag> {
+    if y != 1 || !gate_columns_for_layer(z).contains(&x) {
+        return None;
     }
+
+    gate_tag_for_layer(z)
 }
 
 #[cfg(test)]
@@ -461,34 +542,119 @@ mod tests {
             .ok()
     }
 
+    fn bool_to_charge(value: bool) -> u8 {
+        if value { 0xff } else { 0x00 }
+    }
+
+    fn gate_output(tag: CircuitTag, lhs: u8, rhs: u8) -> u8 {
+        let lhs = lhs != 0;
+        let rhs = rhs != 0;
+
+        bool_to_charge(match tag {
+            CircuitTag::Not => !rhs,
+            CircuitTag::And => lhs && rhs,
+            CircuitTag::Or => lhs || rhs,
+            CircuitTag::Xor => lhs != rhs,
+            CircuitTag::Nand => !(lhs && rhs),
+            CircuitTag::Nor => !(lhs || rhs),
+            CircuitTag::Xnor => lhs == rhs,
+            _ => false,
+        })
+    }
+
+    fn cpu_cell_next(texels: &PackedChargeTexels, x: u32, y: u32, z: u32) -> u8 {
+        let cell = circuit_cell_for_coord(x, y, z);
+
+        match cell.tag {
+            CircuitTag::Noop => 0,
+            CircuitTag::Source => cell.data[0],
+            CircuitTag::Wire => {
+                let [src_x, src_y, src_z] = cell.data;
+                read_packed_charge(texels, src_x as u32, src_y as u32, src_z as u32)
+            }
+            CircuitTag::Not => {
+                let input = read_packed_charge(texels, x, y - 1, z);
+                gate_output(cell.tag, 0, input)
+            }
+            CircuitTag::And
+            | CircuitTag::Or
+            | CircuitTag::Xor
+            | CircuitTag::Nand
+            | CircuitTag::Nor
+            | CircuitTag::Xnor => {
+                let lhs = read_packed_charge(texels, x - 1, y - 1, z);
+                let rhs = read_packed_charge(texels, x + 1, y - 1, z);
+                gate_output(cell.tag, lhs, rhs)
+            }
+        }
+    }
+
     fn expected_charge_after_steps(steps: u32, x: u32, y: u32, z: u32) -> u8 {
-        if is_noop_cell(x, y, z) || steps <= y {
-            return 0;
+        let mut current =
+            vec![[0u8; 4]; (CHARGE_GRID_WIDTH * CHARGE_GRID_HEIGHT * BOARD_LAYERS) as usize];
+
+        for _ in 0..steps {
+            let mut next = vec![[0u8; 4]; current.len()];
+            for layer in 0..BOARD_LAYERS {
+                for row in 0..GRID_HEIGHT {
+                    for col in 0..GRID_WIDTH {
+                        write_packed_charge(
+                            &mut next,
+                            col,
+                            row,
+                            layer,
+                            cpu_cell_next(&current, col, row, layer),
+                        );
+                    }
+                }
+            }
+            current = next;
         }
 
-        if !is_source_cell(x, 0, z) || is_noop_cell(x, 0, z) {
-            return 0;
-        }
+        read_packed_charge(&current, x, y, z)
+    }
 
-        for scan_y in 1..=y {
-            if is_noop_cell(x, scan_y, z) {
-                return 0;
+    #[test]
+    fn gate_truth_tables_match_expected_logic() {
+        let cases = [
+            (CircuitTag::And, [false, false, false, true]),
+            (CircuitTag::Or, [false, true, true, true]),
+            (CircuitTag::Xor, [false, true, true, false]),
+            (CircuitTag::Nand, [true, true, true, false]),
+            (CircuitTag::Nor, [true, false, false, false]),
+            (CircuitTag::Xnor, [true, false, false, true]),
+        ];
+
+        for (tag, expected) in cases {
+            for (ix, (lhs, rhs)) in [(false, false), (false, true), (true, false), (true, true)]
+                .into_iter()
+                .enumerate()
+            {
+                assert_eq!(
+                    gate_output(tag, bool_to_charge(lhs), bool_to_charge(rhs)) != 0,
+                    expected[ix]
+                );
             }
         }
 
-        source_constant_for_layer(z)
+        assert_eq!(gate_output(CircuitTag::Not, 0, 0) != 0, true);
+        assert_eq!(gate_output(CircuitTag::Not, 0, 0xff) != 0, false);
     }
 
     #[test]
     fn packed_charge_cpu_helpers_match_layout() {
-        let mut texels = vec![[0u8; 4]; (CHARGE_GRID_WIDTH * CHARGE_GRID_HEIGHT * BOARD_LAYERS) as usize];
+        let mut texels =
+            vec![[0u8; 4]; (CHARGE_GRID_WIDTH * CHARGE_GRID_HEIGHT * BOARD_LAYERS) as usize];
 
         write_packed_charge(&mut texels, 0, 0, 0, 0x11);
         write_packed_charge(&mut texels, 1, 0, 0, 0x22);
         write_packed_charge(&mut texels, 0, 1, 0, 0x33);
         write_packed_charge(&mut texels, 1, 1, 0, 0x44);
 
-        assert_eq!(texels[packed_charge_texel_index(0, 0, 0)], [0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(
+            texels[packed_charge_texel_index(0, 0, 0)],
+            [0x11, 0x22, 0x33, 0x44]
+        );
         assert_eq!(read_packed_charge(&texels, 0, 0, 0), 0x11);
         assert_eq!(read_packed_charge(&texels, 1, 0, 0), 0x22);
         assert_eq!(read_packed_charge(&texels, 0, 1, 0), 0x33);
@@ -512,14 +678,18 @@ mod tests {
             simulation.step(&device, &mut encoder, current_buffer, next_buffer);
             queue.submit(Some(encoder.finish()));
 
-            let texels = pollster::block_on(simulation.read_charge_buffer(
-                &device,
-                &queue,
-                next_buffer,
-            ));
+            let texels =
+                pollster::block_on(simulation.read_charge_buffer(&device, &queue, next_buffer));
 
             assert_eq!(
-                pollster::block_on(simulation.read_charge_value(&device, &queue, next_buffer, 0, 0, 0)),
+                pollster::block_on(simulation.read_charge_value(
+                    &device,
+                    &queue,
+                    next_buffer,
+                    0,
+                    0,
+                    0
+                )),
                 expected_charge_after_steps(step, 0, 0, 0)
             );
 
