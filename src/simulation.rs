@@ -85,9 +85,9 @@ impl Simulation {
         seed_circuits(queue, &circuit_texture);
         seed_initial_charge(queue, &charge_textures[0]);
 
-        let down_wire_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let basic_cell_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("wire"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("down_wire.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(include_str!("basic_cell.wgsl").into()),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -135,7 +135,7 @@ impl Simulation {
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("wire-pipeline"),
             layout: Some(&pipeline_layout),
-            module: &down_wire_shader,
+            module: &basic_cell_shader,
             entry_point: Some("main"),
             compilation_options: Default::default(),
             cache: None,
