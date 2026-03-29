@@ -202,13 +202,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let cols = max(1u, u32(ceil(sqrt(f32(board_count)))));
     let rows = max(1u, (board_count + cols - 1u) / cols);
 
-    let uv = clamp(
-        (in.uv - vec2(0.5, 0.5)) * render_params.uv_scale
-            + vec2(0.5, 0.5)
-            + render_params.uv_offset,
-        vec2(0.0, 0.0),
-        vec2(0.99999994, 0.99999994),
-    );
+    let uv = (in.uv - vec2(0.5, 0.5)) * render_params.uv_scale
+        + vec2(0.5, 0.5)
+        + render_params.uv_offset;
+
+    if (any(uv < vec2(0.0, 0.0)) || any(uv >= vec2(1.0, 1.0))) {
+        return vec4(0.0, 0.0, 0.0, 1.0);
+    }
     let tiled_uv = uv * vec2<f32>(f32(cols), f32(rows));
     let tile = vec2<u32>(tiled_uv);
     let layer = tile.y * cols + tile.x;

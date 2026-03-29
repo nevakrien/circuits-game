@@ -2,7 +2,6 @@ use bytemuck::{Pod, Zeroable};
 use winit::dpi::PhysicalSize;
 
 const TARGET_ASPECT_RATIO: f32 = 16.0 / 9.0;
-const MIN_ZOOM: f32 = 1.0;
 const MAX_ZOOM: f32 = 8.0;
 
 #[repr(C)]
@@ -23,18 +22,19 @@ impl CameraState {
     pub fn new(surface_size: PhysicalSize<u32>) -> Self {
         Self {
             surface_size,
-            zoom: 1.0,
+            zoom: min_zoom(surface_size),
             offset: [0.0, 0.0],
         }
     }
 
     pub fn resize(&mut self, surface_size: PhysicalSize<u32>) {
         self.surface_size = surface_size;
+        self.zoom = self.zoom.clamp(min_zoom(self.surface_size), MAX_ZOOM);
         self.clamp_offset();
     }
 
     pub fn zoom_by(&mut self, factor: f32) {
-        self.zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        self.zoom = (self.zoom * factor).clamp(min_zoom(self.surface_size), MAX_ZOOM);
         self.clamp_offset();
     }
 
@@ -46,22 +46,32 @@ impl CameraState {
 
     fn clamp_offset(&mut self) {
         let scaled = view_uv_scale(self.surface_size, self.zoom);
-        let max_offset_x = (1.0 - scaled[0]) * 0.5;
-        let max_offset_y = (1.0 - scaled[1]) * 0.5;
+        let max_offset_x = (1.0 - scaled[0]).abs() * 0.5;
+        let max_offset_y = (1.0 - scaled[1]).abs() * 0.5;
         self.offset[0] = self.offset[0].clamp(-max_offset_x, max_offset_x);
         self.offset[1] = self.offset[1].clamp(-max_offset_y, max_offset_y);
     }
 }
 
-fn view_uv_scale(surface_size: PhysicalSize<u32>, zoom: f32) -> [f32; 2] {
+fn aspect_crop(surface_size: PhysicalSize<u32>) -> [f32; 2] {
     let width = surface_size.width.max(1) as f32;
     let height = surface_size.height.max(1) as f32;
     let surface_aspect = width / height;
-    let cropped = if surface_aspect > TARGET_ASPECT_RATIO {
+
+    if surface_aspect > TARGET_ASPECT_RATIO {
         [1.0, TARGET_ASPECT_RATIO / surface_aspect]
     } else {
         [surface_aspect / TARGET_ASPECT_RATIO, 1.0]
-    };
+    }
+}
+
+fn min_zoom(surface_size: PhysicalSize<u32>) -> f32 {
+    let cropped = aspect_crop(surface_size);
+    cropped[0].min(cropped[1])
+}
+
+fn view_uv_scale(surface_size: PhysicalSize<u32>, zoom: f32) -> [f32; 2] {
+    let cropped = aspect_crop(surface_size);
 
     [cropped[0] / zoom, cropped[1] / zoom]
 }
