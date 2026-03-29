@@ -5,6 +5,7 @@ use winit::dpi::PhysicalSize;
 
 const TARGET_ASPECT_RATIO: f32 = 16.0 / 9.0;
 const MAX_ZOOM: f32 = 8.0;
+const MIN_ZOOM_FIT_FACTOR: f32 = 0.9;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -24,7 +25,7 @@ impl CameraState {
     pub fn new(surface_size: PhysicalSize<u32>) -> Self {
         Self {
             surface_size,
-            zoom: min_zoom(surface_size),
+            zoom: fit_zoom(surface_size),
             offset: [0.0, 0.0],
         }
     }
@@ -38,6 +39,11 @@ impl CameraState {
     pub fn zoom_by(&mut self, factor: f32) {
         self.zoom = (self.zoom * factor).clamp(min_zoom(self.surface_size), MAX_ZOOM);
         self.clamp_offset();
+    }
+
+    pub fn reset_to_fit(&mut self) {
+        self.zoom = fit_zoom(self.surface_size);
+        self.offset = [0.0, 0.0];
     }
 
     pub fn pan_by(&mut self, delta: [f32; 2]) {
@@ -89,6 +95,10 @@ fn aspect_crop(surface_size: PhysicalSize<u32>) -> [f32; 2] {
 }
 
 fn min_zoom(surface_size: PhysicalSize<u32>) -> f32 {
+    fit_zoom(surface_size) * MIN_ZOOM_FIT_FACTOR
+}
+
+fn fit_zoom(surface_size: PhysicalSize<u32>) -> f32 {
     let cropped = aspect_crop(surface_size);
     cropped[0].min(cropped[1])
 }
