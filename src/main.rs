@@ -61,7 +61,6 @@ async fn run() {
     let mut step_requested = false;
     let mut pressed_keys = HashSet::new();
     let mut cursor_position = None;
-    let mut pending_wire_removal_source = None;
 
     event_loop
         .run(|event, target| match event {
@@ -79,9 +78,6 @@ async fn run() {
                         });
                         if editor_ui.selected_tool() != editor::EditorTool::Wire {
                             wire_overlay.cancel_draft(&device, &queue);
-                        }
-                        if editor_ui.selected_tool() != editor::EditorTool::RemoveWire {
-                            pending_wire_removal_source = None;
                         }
                         egui_state.handle_platform_output(&window, full_output.platform_output);
                         let paint_jobs =
@@ -238,7 +234,6 @@ async fn run() {
                                                 layer: displayed_layer,
                                             },
                                         );
-                                        pending_wire_removal_source = None;
                                         let hover = cursor_position.and_then(|cursor| {
                                             wires::cursor_to_board_point(
                                                 camera,
@@ -263,7 +258,6 @@ async fn run() {
                                                 layer: displayed_layer,
                                             },
                                         );
-                                        pending_wire_removal_source = None;
                                         let hover = cursor_position.and_then(|cursor| {
                                             wires::cursor_to_board_point(
                                                 camera,
@@ -294,17 +288,12 @@ async fn run() {
 
                                     if !event.repeat && code == KeyCode::Escape {
                                         wire_overlay.cancel_draft(&device, &queue);
-                                        pending_wire_removal_source = None;
                                         window.request_redraw();
                                     }
 
                                     if !event.repeat && code == KeyCode::Backspace {
                                         if editor_ui.selected_tool() == editor::EditorTool::Wire {
                                             wire_overlay.pop_point(&device, &queue);
-                                        } else if editor_ui.selected_tool()
-                                            == editor::EditorTool::RemoveWire
-                                        {
-                                            pending_wire_removal_source = None;
                                         }
                                         window.request_redraw();
                                     }
@@ -376,13 +365,13 @@ async fn run() {
                                         }
                                     }
                                     editor::EditorTool::RemoveWire => {
-                                        let endpoint = components::WireEndpointId::from_grid_cell(
-                                            source,
-                                            displayed_layer,
-                                        );
-                                        if let Some(removal_source) = pending_wire_removal_source {
+                                        if let Some(point) = wires::cursor_to_board_point(
+                                            camera,
+                                            cursor,
+                                            [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
+                                        ) {
                                             if edited_component
-                                                .remove_wire_edge_between(removal_source, endpoint)
+                                                .remove_wire_at_point(displayed_layer, point)
                                                 .is_some()
                                             {
                                                 sync_component_wires(
@@ -392,10 +381,6 @@ async fn run() {
                                                     &queue,
                                                 );
                                             }
-                                            pending_wire_removal_source = None;
-                                            window.request_redraw();
-                                        } else {
-                                            pending_wire_removal_source = Some(endpoint);
                                             window.request_redraw();
                                         }
                                     }
@@ -420,8 +405,6 @@ async fn run() {
                                 &device,
                                 &queue,
                             );
-                        } else if editor_ui.selected_tool() == editor::EditorTool::RemoveWire {
-                            pending_wire_removal_source = None;
                         }
                         window.request_redraw();
                     }

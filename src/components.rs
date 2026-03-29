@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use crate::wires::{GridCell, WirePoint};
 
+const WIRE_DELETE_DISTANCE: f32 = 0.35;
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ComponentBufferId {
     pub texture_index: u32,
@@ -105,9 +107,62 @@ impl ComponentInfo {
             .or_else(|| self.remove_wire_edge(second_id, first_id))
     }
 
+    pub fn remove_wire_at_point(&mut self, layer: u32, point: WirePoint) -> Option<StoredWireEdge> {
+        let (key, index) = self
+            .wire_edges
+            .iter()
+            .filter(|(_, edges)| {
+                edges
+                    .first()
+                    .is_some_and(|edge| edge.source_id.layer == layer)
+            })
+            .find_map(|(key, edges)| {
+                edges
+                    .iter()
+                    .position(|edge| wire_contains_point(&edge.points, point, WIRE_DELETE_DISTANCE))
+                    .map(|index| (*key, index))
+            })?;
+
+        let edges = self.wire_edges.get_mut(&key)?;
+        let removed = edges.remove(index);
+        if edges.is_empty() {
+            self.wire_edges.remove(&key);
+        }
+        Some(removed)
+    }
+
     pub fn wire_edges(&self) -> impl Iterator<Item = &StoredWireEdge> {
         self.wire_edges.values().flatten()
     }
+}
+
+fn wire_contains_point(points: &[WirePoint], point: WirePoint, max_distance: f32) -> bool {
+    points
+        .windows(2)
+        .any(|segment| point_to_segment_distance(point, segment[0], segment[1]) <= max_distance)
+}
+
+fn point_to_segment_distance(point: WirePoint, start: WirePoint, end: WirePoint) -> f32 {
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    let length_squared = dx * dx + dy * dy;
+    if length_squared <= f32::EPSILON {
+        return point_distance(point, start);
+    }
+
+    let t = ((point.x - start.x) * dx + (point.y - start.y) * dy) / length_squared;
+    let t = t.clamp(0.0, 1.0);
+    let projection = WirePoint {
+        x: start.x + dx * t,
+        y: start.y + dy * t,
+    };
+    point_distance(point, projection)
+}
+
+fn point_distance(first: WirePoint, second: WirePoint) -> f32 {
+    let dx = second.x - first.x;
+    let dy = second.y - first.y;
+    (dx * dx + dy * dy).sqrt()
 }
 
 #[cfg(test)]
@@ -205,6 +260,60 @@ mod tests {
         let removed = component.remove_wire_edge(source_id, destination_id);
 
         assert!(removed.is_some());
+        assert_eq!(component.wire_edges().count(), 1);
+    }
+
+    #[test]
+    fn removes_wire_when_click_hits_segment_on_same_layer() {
+        let mut component = ComponentInfo::new(ComponentBufferId {
+            texture_index: 0,
+            layer: 1,
+        });
+        component.add_wire_edge(StoredWireEdge {
+            source_id: WireEndpointId {
+                x: 1,
+                y: 1,
+                layer: 1,
+            },
+            destination_id: WireEndpointId {
+                x: 4,
+                y: 1,
+                layer: 1,
+            },
+            points: vec![WirePoint { x: 1.0, y: 1.0 }, WirePoint { x: 4.0, y: 1.0 }],
+            color: [1.0, 1.0, 1.0, 1.0],
+        });
+
+        let removed = component.remove_wire_at_point(1, WirePoint { x: 2.5, y: 1.2 });
+
+        assert!(removed.is_some());
+        assert_eq!(component.wire_edges().count(), 0);
+    }
+
+    #[test]
+    fn keeps_wire_when_click_hits_different_layer() {
+        let mut component = ComponentInfo::new(ComponentBufferId {
+            texture_index: 0,
+            layer: 1,
+        });
+        component.add_wire_edge(StoredWireEdge {
+            source_id: WireEndpointId {
+                x: 1,
+                y: 1,
+                layer: 1,
+            },
+            destination_id: WireEndpointId {
+                x: 4,
+                y: 1,
+                layer: 1,
+            },
+            points: vec![WirePoint { x: 1.0, y: 1.0 }, WirePoint { x: 4.0, y: 1.0 }],
+            color: [1.0, 1.0, 1.0, 1.0],
+        });
+
+        let removed = component.remove_wire_at_point(2, WirePoint { x: 2.5, y: 1.0 });
+
+        assert!(removed.is_none());
         assert_eq!(component.wire_edges().count(), 1);
     }
 }
