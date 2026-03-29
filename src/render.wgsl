@@ -113,7 +113,7 @@ fn render_wire(
     let head_left = segment_mask(centered, tip, tip - flow * 0.085 + wing, 0.016);
     let head_right = segment_mask(centered, tip, tip - flow * 0.085 - wing, 0.016);
     let arrow = max(shaft, max(head_left, head_right)) * circle;
-    let arrow_color = mix(vec3(0.02, 0.03, 0.04), vec3(0.97, 0.99, 1.0), 0.35 + charge_level * 0.65);
+    let arrow_color = mix(vec3(0.5, 0.03, 0.04), vec3(1.0, 0.2, 0.1), 0.35 + charge_level * 0.65);
 
     var color = base;
     color = mix(color, node_color, circle);
