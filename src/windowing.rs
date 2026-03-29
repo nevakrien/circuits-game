@@ -1,6 +1,8 @@
 use std::sync::Arc;
+use egui_wgpu::wgpu;
+use egui_winit::winit;
 
-use winit::{dpi::PhysicalSize, event_loop::EventLoop, window::Window};
+use winit::{dpi::PhysicalSize, event_loop::EventLoop, window::{Window, WindowAttributes}};
 
 pub struct WindowState {
     pub event_loop: EventLoop<()>,
@@ -11,9 +13,10 @@ pub struct WindowState {
     pub queue: wgpu::Queue,
 }
 
+#[allow(deprecated)]
 pub async fn prepare_window() -> WindowState {
     let event_loop = EventLoop::new().unwrap();
-    let window = Arc::new(Window::new(&event_loop).unwrap());
+    let window = Arc::new(event_loop.create_window(WindowAttributes::default()).unwrap());
 
     let instance = wgpu::Instance::default();
     let adapter = instance

@@ -1,4 +1,6 @@
 use bytemuck::{Pod, Zeroable};
+use egui_wgpu::wgpu;
+use egui_winit::winit;
 use winit::dpi::PhysicalSize;
 
 use crate::render::CameraState;
@@ -120,8 +122,8 @@ impl WireOverlay {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("wire-overlay-pipeline-layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
-            ..Default::default()
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
         });
 
         let vertex_layout = wgpu::VertexBufferLayout {
@@ -161,7 +163,7 @@ impl WireOverlay {
             },
             depth_stencil: None,
             multisample: Default::default(),
-            multiview_mask: None,
+            multiview: None,
             cache: None,
         });
 

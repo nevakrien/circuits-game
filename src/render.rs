@@ -1,3 +1,5 @@
+use egui_wgpu::wgpu;
+use egui_winit::winit;
 use bytemuck::{Pod, Zeroable};
 use winit::dpi::PhysicalSize;
 
@@ -110,9 +112,11 @@ impl Renderer {
         surface_format: wgpu::TextureFormat,
         surface_size: PhysicalSize<u32>,
     ) -> Self {
+        let shader_source = [include_str!("gates_render_header.wgsl"), include_str!("render.wgsl")]
+            .join("\n");
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("render"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("render.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
         });
 
         let texture_entry = |binding| wgpu::BindGroupLayoutEntry {
@@ -153,8 +157,8 @@ impl Renderer {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("render-pipeline-layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
-            ..Default::default()
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -179,7 +183,7 @@ impl Renderer {
             primitive: Default::default(),
             depth_stencil: None,
             multisample: Default::default(),
-            multiview_mask: None,
+            multiview: None,
             cache: None,
         });
 

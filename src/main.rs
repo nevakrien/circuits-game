@@ -1,3 +1,5 @@
+use egui_wgpu::wgpu;
+use egui_winit::winit;
 use circuits_game::{render, simulation, windowing, wires};
 
 use winit::{
@@ -77,20 +79,13 @@ async fn run() {
                 let next_buffer = (current_buffer + 1) % simulation::CHARGE_BUFFER_COUNT;
 
                 let frame = match surface.get_current_texture() {
-                    wgpu::CurrentSurfaceTexture::Success(frame)
-                    | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
-
-                    wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                    Ok(frame) => frame,
+                    Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
                         surface.configure(&device, &config);
                         return;
                     }
-
-                    wgpu::CurrentSurfaceTexture::Timeout
-                    | wgpu::CurrentSurfaceTexture::Occluded => return,
-
-                    wgpu::CurrentSurfaceTexture::Validation => {
-                        panic!("surface validation error");
-                    }
+                    Err(wgpu::SurfaceError::Timeout | wgpu::SurfaceError::OutOfMemory) => return,
+                    Err(wgpu::SurfaceError::Other) => return,
                 };
 
                 let display_frame = if step_requested {
