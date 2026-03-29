@@ -3,6 +3,10 @@ pub const GRID_HEIGHT: u32 = 8;
 pub const BOARD_LAYERS: u32 = 4;
 pub const CHARGE_BUFFER_COUNT: u32 = 2;
 
+const CHARGE_GRID_WIDTH: u32 = GRID_WIDTH.div_ceil(2);
+const CHARGE_GRID_HEIGHT: u32 = GRID_HEIGHT.div_ceil(2);
+const CHARGE_TEXEL_SIZE: u32 = 4;
+
 const CHARGE_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Uint;
 const CIRCUIT_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Uint;
 
@@ -29,6 +33,35 @@ pub struct Simulation {
     circuit_view: wgpu::TextureView,
 }
 
+pub type PackedChargeTexels = Vec<[u8; 4]>;
+
+pub fn packed_charge_texel_coord(x: u32, y: u32, z: u32) -> (u32, u32, u32) {
+    (x / 2, y / 2, z)
+}
+
+pub fn packed_charge_channel(x: u32, y: u32) -> usize {
+    ((y & 1) * 2 + (x & 1)) as usize
+}
+
+pub fn packed_charge_texel_index(x: u32, y: u32, z: u32) -> usize {
+    let (packed_x, packed_y, packed_z) = packed_charge_texel_coord(x, y, z);
+    (packed_z * CHARGE_GRID_WIDTH * CHARGE_GRID_HEIGHT + packed_y * CHARGE_GRID_WIDTH + packed_x)
+        as usize
+}
+
+pub fn read_packed_charge(texels: &[[u8; 4]], x: u32, y: u32, z: u32) -> u8 {
+    texels[packed_charge_texel_index(x, y, z)][packed_charge_channel(x, y)]
+}
+
+pub fn write_packed_charge(texels: &mut [[u8; 4]], x: u32, y: u32, z: u32, value: u8) {
+    texels[packed_charge_texel_index(x, y, z)][packed_charge_channel(x, y)] = value;
+}
+
+fn charge_readback_bytes_per_row() -> u32 {
+    let unpadded = CHARGE_GRID_WIDTH * CHARGE_TEXEL_SIZE;
+    unpadded.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+}
+
 impl Simulation {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
         let charge_textures: Vec<_> = (0..CHARGE_BUFFER_COUNT)
@@ -36,8 +69,8 @@ impl Simulation {
                 device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("simulation-charge"),
                     size: wgpu::Extent3d {
-                        width: GRID_WIDTH,
-                        height: GRID_HEIGHT,
+                        width: CHARGE_GRID_WIDTH,
+                        height: CHARGE_GRID_HEIGHT,
                         depth_or_array_layers: BOARD_LAYERS,
                     },
                     mip_level_count: 1,
@@ -46,7 +79,8 @@ impl Simulation {
                     format: CHARGE_TEXTURE_FORMAT,
                     usage: wgpu::TextureUsages::TEXTURE_BINDING
                         | wgpu::TextureUsages::STORAGE_BINDING
-                        | wgpu::TextureUsages::COPY_DST,
+                        | wgpu::TextureUsages::COPY_DST
+                        | wgpu::TextureUsages::COPY_SRC,
                     view_formats: &[],
                 })
             })
@@ -159,6 +193,93 @@ impl Simulation {
         &self.circuit_view
     }
 
+    pub async fn read_charge_buffer(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        buffer_index: u32,
+    ) -> PackedChargeTexels {
+        let bytes_per_row = charge_readback_bytes_per_row();
+        let size = u64::from(bytes_per_row) * u64::from(CHARGE_GRID_HEIGHT) * u64::from(BOARD_LAYERS);
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("simulation-charge-readback"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("simulation-charge-readback"),
+        });
+
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self._charge_textures[buffer_index as usize],
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(CHARGE_GRID_HEIGHT),
+                },
+            },
+            wgpu::Extent3d {
+                width: CHARGE_GRID_WIDTH,
+                height: CHARGE_GRID_HEIGHT,
+                depth_or_array_layers: BOARD_LAYERS,
+            },
+        );
+
+        queue.submit(Some(encoder.finish()));
+
+        let slice = readback.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).unwrap();
+        });
+        let _ = device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        receiver.recv().unwrap().unwrap();
+
+        let mapped = slice.get_mapped_range();
+        let mut texels = vec![[0u8; 4]; (CHARGE_GRID_WIDTH * CHARGE_GRID_HEIGHT * BOARD_LAYERS) as usize];
+        for z in 0..BOARD_LAYERS as usize {
+            for y in 0..CHARGE_GRID_HEIGHT as usize {
+                let src_row_offset = z * CHARGE_GRID_HEIGHT as usize * bytes_per_row as usize
+                    + y * bytes_per_row as usize;
+                let dst_row_offset = z * CHARGE_GRID_HEIGHT as usize * CHARGE_GRID_WIDTH as usize + y * CHARGE_GRID_WIDTH as usize;
+                let src_row = &mapped[src_row_offset..src_row_offset + CHARGE_GRID_WIDTH as usize * CHARGE_TEXEL_SIZE as usize];
+                for x in 0..CHARGE_GRID_WIDTH as usize {
+                    let src = x * CHARGE_TEXEL_SIZE as usize;
+                    texels[dst_row_offset + x].copy_from_slice(&src_row[src..src + CHARGE_TEXEL_SIZE as usize]);
+                }
+            }
+        }
+        drop(mapped);
+        readback.unmap();
+
+        texels
+    }
+
+    pub async fn read_charge_value(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        buffer_index: u32,
+        x: u32,
+        y: u32,
+        z: u32,
+    ) -> u8 {
+        let texels = self.read_charge_buffer(device, queue, buffer_index).await;
+        read_packed_charge(&texels, x, y, z)
+    }
+
     pub fn step(
         &self,
         device: &wgpu::Device,
@@ -189,15 +310,16 @@ impl Simulation {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups(
-            GRID_WIDTH.div_ceil(8),
-            GRID_HEIGHT.div_ceil(8),
+            CHARGE_GRID_WIDTH.div_ceil(8),
+            CHARGE_GRID_HEIGHT.div_ceil(8),
             BOARD_LAYERS,
         );
     }
 }
 
 fn seed_initial_charge(queue: &wgpu::Queue, texture: &wgpu::Texture) {
-    let initial_state = vec![[0u8; 4]; (GRID_WIDTH * GRID_HEIGHT * BOARD_LAYERS) as usize];
+    let initial_state =
+        vec![[0u8; 4]; (CHARGE_GRID_WIDTH * CHARGE_GRID_HEIGHT * BOARD_LAYERS) as usize];
 
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
@@ -209,12 +331,12 @@ fn seed_initial_charge(queue: &wgpu::Queue, texture: &wgpu::Texture) {
         bytemuck::cast_slice(&initial_state),
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(GRID_WIDTH * 4),
-            rows_per_image: Some(GRID_HEIGHT),
+            bytes_per_row: Some(CHARGE_GRID_WIDTH * 4),
+            rows_per_image: Some(CHARGE_GRID_HEIGHT),
         },
         wgpu::Extent3d {
-            width: GRID_WIDTH,
-            height: GRID_HEIGHT,
+            width: CHARGE_GRID_WIDTH,
+            height: CHARGE_GRID_HEIGHT,
             depth_or_array_layers: BOARD_LAYERS,
         },
     );
@@ -319,5 +441,101 @@ fn is_source_cell(x: u32, y: u32, z: u32) -> bool {
         2 => x >= GRID_WIDTH / 2,
         3 => x == GRID_WIDTH / 2,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn create_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::default();
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .await
+            .ok()?;
+
+        adapter
+            .request_device(&wgpu::DeviceDescriptor::default())
+            .await
+            .ok()
+    }
+
+    fn expected_charge_after_steps(steps: u32, x: u32, y: u32, z: u32) -> u8 {
+        if is_noop_cell(x, y, z) || steps <= y {
+            return 0;
+        }
+
+        if !is_source_cell(x, 0, z) || is_noop_cell(x, 0, z) {
+            return 0;
+        }
+
+        for scan_y in 1..=y {
+            if is_noop_cell(x, scan_y, z) {
+                return 0;
+            }
+        }
+
+        source_constant_for_layer(z)
+    }
+
+    #[test]
+    fn packed_charge_cpu_helpers_match_layout() {
+        let mut texels = vec![[0u8; 4]; (CHARGE_GRID_WIDTH * CHARGE_GRID_HEIGHT * BOARD_LAYERS) as usize];
+
+        write_packed_charge(&mut texels, 0, 0, 0, 0x11);
+        write_packed_charge(&mut texels, 1, 0, 0, 0x22);
+        write_packed_charge(&mut texels, 0, 1, 0, 0x33);
+        write_packed_charge(&mut texels, 1, 1, 0, 0x44);
+
+        assert_eq!(texels[packed_charge_texel_index(0, 0, 0)], [0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(read_packed_charge(&texels, 0, 0, 0), 0x11);
+        assert_eq!(read_packed_charge(&texels, 1, 0, 0), 0x22);
+        assert_eq!(read_packed_charge(&texels, 0, 1, 0), 0x33);
+        assert_eq!(read_packed_charge(&texels, 1, 1, 0), 0x44);
+    }
+
+    #[test]
+    fn simulation_step_can_be_read_back_without_window() {
+        let Some((device, queue)) = pollster::block_on(create_headless_device()) else {
+            return;
+        };
+
+        let simulation = Simulation::new(&device, &queue);
+        let mut current_buffer = 0;
+
+        for step in 1..=GRID_HEIGHT {
+            let next_buffer = (current_buffer + 1) % CHARGE_BUFFER_COUNT;
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("simulation-test-step"),
+            });
+            simulation.step(&device, &mut encoder, current_buffer, next_buffer);
+            queue.submit(Some(encoder.finish()));
+
+            let texels = pollster::block_on(simulation.read_charge_buffer(
+                &device,
+                &queue,
+                next_buffer,
+            ));
+
+            assert_eq!(
+                pollster::block_on(simulation.read_charge_value(&device, &queue, next_buffer, 0, 0, 0)),
+                expected_charge_after_steps(step, 0, 0, 0)
+            );
+
+            for z in 0..BOARD_LAYERS {
+                for y in 0..GRID_HEIGHT {
+                    for x in 0..GRID_WIDTH {
+                        assert_eq!(
+                            read_packed_charge(&texels, x, y, z),
+                            expected_charge_after_steps(step, x, y, z),
+                            "mismatch at step={step}, coord=({x}, {y}, {z})"
+                        );
+                    }
+                }
+            }
+
+            current_buffer = next_buffer;
+        }
     }
 }

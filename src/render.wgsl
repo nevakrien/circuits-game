@@ -4,6 +4,30 @@ var charge_tex: texture_3d<u32>;
 @group(0) @binding(1)
 var circuit_tex: texture_3d<u32>;
 
+fn byte_channel(coord: vec2<u32>) -> u32 {
+    return (coord.y & 1u) * 2u + (coord.x & 1u);
+}
+
+fn read_byte(tex: texture_3d<u32>, coord: vec3<u32>) -> u32 {
+    let packed_coord = vec3<i32>(i32(coord.x >> 1u), i32(coord.y >> 1u), i32(coord.z));
+    let packed = textureLoad(tex, packed_coord, 0);
+
+    switch (byte_channel(coord.xy)) {
+        case 0u: {
+            return packed.x;
+        }
+        case 1u: {
+            return packed.y;
+        }
+        case 2u: {
+            return packed.z;
+        }
+        default: {
+            return packed.w;
+        }
+    }
+}
+
 struct VsOut {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
@@ -165,7 +189,7 @@ fn vs_main(@builtin(vertex_index) index: u32) -> VsOut {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let dims = textureDimensions(charge_tex);
+    let dims = textureDimensions(circuit_tex);
     let board_count = dims.z;
     let cols = max(1u, u32(ceil(sqrt(f32(board_count)))));
     let rows = max(1u, (board_count + cols - 1u) / cols);
@@ -186,7 +210,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let centered = local_uv - vec2(0.5, 0.5);
 
     let sample_coord = vec3<i32>(vec2<i32>(coord), i32(layer));
-    let charge = textureLoad(charge_tex, sample_coord, 0).x & 0xffu;
+    let charge = read_byte(charge_tex, vec3u(coord, layer)) & 0xffu;
     let circuit = textureLoad(circuit_tex, sample_coord, 0);
 
     let radius = length(centered);
