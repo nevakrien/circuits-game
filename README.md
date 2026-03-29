@@ -19,7 +19,7 @@ Which works very well with double-buffers (no false share risk).
 when you add to this the fact most human built circuts follow a natural 2D structure it pushes us to want to store things closely based on their 2D distance to eachother, to have the best cache locality possible.
 
 Each circut board is simulated as a grid where each cell has a charge and we run a kernel over that space to write the charge to the next buffer.
-we also support having multiple sub component, these grids are allocated in standard sizes of Nx(N+-4) N<=1024 arenas which can each be a single large 3D texture subdivides properly into 7\*10 diffrent types of pages containing texture of thier type so each 1024x1024 slice can be split into multiple smaller slice.
+we also support having multiple sub component, these grids are allocated in standard sizes of Nx(N+-4) N<=1024 arenas which can each be a single large 3D texture subdivides properly into diffrent types of pages containing texture of thier type so each 1024x1024 slice can be split into multiple smaller slice.
 
 circut are stored in a similar manner with a tag+data union aproch.
 each location has 1 circut which it stores, this is chosen over a sparse represntation because the index would be 32bit (10x10x12) which is a lot of memory for this setup. for a CPU based aproch we would go dense and eat the cost.

@@ -1,6 +1,7 @@
 mod render;
 mod simulation;
 mod windowing;
+mod allocator;
 
 use winit::{
     event::*,
