@@ -1,20 +1,41 @@
 @group(0) @binding(0)
-var history: texture_2d<u32>;
+var history: texture_3d<u32>;
 
 @group(0) @binding(1)
-var out_tex: texture_storage_2d<r32uint, write>;
+var circuits: texture_3d<u32>;
+
+@group(0) @binding(2)
+var out_tex: texture_storage_3d<rgba8uint, write>;
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let x = i32(id.x);
-    let y = i32(id.y);
+    let dims = textureDimensions(history);
 
-    if (x >= 8 || y >= 8) {
+    if (any(id >= dims)) {
         return;
     }
 
-    let y_down = max(y - 1, 0);
-    let below = textureLoad(history, vec2<i32>(x, y_down), 0).x;
+    let coord = vec3<i32>(id);
+    let current_charge = textureLoad(history, coord, 0).x & 0xffu;
+    let circuit = textureLoad(circuits, coord, 0);
+    let payload = circuit.yzw & vec3u(0xffu, 0xffu, 0xffu);
 
-    textureStore(out_tex, vec2<i32>(x, y), vec4<u32>(below, 0u, 0u, 0u));
+    var next_charge = current_charge;
+    switch (circuit.x & 0xffu) {
+        case 0u: {
+            next_charge = 0u;
+        }
+        case 1u: {
+            next_charge = payload.x;
+        }
+        case 2u: {
+            let src = min(payload, dims - vec3u(1u, 1u, 1u));
+            next_charge = textureLoad(history, vec3<i32>(src), 0).x & 0xffu;
+        }
+        default: {
+            next_charge = current_charge;
+        }
+    }
+
+    textureStore(out_tex, coord, vec4<u32>(next_charge, 0u, 0u, 0u));
 }

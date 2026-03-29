@@ -28,7 +28,7 @@ async fn run() {
     let simulation = simulation::Simulation::new(&device, &queue);
     let renderer = render::Renderer::new(&device, config.format);
 
-    let mut frame_index = 0;
+    let mut current_buffer = 0;
     let mut step_requested = false;
 
     event_loop
@@ -39,8 +39,7 @@ async fn run() {
                 event: WindowEvent::RedrawRequested,
                 ..
             } => {
-                let current_frame = frame_index % simulation::FRAME_HISTORY;
-                let next_frame = (frame_index + 1) % simulation::FRAME_HISTORY;
+                let next_buffer = (current_buffer + 1) % simulation::CHARGE_BUFFER_COUNT;
 
                 let frame = match surface.get_current_texture() {
                     wgpu::CurrentSurfaceTexture::Success(frame)
@@ -60,30 +59,31 @@ async fn run() {
                 };
 
                 let display_frame = if step_requested {
-                    next_frame
+                    next_buffer
                 } else {
-                    current_frame
+                    current_buffer
                 };
 
                 let mut encoder =
                     device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
                 if step_requested {
-                    simulation.step(&device, &mut encoder, current_frame, next_frame);
+                    simulation.step(&device, &mut encoder, current_buffer, next_buffer);
                 }
 
                 renderer.draw(
                     &device,
                     &mut encoder,
                     &frame.texture,
-                    simulation.frame_view(display_frame),
+                    simulation.charge_view(display_frame),
+                    simulation.circuit_view(),
                 );
 
                 queue.submit(Some(encoder.finish()));
                 frame.present();
 
                 if step_requested {
-                    frame_index = next_frame;
+                    current_buffer = next_buffer;
                     step_requested = false;
                 }
             }

@@ -159,13 +159,13 @@ impl Page {
         (self.free_bits[word_idx] & (1u64 << bit)) != 0
     }
 
-    fn mark_slot_allocated(&mut self, slot: u32) {
-        debug_assert!(slot < self.capacity);
-        let word_idx = (slot / 64) as usize;
-        let bit = slot % 64;
-        self.free_bits[word_idx] &= !(1u64 << bit);
-        self.free_count -= 1;
-    }
+    // fn mark_slot_allocated(&mut self, slot: u32) {
+    //     debug_assert!(slot < self.capacity);
+    //     let word_idx = (slot / 64) as usize;
+    //     let bit = slot % 64;
+    //     self.free_bits[word_idx] &= !(1u64 << bit);
+    //     self.free_count -= 1;
+    // }
 
     fn mark_slot_free(&mut self, slot: u32) {
         debug_assert!(slot < self.capacity);

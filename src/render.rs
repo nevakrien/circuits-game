@@ -10,24 +10,26 @@ impl Renderer {
             source: wgpu::ShaderSource::Wgsl(include_str!("render.wgsl").into()),
         });
 
+        let texture_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                multisampled: false,
+                view_dimension: wgpu::TextureViewDimension::D3,
+                sample_type: wgpu::TextureSampleType::Uint,
+            },
+            count: None,
+        };
+
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("render-bind-group-layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    multisampled: false,
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    sample_type: wgpu::TextureSampleType::Uint,
-                },
-                count: None,
-            }],
+            entries: &[texture_entry(0), texture_entry(1)],
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("render-pipeline-layout"),
             bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 0,
+            ..Default::default()
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -67,20 +69,28 @@ impl Renderer {
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         surface_texture: &wgpu::Texture,
-        simulation_view: &wgpu::TextureView,
+        charge_view: &wgpu::TextureView,
+        circuit_view: &wgpu::TextureView,
     ) {
         let output_view = surface_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("render-bind-group"),
             layout: &self.bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(simulation_view),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(charge_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(circuit_view),
+                },
+            ],
         });
 
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("render-pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &output_view,
                 resolve_target: None,
