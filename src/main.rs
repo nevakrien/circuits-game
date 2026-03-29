@@ -1,6 +1,6 @@
+use circuits_game::{components, editor, render, simulation, windowing, wires};
 use egui_wgpu::wgpu;
 use egui_winit::winit;
-use circuits_game::{editor, render, simulation, windowing, wires};
 
 use winit::{
     event::*,
@@ -52,11 +52,16 @@ async fn run() {
         egui_wgpu::RendererOptions::default(),
     );
     let mut editor_ui = editor::EditorUi::new();
+    let mut edited_component = components::ComponentInfo::new(components::ComponentBufferId {
+        texture_index: 0,
+        layer: displayed_layer,
+    });
 
     let mut current_buffer = 0;
     let mut step_requested = false;
     let mut pressed_keys = HashSet::new();
     let mut cursor_position = None;
+    let mut pending_wire_removal_source = None;
 
     event_loop
         .run(|event, target| match event {
@@ -72,6 +77,12 @@ async fn run() {
                         let full_output = egui_ctx.run(raw_input, |ctx| {
                             reset_camera = editor_ui.show(ctx, displayed_layer);
                         });
+                        if editor_ui.selected_tool() != editor::EditorTool::Wire {
+                            wire_overlay.cancel_draft(&device, &queue);
+                        }
+                        if editor_ui.selected_tool() != editor::EditorTool::RemoveWire {
+                            pending_wire_removal_source = None;
+                        }
                         egui_state.handle_platform_output(&window, full_output.platform_output);
                         let paint_jobs =
                             egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
@@ -134,8 +145,8 @@ async fn run() {
                             current_buffer
                         };
 
-                        let mut encoder =
-                            device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                        let mut encoder = device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
                         if step_requested {
                             simulation.step(&device, &mut encoder, current_buffer, next_buffer);
@@ -196,6 +207,10 @@ async fn run() {
 
                         if step_requested {
                             current_buffer = next_buffer;
+                            edited_component.set_buffer_id(components::ComponentBufferId {
+                                texture_index: current_buffer,
+                                layer: displayed_layer,
+                            });
                             step_requested = false;
                         }
                     }
@@ -217,6 +232,13 @@ async fn run() {
                                     if !event.repeat && code == KeyCode::ArrowUp {
                                         displayed_layer = (displayed_layer + 1)
                                             .min(simulation::BOARD_LAYERS.saturating_sub(1));
+                                        edited_component.set_buffer_id(
+                                            components::ComponentBufferId {
+                                                texture_index: current_buffer,
+                                                layer: displayed_layer,
+                                            },
+                                        );
+                                        pending_wire_removal_source = None;
                                         let hover = cursor_position.and_then(|cursor| {
                                             wires::cursor_to_board_point(
                                                 camera,
@@ -224,13 +246,24 @@ async fn run() {
                                                 [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
                                             )
                                         });
-                                        wire_overlay
-                                            .update_hover(&device, &queue, displayed_layer, hover);
+                                        wire_overlay.update_hover(
+                                            &device,
+                                            &queue,
+                                            displayed_layer,
+                                            hover,
+                                        );
                                         window.request_redraw();
                                     }
 
                                     if !event.repeat && code == KeyCode::ArrowDown {
                                         displayed_layer = displayed_layer.saturating_sub(1);
+                                        edited_component.set_buffer_id(
+                                            components::ComponentBufferId {
+                                                texture_index: current_buffer,
+                                                layer: displayed_layer,
+                                            },
+                                        );
+                                        pending_wire_removal_source = None;
                                         let hover = cursor_position.and_then(|cursor| {
                                             wires::cursor_to_board_point(
                                                 camera,
@@ -238,24 +271,41 @@ async fn run() {
                                                 [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
                                             )
                                         });
-                                        wire_overlay
-                                            .update_hover(&device, &queue, displayed_layer, hover);
+                                        wire_overlay.update_hover(
+                                            &device,
+                                            &queue,
+                                            displayed_layer,
+                                            hover,
+                                        );
                                         window.request_redraw();
                                     }
 
                                     if !event.repeat && code == KeyCode::Enter {
-                                        if wire_overlay.commit_draft(&device, &queue) {
+                                        if editor_ui.selected_tool() == editor::EditorTool::Wire {
+                                            finish_wire_attempt(
+                                                &mut wire_overlay,
+                                                &mut edited_component,
+                                                &device,
+                                                &queue,
+                                            );
                                             window.request_redraw();
                                         }
                                     }
 
                                     if !event.repeat && code == KeyCode::Escape {
                                         wire_overlay.cancel_draft(&device, &queue);
+                                        pending_wire_removal_source = None;
                                         window.request_redraw();
                                     }
 
                                     if !event.repeat && code == KeyCode::Backspace {
-                                        wire_overlay.pop_point(&device, &queue);
+                                        if editor_ui.selected_tool() == editor::EditorTool::Wire {
+                                            wire_overlay.pop_point(&device, &queue);
+                                        } else if editor_ui.selected_tool()
+                                            == editor::EditorTool::RemoveWire
+                                        {
+                                            pending_wire_removal_source = None;
+                                        }
                                         window.request_redraw();
                                     }
                                 }
@@ -291,26 +341,66 @@ async fn run() {
                         }
 
                         if let Some(cursor) = cursor_position {
-                            if let (Some(point), Some(source)) = (
-                                wires::cursor_to_board_point(
-                                    camera,
-                                    cursor,
-                                    [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
-                                ),
-                                wires::snap_cursor_to_cell(
-                                    camera,
-                                    cursor,
-                                    [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
-                                ),
+                            if let Some(source) = wires::snap_cursor_to_cell(
+                                camera,
+                                cursor,
+                                [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
                             ) {
-                                wire_overlay.add_point(
-                                    &device,
-                                    &queue,
-                                    displayed_layer,
-                                    point,
-                                    source,
-                                );
-                                window.request_redraw();
+                                match editor_ui.selected_tool() {
+                                    editor::EditorTool::Wire => {
+                                        if let Some(point) = wires::cursor_to_board_point(
+                                            camera,
+                                            cursor,
+                                            [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
+                                        ) {
+                                            let had_draft = wire_overlay.has_draft();
+                                            wire_overlay.add_point(
+                                                &device,
+                                                &queue,
+                                                displayed_layer,
+                                                point,
+                                                source,
+                                            );
+                                            let extend_wire = pressed_keys
+                                                .contains(&KeyCode::ShiftLeft)
+                                                || pressed_keys.contains(&KeyCode::ShiftRight);
+                                            if had_draft && !extend_wire {
+                                                finish_wire_attempt(
+                                                    &mut wire_overlay,
+                                                    &mut edited_component,
+                                                    &device,
+                                                    &queue,
+                                                );
+                                            }
+                                            window.request_redraw();
+                                        }
+                                    }
+                                    editor::EditorTool::RemoveWire => {
+                                        let endpoint = components::WireEndpointId::from_grid_cell(
+                                            source,
+                                            displayed_layer,
+                                        );
+                                        if let Some(removal_source) = pending_wire_removal_source {
+                                            if edited_component
+                                                .remove_wire_edge_between(removal_source, endpoint)
+                                                .is_some()
+                                            {
+                                                sync_component_wires(
+                                                    &mut wire_overlay,
+                                                    &edited_component,
+                                                    &device,
+                                                    &queue,
+                                                );
+                                            }
+                                            pending_wire_removal_source = None;
+                                            window.request_redraw();
+                                        } else {
+                                            pending_wire_removal_source = Some(endpoint);
+                                            window.request_redraw();
+                                        }
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
                     }
@@ -323,7 +413,16 @@ async fn run() {
                             window.request_redraw();
                             return;
                         }
-                        wire_overlay.pop_point(&device, &queue);
+                        if editor_ui.selected_tool() == editor::EditorTool::Wire {
+                            finish_wire_attempt(
+                                &mut wire_overlay,
+                                &mut edited_component,
+                                &device,
+                                &queue,
+                            );
+                        } else if editor_ui.selected_tool() == editor::EditorTool::RemoveWire {
+                            pending_wire_removal_source = None;
+                        }
                         window.request_redraw();
                     }
                     WindowEvent::Resized(size) => {
@@ -342,4 +441,27 @@ async fn run() {
             _ => {}
         })
         .unwrap();
+}
+
+fn sync_component_wires(
+    wire_overlay: &mut wires::WireOverlay,
+    component: &components::ComponentInfo,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) {
+    wire_overlay.replace_wires(device, queue, component.wire_edges().cloned().collect());
+}
+
+fn finish_wire_attempt(
+    wire_overlay: &mut wires::WireOverlay,
+    component: &mut components::ComponentInfo,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) {
+    if let Some(edge) = wire_overlay.commit_draft(device, queue) {
+        component.add_wire_edge(edge);
+        sync_component_wires(wire_overlay, component, device, queue);
+    } else {
+        wire_overlay.cancel_draft(device, queue);
+    }
 }

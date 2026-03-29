@@ -3,12 +3,15 @@ use egui_wgpu::wgpu;
 use egui_winit::winit;
 use winit::dpi::PhysicalSize;
 
-use crate::render::CameraState;
+use crate::{
+    components::{StoredWireEdge, WireEndpointId},
+    render::CameraState,
+};
 
 const INITIAL_SEGMENT_CAPACITY: usize = 16;
 const WIRE_THICKNESS_PX: f32 = 5.0;
 const MIN_POINT_DELTA: f32 = 0.01;
-const DEFAULT_WIRE_COLOR: [f32; 4] = [0.20, 0.48, 0.82, 1.0];
+pub const DEFAULT_WIRE_COLOR: [f32; 4] = [0.20, 0.48, 0.82, 1.0];
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -219,6 +222,10 @@ impl WireOverlay {
         self.sync_segments(device, queue);
     }
 
+    pub fn has_draft(&self) -> bool {
+        !self.draft_points.is_empty()
+    }
+
     pub fn add_point(
         &mut self,
         device: &wgpu::Device,
@@ -267,24 +274,51 @@ impl WireOverlay {
         self.sync_segments(device, queue);
     }
 
-    pub fn commit_draft(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
+    pub fn commit_draft(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Option<StoredWireEdge> {
         let Some(source) = self.draft_source else {
-            return false;
+            return None;
         };
         if self.draft_points.len() < 2 {
-            return false;
+            return None;
         }
 
-        self.wires.push(AestheticWire {
-            layer: self.draft_layer,
-            source,
+        let destination = self.draft_points.last().copied().map(|point| GridCell {
+            x: point.x.floor() as u32,
+            y: point.y.floor() as u32,
+        })?;
+
+        let edge = StoredWireEdge {
+            source_id: WireEndpointId::from_grid_cell(source, self.draft_layer),
+            destination_id: WireEndpointId::from_grid_cell(destination, self.draft_layer),
             points: self.draft_points.clone(),
             color: DEFAULT_WIRE_COLOR,
-        });
+        };
         self.draft_points.clear();
         self.draft_source = None;
         self.sync_segments(device, queue);
-        true
+        Some(edge)
+    }
+
+    pub fn replace_wires(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        wires: Vec<StoredWireEdge>,
+    ) {
+        self.wires = wires
+            .into_iter()
+            .map(|wire| AestheticWire {
+                layer: wire.source_id.layer,
+                source: wire.source_id.as_grid_cell(),
+                points: wire.points,
+                color: wire.color,
+            })
+            .collect();
+        self.sync_segments(device, queue);
     }
 
     pub fn draw(

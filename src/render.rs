@@ -1,6 +1,6 @@
+use bytemuck::{Pod, Zeroable};
 use egui_wgpu::wgpu;
 use egui_winit::winit;
-use bytemuck::{Pod, Zeroable};
 use winit::dpi::PhysicalSize;
 
 const TARGET_ASPECT_RATIO: f32 = 16.0 / 9.0;
@@ -122,8 +122,11 @@ impl Renderer {
         surface_format: wgpu::TextureFormat,
         surface_size: PhysicalSize<u32>,
     ) -> Self {
-        let shader_source = [include_str!("gates_render_header.wgsl"), include_str!("render.wgsl")]
-            .join("\n");
+        let shader_source = [
+            include_str!("gates_render_header.wgsl"),
+            include_str!("render.wgsl"),
+        ]
+        .join("\n");
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("render"),
             source: wgpu::ShaderSource::Wgsl(shader_source.into()),
