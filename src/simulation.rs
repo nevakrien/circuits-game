@@ -35,6 +35,11 @@ struct CircuitCell {
     data: [u8; 3],
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CellSnapshot {
+    pub bytes: [u8; 4],
+}
+
 pub struct Simulation {
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
@@ -118,7 +123,9 @@ impl Simulation {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
             format: CIRCUIT_TEXTURE_FORMAT,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
 
@@ -205,9 +212,21 @@ impl Simulation {
     }
 
     pub fn clear_cell(&self, queue: &wgpu::Queue, grid_cell: GridCell, layer: u32) {
-        let cell = noop_cell();
-        let texel = [[cell.tag as u8, cell.data[0], cell.data[1], cell.data[2]]];
+        self.write_cell(
+            queue,
+            grid_cell,
+            layer,
+            CellSnapshot::from_cell(noop_cell()),
+        );
+    }
 
+    pub fn write_cell(
+        &self,
+        queue: &wgpu::Queue,
+        grid_cell: GridCell,
+        layer: u32,
+        cell: CellSnapshot,
+    ) {
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self._circuit_texture,
@@ -216,6 +235,127 @@ impl Simulation {
                     x: grid_cell.x,
                     y: grid_cell.y,
                     z: layer,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&[cell.bytes]),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    pub fn read_cell(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        grid_cell: GridCell,
+        layer: u32,
+    ) -> CellSnapshot {
+        let bytes_per_row = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("simulation-circuit-readback"),
+            size: u64::from(bytes_per_row),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("simulation-circuit-readback"),
+        });
+
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self._circuit_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: grid_cell.x,
+                    y: grid_cell.y,
+                    z: layer,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(1),
+                },
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        queue.submit(Some(encoder.finish()));
+
+        let slice = readback.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).unwrap();
+        });
+        let _ = device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        receiver.recv().unwrap().unwrap();
+
+        let mapped = slice.get_mapped_range();
+        let bytes = [mapped[0], mapped[1], mapped[2], mapped[3]];
+        drop(mapped);
+        readback.unmap();
+
+        CellSnapshot { bytes }
+    }
+
+    pub fn clear_charge_at(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        grid_cell: GridCell,
+        layer: u32,
+    ) {
+        for buffer_index in 0..CHARGE_BUFFER_COUNT {
+            self.write_charge_value(device, queue, buffer_index, grid_cell, layer, 0);
+        }
+    }
+
+    pub fn write_charge_value(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        buffer_index: u32,
+        grid_cell: GridCell,
+        layer: u32,
+        value: u8,
+    ) {
+        let (packed_x, packed_y, packed_z) =
+            packed_charge_texel_coord(grid_cell.x, grid_cell.y, layer);
+        let channel = packed_charge_channel(grid_cell.x, grid_cell.y);
+
+        let mut texel = [
+            pollster::block_on(self.read_charge_buffer(device, queue, buffer_index))
+                [packed_charge_texel_index(grid_cell.x, grid_cell.y, layer)],
+        ];
+        texel[0][channel] = value;
+
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self._charge_textures[buffer_index as usize],
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: packed_x,
+                    y: packed_y,
+                    z: packed_z,
                 },
                 aspect: wgpu::TextureAspect::All,
             },
@@ -231,51 +371,6 @@ impl Simulation {
                 depth_or_array_layers: 1,
             },
         );
-    }
-
-    pub fn clear_charge_at(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        grid_cell: GridCell,
-        layer: u32,
-    ) {
-        let (packed_x, packed_y, packed_z) =
-            packed_charge_texel_coord(grid_cell.x, grid_cell.y, layer);
-        let channel = packed_charge_channel(grid_cell.x, grid_cell.y);
-
-        for (buffer_index, texture) in self._charge_textures.iter().enumerate() {
-            let mut texel =
-                [
-                    pollster::block_on(self.read_charge_buffer(device, queue, buffer_index as u32))
-                        [packed_charge_texel_index(grid_cell.x, grid_cell.y, layer)],
-                ];
-            texel[0][channel] = 0;
-
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: packed_x,
-                        y: packed_y,
-                        z: packed_z,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                bytemuck::cast_slice(&texel),
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(4),
-                    rows_per_image: Some(1),
-                },
-                wgpu::Extent3d {
-                    width: 1,
-                    height: 1,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
     }
 
     pub async fn read_charge_buffer(
@@ -480,6 +575,14 @@ fn circuit_cell_for_coord(x: u32, y: u32, z: u32) -> CircuitCell {
 
 fn encode_spatial_id(coord: (u32, u32, u32)) -> [u8; 3] {
     [coord.0 as u8, coord.1 as u8, coord.2 as u8]
+}
+
+impl CellSnapshot {
+    fn from_cell(cell: CircuitCell) -> Self {
+        Self {
+            bytes: [cell.tag as u8, cell.data[0], cell.data[1], cell.data[2]],
+        }
+    }
 }
 
 fn noop_cell() -> CircuitCell {

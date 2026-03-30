@@ -107,6 +107,17 @@ impl ComponentInfo {
             .or_else(|| self.remove_wire_edge(second_id, first_id))
     }
 
+    pub fn remove_matching_wire_edge(&mut self, edge: &StoredWireEdge) -> Option<StoredWireEdge> {
+        let key = edge.key();
+        let edges = self.wire_edges.get_mut(&key)?;
+        let index = edges.iter().position(|candidate| candidate == edge)?;
+        let removed = edges.remove(index);
+        if edges.is_empty() {
+            self.wire_edges.remove(&key);
+        }
+        Some(removed)
+    }
+
     pub fn remove_wire_at_point(&mut self, layer: u32, point: WirePoint) -> Option<StoredWireEdge> {
         let (key, index) = self
             .wire_edges
@@ -261,6 +272,44 @@ mod tests {
 
         assert!(removed.is_some());
         assert_eq!(component.wire_edges().count(), 1);
+    }
+
+    #[test]
+    fn removes_exact_matching_duplicate_edge() {
+        let mut component = ComponentInfo::new(ComponentBufferId {
+            texture_index: 0,
+            layer: 2,
+        });
+        let source_id = WireEndpointId {
+            x: 2,
+            y: 1,
+            layer: 2,
+        };
+        let destination_id = WireEndpointId {
+            x: 4,
+            y: 1,
+            layer: 2,
+        };
+        let first = StoredWireEdge {
+            source_id,
+            destination_id,
+            points: vec![WirePoint { x: 2.0, y: 1.0 }, WirePoint { x: 3.0, y: 1.0 }],
+            color: [1.0, 1.0, 1.0, 1.0],
+        };
+        let second = StoredWireEdge {
+            source_id,
+            destination_id,
+            points: vec![WirePoint { x: 2.0, y: 1.0 }, WirePoint { x: 4.0, y: 1.0 }],
+            color: [1.0, 1.0, 1.0, 1.0],
+        };
+
+        component.add_wire_edge(first.clone());
+        component.add_wire_edge(second.clone());
+
+        let removed = component.remove_matching_wire_edge(&first);
+
+        assert_eq!(removed, Some(first));
+        assert_eq!(component.wire_edges().next(), Some(&second));
     }
 
     #[test]

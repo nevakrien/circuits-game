@@ -85,7 +85,13 @@ impl EditorUi {
         self.selected_tool
     }
 
-    pub fn show(&mut self, ctx: &egui::Context, displayed_layer: u32) -> bool {
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        displayed_layer: u32,
+        can_undo: bool,
+        can_redo: bool,
+    ) -> bool {
         let screen_rect = ctx.content_rect();
         let panel_height = PANEL_HEIGHT.min((screen_rect.height() - PANEL_MARGIN * 2.0).max(160.0));
         let origin = Pos2::new(
@@ -144,6 +150,19 @@ impl EditorUi {
                                 .small()
                                 .strong()
                                 .color(Color32::from_rgb(214, 224, 235)),
+                        );
+                        ui.label(
+                            RichText::new(format!(
+                                "Undo {}  Redo {}",
+                                if can_undo { "Ctrl+Z" } else { "-" },
+                                if can_redo {
+                                    "Ctrl+Shift+Z / Ctrl+Y"
+                                } else {
+                                    "-"
+                                },
+                            ))
+                            .small()
+                            .color(Color32::from_rgb(160, 174, 190)),
                         );
                         ui.add_space(8.0);
 
