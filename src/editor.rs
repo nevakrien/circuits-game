@@ -16,9 +16,7 @@ const TOOL_CARD_HEIGHT: f32 = 78.0;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EditorTool {
     Wire,
-    RemoveWire,
     Source,
-    RemoveGate,
     Not,
     And,
     Or,
@@ -32,9 +30,7 @@ impl EditorTool {
     fn title(self) -> &'static str {
         match self {
             Self::Wire => "Wire",
-            Self::RemoveWire => "Remove Wire",
             Self::Source => "Source",
-            Self::RemoveGate => "Remove Gate",
             Self::Not => "NOT",
             Self::And => "AND",
             Self::Or => "OR",
@@ -48,9 +44,7 @@ impl EditorTool {
     fn description(self) -> &'static str {
         match self {
             Self::Wire => "Route a new wire path",
-            Self::RemoveWire => "Delete an existing wire",
             Self::Source => "Place a constant signal source",
-            Self::RemoveGate => "Delete a placed gate",
             Self::Not => "Invert the incoming signal",
             Self::And => "Output high when both inputs are high",
             Self::Or => "Output high when either input is high",
@@ -64,9 +58,7 @@ impl EditorTool {
 
 const TOOL_OPTIONS: &[EditorTool] = &[
     EditorTool::Wire,
-    EditorTool::RemoveWire,
     EditorTool::Source,
-    EditorTool::RemoveGate,
     EditorTool::Not,
     EditorTool::And,
     EditorTool::Or,
@@ -297,9 +289,7 @@ fn draw_tool_card(ui: &mut egui::Ui, tool: EditorTool, selected: bool) -> egui::
 fn draw_tool_preview(painter: &egui::Painter, rect: Rect, tool: EditorTool, active: bool) {
     match tool {
         EditorTool::Wire => draw_wire_preview(painter, rect, false, active),
-        EditorTool::RemoveWire => draw_wire_preview(painter, rect, true, active),
         EditorTool::Source => draw_source_preview(painter, rect, active),
-        EditorTool::RemoveGate => draw_gate_preview(painter, rect, "DEL", true, active),
         EditorTool::Not => draw_gate_preview(painter, rect, "NOT", false, active),
         EditorTool::And => draw_gate_preview(painter, rect, "AND", false, active),
         EditorTool::Or => draw_gate_preview(painter, rect, "OR", false, active),

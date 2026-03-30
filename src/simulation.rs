@@ -1,5 +1,7 @@
 use egui_wgpu::wgpu;
 
+use crate::wires::GridCell;
+
 pub const GRID_WIDTH: u32 = 8;
 pub const GRID_HEIGHT: u32 = 8;
 pub const BOARD_LAYERS: u32 = 8;
@@ -200,6 +202,80 @@ impl Simulation {
 
     pub fn circuit_view(&self) -> &wgpu::TextureView {
         &self.circuit_view
+    }
+
+    pub fn clear_cell(&self, queue: &wgpu::Queue, grid_cell: GridCell, layer: u32) {
+        let cell = noop_cell();
+        let texel = [[cell.tag as u8, cell.data[0], cell.data[1], cell.data[2]]];
+
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self._circuit_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: grid_cell.x,
+                    y: grid_cell.y,
+                    z: layer,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&texel),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    pub fn clear_charge_at(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        grid_cell: GridCell,
+        layer: u32,
+    ) {
+        let (packed_x, packed_y, packed_z) =
+            packed_charge_texel_coord(grid_cell.x, grid_cell.y, layer);
+        let channel = packed_charge_channel(grid_cell.x, grid_cell.y);
+
+        for (buffer_index, texture) in self._charge_textures.iter().enumerate() {
+            let mut texel =
+                [
+                    pollster::block_on(self.read_charge_buffer(device, queue, buffer_index as u32))
+                        [packed_charge_texel_index(grid_cell.x, grid_cell.y, layer)],
+                ];
+            texel[0][channel] = 0;
+
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: packed_x,
+                        y: packed_y,
+                        z: packed_z,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                bytemuck::cast_slice(&texel),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4),
+                    rows_per_image: Some(1),
+                },
+                wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
     }
 
     pub async fn read_charge_buffer(

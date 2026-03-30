@@ -364,26 +364,6 @@ async fn run() {
                                             window.request_redraw();
                                         }
                                     }
-                                    editor::EditorTool::RemoveWire => {
-                                        if let Some(point) = wires::cursor_to_board_point(
-                                            camera,
-                                            cursor,
-                                            [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
-                                        ) {
-                                            if edited_component
-                                                .remove_wire_at_point(displayed_layer, point)
-                                                .is_some()
-                                            {
-                                                sync_component_wires(
-                                                    &mut wire_overlay,
-                                                    &edited_component,
-                                                    &device,
-                                                    &queue,
-                                                );
-                                            }
-                                            window.request_redraw();
-                                        }
-                                    }
                                     _ => {}
                                 }
                             }
@@ -398,14 +378,17 @@ async fn run() {
                             window.request_redraw();
                             return;
                         }
-                        if editor_ui.selected_tool() == editor::EditorTool::Wire {
-                            finish_wire_attempt(
-                                &mut wire_overlay,
-                                &mut edited_component,
-                                &device,
-                                &queue,
-                            );
-                        }
+
+                        delete_at_cursor(
+                            &simulation,
+                            &mut edited_component,
+                            &mut wire_overlay,
+                            &device,
+                            &queue,
+                            camera,
+                            cursor_position,
+                            displayed_layer,
+                        );
                         window.request_redraw();
                     }
                     WindowEvent::Resized(size) => {
@@ -446,5 +429,44 @@ fn finish_wire_attempt(
         sync_component_wires(wire_overlay, component, device, queue);
     } else {
         wire_overlay.cancel_draft(device, queue);
+    }
+}
+
+fn delete_at_cursor(
+    simulation: &simulation::Simulation,
+    component: &mut components::ComponentInfo,
+    wire_overlay: &mut wires::WireOverlay,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    camera: render::CameraState,
+    cursor_position: Option<[f32; 2]>,
+    displayed_layer: u32,
+) {
+    let Some(cursor) = cursor_position else {
+        return;
+    };
+    let Some(grid_cell) = wires::snap_cursor_to_cell(
+        camera,
+        cursor,
+        [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
+    ) else {
+        return;
+    };
+    let Some(point) = wires::cursor_to_board_point(
+        camera,
+        cursor,
+        [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
+    ) else {
+        return;
+    };
+
+    if component
+        .remove_wire_at_point(displayed_layer, point)
+        .is_some()
+    {
+        sync_component_wires(wire_overlay, component, device, queue);
+    } else {
+        simulation.clear_cell(queue, grid_cell, displayed_layer);
+        simulation.clear_charge_at(device, queue, grid_cell, displayed_layer);
     }
 }
