@@ -40,6 +40,17 @@ pub struct CellSnapshot {
     pub bytes: [u8; 4],
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GateKind {
+    Not,
+    And,
+    Or,
+    Xor,
+    Nand,
+    Nor,
+    Xnor,
+}
+
 pub struct Simulation {
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
@@ -582,6 +593,27 @@ impl CellSnapshot {
         Self {
             bytes: [cell.tag as u8, cell.data[0], cell.data[1], cell.data[2]],
         }
+    }
+
+    pub fn empty() -> Self {
+        Self::from_cell(noop_cell())
+    }
+
+    pub fn source(value: u8) -> Self {
+        Self::from_cell(source_cell(value))
+    }
+
+    pub fn gate(kind: GateKind) -> Self {
+        let tag = match kind {
+            GateKind::Not => CircuitTag::Not,
+            GateKind::And => CircuitTag::And,
+            GateKind::Or => CircuitTag::Or,
+            GateKind::Xor => CircuitTag::Xor,
+            GateKind::Nand => CircuitTag::Nand,
+            GateKind::Nor => CircuitTag::Nor,
+            GateKind::Xnor => CircuitTag::Xnor,
+        };
+        Self::from_cell(gate_cell(tag))
     }
 }
 

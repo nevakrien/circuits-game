@@ -115,6 +115,29 @@ pub struct Renderer {
     params_buffer: wgpu::Buffer,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct HoverPreviewParams {
+    view: [f32; 4],
+    board: [u32; 4],
+    cell: [u32; 4],
+    circuit: [u32; 4],
+    charge: [u32; 4],
+}
+
+#[derive(Clone, Copy)]
+pub struct HoverPreviewState {
+    pub cell: [u32; 2],
+    pub circuit: [u8; 4],
+    pub charge: u8,
+}
+
+pub struct HoverPreviewRenderer {
+    pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    params_buffer: wgpu::Buffer,
+}
+
 impl Renderer {
     pub fn new(
         device: &wgpu::Device,
@@ -262,6 +285,144 @@ impl Renderer {
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            ..Default::default()
+        });
+
+        render_pass.set_pipeline(&self.pipeline);
+        render_pass.set_bind_group(0, &bind_group, &[]);
+        render_pass.draw(0..3, 0..1);
+    }
+}
+
+impl HoverPreviewRenderer {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, surface_format: wgpu::TextureFormat) -> Self {
+        let shader_source = [
+            include_str!("gates_render_header.wgsl"),
+            include_str!("hover_preview.wgsl"),
+        ]
+        .join("\n");
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("hover-preview"),
+            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+        });
+
+        let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hover-preview-params-buffer"),
+            size: std::mem::size_of::<HoverPreviewParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("hover-preview-bind-group-layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("hover-preview-pipeline-layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("hover-preview-pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        let renderer = Self {
+            pipeline,
+            bind_group_layout,
+            params_buffer,
+        };
+        renderer.update(queue, CameraState::new(PhysicalSize::new(1, 1)), None);
+        renderer
+    }
+
+    pub fn update(
+        &self,
+        queue: &wgpu::Queue,
+        camera: CameraState,
+        preview: Option<HoverPreviewState>,
+    ) {
+        let uv_scale = camera.view_params();
+        let params = if let Some(preview) = preview {
+            HoverPreviewParams {
+                view: [uv_scale[0], uv_scale[1], camera.offset[0], camera.offset[1]],
+                board: [crate::simulation::GRID_WIDTH, crate::simulation::GRID_HEIGHT, 0, 0],
+                cell: [preview.cell[0], preview.cell[1], 0, 1],
+                circuit: preview.circuit.map(u32::from),
+                charge: [u32::from(preview.charge), 0, 0, 0],
+            }
+        } else {
+            HoverPreviewParams {
+                view: [uv_scale[0], uv_scale[1], camera.offset[0], camera.offset[1]],
+                board: [crate::simulation::GRID_WIDTH, crate::simulation::GRID_HEIGHT, 0, 0],
+                cell: [0, 0, 0, 0],
+                circuit: [0, 0, 0, 0],
+                charge: [0, 0, 0, 0],
+            }
+        };
+
+        queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
+    }
+
+    pub fn draw(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        surface_texture: &wgpu::Texture,
+    ) {
+        let output_view = surface_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("hover-preview-bind-group"),
+            layout: &self.bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: self.params_buffer.as_entire_binding(),
+            }],
+        });
+
+        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("hover-preview-pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &output_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
                 },
                 depth_slice: None,

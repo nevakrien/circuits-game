@@ -12,7 +12,6 @@ const PANEL_HEIGHT: f32 = 420.0;
 const PANEL_MARGIN: f32 = 12.0;
 const PANEL_INNER_WIDTH: f32 = PANEL_WIDTH - 24.0;
 const TOOL_CARD_HEIGHT: f32 = 78.0;
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EditorTool {
     Wire,
@@ -27,6 +26,10 @@ pub enum EditorTool {
 }
 
 impl EditorTool {
+    pub fn is_placeable(self) -> bool {
+        self != Self::Wire
+    }
+
     fn title(self) -> &'static str {
         match self {
             Self::Wire => "Wire",
@@ -83,6 +86,10 @@ impl EditorUi {
 
     pub fn selected_tool(&self) -> EditorTool {
         self.selected_tool
+    }
+
+    pub fn reset_to_default_tool(&mut self) {
+        self.selected_tool = EditorTool::Wire;
     }
 
     pub fn show(
