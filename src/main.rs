@@ -874,3 +874,257 @@ fn apply_inverse_action(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use winit::dpi::PhysicalSize;
+
+    const TEST_SURFACE_SIZE: PhysicalSize<u32> = PhysicalSize::new(1600, 900);
+
+    async fn create_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::default();
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .await
+            .ok()?;
+
+        adapter
+            .request_device(&wgpu::DeviceDescriptor::default())
+            .await
+            .ok()
+    }
+
+    fn create_editor_test_context() -> Option<(
+        wgpu::Device,
+        wgpu::Queue,
+        simulation::Simulation,
+        components::ComponentInfo,
+        wires::WireOverlay,
+        render::CameraState,
+    )> {
+        let (device, queue) = pollster::block_on(create_headless_device())?;
+        let simulation = simulation::Simulation::new(&device, &queue);
+        let component = components::ComponentInfo::new(components::ComponentBufferId {
+            texture_index: 0,
+            layer: 0,
+        });
+        let wire_overlay = wires::WireOverlay::new(
+            &device,
+            &queue,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            TEST_SURFACE_SIZE,
+            [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
+        );
+        let camera = render::CameraState::new(TEST_SURFACE_SIZE);
+
+        Some((device, queue, simulation, component, wire_overlay, camera))
+    }
+
+    fn cursor_for_cell(cell: wires::GridCell) -> [f32; 2] {
+        [
+            (cell.x as f32 + 0.5) / simulation::GRID_WIDTH as f32 * TEST_SURFACE_SIZE.width as f32,
+            (cell.y as f32 + 0.5) / simulation::GRID_HEIGHT as f32
+                * TEST_SURFACE_SIZE.height as f32,
+        ]
+    }
+
+    fn read_charge_values(
+        simulation: &simulation::Simulation,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        cell: wires::GridCell,
+        layer: u32,
+    ) -> Vec<u8> {
+        (0..simulation::CHARGE_BUFFER_COUNT)
+            .map(|buffer_index| {
+                pollster::block_on(simulation.read_charge_value(
+                    device,
+                    queue,
+                    buffer_index,
+                    cell.x,
+                    cell.y,
+                    layer,
+                ))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn placing_tools_writes_expected_cell_and_charge_values() {
+        let Some((device, queue, simulation, _, _, camera)) = create_editor_test_context() else {
+            return;
+        };
+
+        let cases = [
+            (
+                editor::EditorTool::Source,
+                wires::GridCell { x: 0, y: 0 },
+                simulation::CellSnapshot::source(0xff),
+                vec![0xff; simulation::CHARGE_BUFFER_COUNT as usize],
+            ),
+            (
+                editor::EditorTool::Not,
+                wires::GridCell { x: 1, y: 0 },
+                simulation::CellSnapshot::gate(simulation::GateKind::Not),
+                vec![0x00; simulation::CHARGE_BUFFER_COUNT as usize],
+            ),
+            (
+                editor::EditorTool::And,
+                wires::GridCell { x: 2, y: 0 },
+                simulation::CellSnapshot::gate(simulation::GateKind::And),
+                vec![0x00; simulation::CHARGE_BUFFER_COUNT as usize],
+            ),
+            (
+                editor::EditorTool::Or,
+                wires::GridCell { x: 3, y: 0 },
+                simulation::CellSnapshot::gate(simulation::GateKind::Or),
+                vec![0x00; simulation::CHARGE_BUFFER_COUNT as usize],
+            ),
+            (
+                editor::EditorTool::Xor,
+                wires::GridCell { x: 4, y: 0 },
+                simulation::CellSnapshot::gate(simulation::GateKind::Xor),
+                vec![0x00; simulation::CHARGE_BUFFER_COUNT as usize],
+            ),
+            (
+                editor::EditorTool::Nand,
+                wires::GridCell { x: 5, y: 0 },
+                simulation::CellSnapshot::gate(simulation::GateKind::Nand),
+                vec![0x00; simulation::CHARGE_BUFFER_COUNT as usize],
+            ),
+            (
+                editor::EditorTool::Nor,
+                wires::GridCell { x: 6, y: 0 },
+                simulation::CellSnapshot::gate(simulation::GateKind::Nor),
+                vec![0x00; simulation::CHARGE_BUFFER_COUNT as usize],
+            ),
+            (
+                editor::EditorTool::Xnor,
+                wires::GridCell { x: 7, y: 0 },
+                simulation::CellSnapshot::gate(simulation::GateKind::Xnor),
+                vec![0x00; simulation::CHARGE_BUFFER_COUNT as usize],
+            ),
+        ];
+
+        for (tool, grid_cell, expected_cell, expected_charge_values) in cases {
+            let action = place_cell_at_cursor(
+                &simulation,
+                &device,
+                &queue,
+                camera,
+                cursor_for_cell(grid_cell),
+                0,
+                tool,
+            )
+            .unwrap();
+
+            match action {
+                EditorAction::PlaceCell {
+                    grid_cell: action_grid_cell,
+                    layer,
+                    previous_cell,
+                    previous_charge_values,
+                    new_cell,
+                    new_charge_values,
+                } => {
+                    assert_eq!(action_grid_cell, grid_cell);
+                    assert_eq!(layer, 0);
+                    assert_eq!(previous_cell, simulation::CellSnapshot::empty());
+                    assert_eq!(
+                        previous_charge_values,
+                        vec![0x00; simulation::CHARGE_BUFFER_COUNT as usize]
+                    );
+                    assert_eq!(new_cell, expected_cell);
+                    assert_eq!(new_charge_values, expected_charge_values);
+                }
+                _ => panic!("expected place-cell action"),
+            }
+
+            assert_eq!(simulation.read_cell(&device, &queue, grid_cell, 0), expected_cell);
+            assert_eq!(
+                read_charge_values(&simulation, &device, &queue, grid_cell, 0),
+                expected_charge_values
+            );
+        }
+    }
+
+    #[test]
+    fn undo_and_redo_restore_previous_cell_and_charge_values() {
+        let Some((device, queue, simulation, mut component, mut wire_overlay, camera)) =
+            create_editor_test_context()
+        else {
+            return;
+        };
+
+        let grid_cell = wires::GridCell { x: 3, y: 4 };
+        let layer = 0;
+        let previous_cell = simulation::CellSnapshot::gate(simulation::GateKind::Not);
+        let previous_charge_values = [0x12, 0x34];
+
+        simulation.write_cell(&queue, grid_cell, layer, previous_cell);
+        for (buffer_index, value) in previous_charge_values.into_iter().enumerate() {
+            simulation.write_charge_value(
+                &device,
+                &queue,
+                buffer_index as u32,
+                grid_cell,
+                layer,
+                value,
+            );
+        }
+
+        let action = place_cell_at_cursor(
+            &simulation,
+            &device,
+            &queue,
+            camera,
+            cursor_for_cell(grid_cell),
+            layer,
+            editor::EditorTool::Source,
+        )
+        .unwrap();
+
+        let mut history = EditorHistory::default();
+        history.push(action);
+
+        assert_eq!(
+            simulation.read_cell(&device, &queue, grid_cell, layer),
+            simulation::CellSnapshot::source(0xff)
+        );
+        assert_eq!(
+            read_charge_values(&simulation, &device, &queue, grid_cell, layer),
+            vec![0xff; simulation::CHARGE_BUFFER_COUNT as usize]
+        );
+
+        assert!(history.undo(
+            &simulation,
+            &mut component,
+            &mut wire_overlay,
+            &device,
+            &queue,
+        ));
+        assert_eq!(simulation.read_cell(&device, &queue, grid_cell, layer), previous_cell);
+        assert_eq!(
+            read_charge_values(&simulation, &device, &queue, grid_cell, layer),
+            previous_charge_values.to_vec()
+        );
+
+        assert!(history.redo(
+            &simulation,
+            &mut component,
+            &mut wire_overlay,
+            &device,
+            &queue,
+        ));
+        assert_eq!(
+            simulation.read_cell(&device, &queue, grid_cell, layer),
+            simulation::CellSnapshot::source(0xff)
+        );
+        assert_eq!(
+            read_charge_values(&simulation, &device, &queue, grid_cell, layer),
+            vec![0xff; simulation::CHARGE_BUFFER_COUNT as usize]
+        );
+    }
+}
