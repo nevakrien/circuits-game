@@ -125,6 +125,8 @@ async fn run() {
         config.format,
         egui_wgpu::RendererOptions::default(),
     );
+    let tool_preview_textures =
+        render::create_editor_tool_previews(&device, &queue, &mut egui_renderer);
     let mut editor_ui = editor::EditorUi::new();
     let mut history = EditorHistory::default();
     let mut edited_component = components::ComponentInfo::new(components::ComponentBufferId {
@@ -154,6 +156,7 @@ async fn run() {
                                 displayed_layer,
                                 history.can_undo(),
                                 history.can_redo(),
+                                &tool_preview_textures,
                             );
                         });
                         if editor_ui.selected_tool() != editor::EditorTool::Wire {
@@ -743,9 +746,13 @@ fn snapshot_for_tool(tool: editor::EditorTool) -> Option<simulation::CellSnapsho
         editor::EditorTool::And => Some(simulation::CellSnapshot::gate(simulation::GateKind::And)),
         editor::EditorTool::Or => Some(simulation::CellSnapshot::gate(simulation::GateKind::Or)),
         editor::EditorTool::Xor => Some(simulation::CellSnapshot::gate(simulation::GateKind::Xor)),
-        editor::EditorTool::Nand => Some(simulation::CellSnapshot::gate(simulation::GateKind::Nand)),
+        editor::EditorTool::Nand => {
+            Some(simulation::CellSnapshot::gate(simulation::GateKind::Nand))
+        }
         editor::EditorTool::Nor => Some(simulation::CellSnapshot::gate(simulation::GateKind::Nor)),
-        editor::EditorTool::Xnor => Some(simulation::CellSnapshot::gate(simulation::GateKind::Xnor)),
+        editor::EditorTool::Xnor => {
+            Some(simulation::CellSnapshot::gate(simulation::GateKind::Xnor))
+        }
     }
 }
 

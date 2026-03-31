@@ -1,6 +1,6 @@
 use egui::{
     Color32, CornerRadius, FontId, Id, Order, Pos2, Rect, RichText, ScrollArea, Sense, Stroke,
-    StrokeKind, Vec2,
+    StrokeKind, TextureId, Vec2,
 };
 
 const TAG_WIDTH: f32 = 54.0;
@@ -26,8 +26,36 @@ pub enum EditorTool {
 }
 
 impl EditorTool {
+    pub const ALL: [Self; 9] = [
+        Self::Wire,
+        Self::Source,
+        Self::Not,
+        Self::And,
+        Self::Or,
+        Self::Xor,
+        Self::Nand,
+        Self::Nor,
+        Self::Xnor,
+    ];
+
+    pub const COUNT: usize = Self::ALL.len();
+
     pub fn is_placeable(self) -> bool {
         self != Self::Wire
+    }
+
+    pub fn preview_index(self) -> usize {
+        match self {
+            Self::Wire => 0,
+            Self::Source => 1,
+            Self::Not => 2,
+            Self::And => 3,
+            Self::Or => 4,
+            Self::Xor => 5,
+            Self::Nand => 6,
+            Self::Nor => 7,
+            Self::Xnor => 8,
+        }
     }
 
     fn title(self) -> &'static str {
@@ -46,30 +74,20 @@ impl EditorTool {
 
     fn description(self) -> &'static str {
         match self {
-            Self::Wire => "Route a new wire path",
-            Self::Source => "Place a constant signal source",
-            Self::Not => "Invert the incoming signal",
-            Self::And => "Output high when both inputs are high",
-            Self::Or => "Output high when either input is high",
-            Self::Xor => "Output high when inputs differ",
-            Self::Nand => "Output low only when both inputs are high",
-            Self::Nor => "Output high only when both inputs are low",
-            Self::Xnor => "Output high when inputs match",
+            Self::Wire => "Reads the input",
+            Self::Source => "Constant",
+            Self::Not => "Not Gate",
+            Self::And => "And Gate",
+            Self::Or => "Or Gate",
+            Self::Xor => "Xor Gate (not equal)",
+            Self::Nand => "Nand Gate",
+            Self::Nor => "Nor Gate",
+            Self::Xnor => "Xnor Gate (equal)",
         }
     }
 }
 
-const TOOL_OPTIONS: &[EditorTool] = &[
-    EditorTool::Wire,
-    EditorTool::Source,
-    EditorTool::Not,
-    EditorTool::And,
-    EditorTool::Or,
-    EditorTool::Xor,
-    EditorTool::Nand,
-    EditorTool::Nor,
-    EditorTool::Xnor,
-];
+const TOOL_OPTIONS: &[EditorTool] = &EditorTool::ALL;
 
 pub struct EditorUi {
     expanded: bool,
@@ -98,6 +116,7 @@ impl EditorUi {
         displayed_layer: u32,
         can_undo: bool,
         can_redo: bool,
+        tool_preview_textures: &[TextureId; EditorTool::COUNT],
     ) -> bool {
         let screen_rect = ctx.content_rect();
         let panel_height = PANEL_HEIGHT.min((screen_rect.height() - PANEL_MARGIN * 2.0).max(160.0));
@@ -177,8 +196,12 @@ impl EditorUi {
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 for tool in TOOL_OPTIONS {
-                                    let response =
-                                        draw_tool_card(ui, *tool, *tool == self.selected_tool);
+                                    let response = draw_tool_card(
+                                        ui,
+                                        *tool,
+                                        *tool == self.selected_tool,
+                                        tool_preview_textures[tool.preview_index()],
+                                    );
                                     if response.clicked() {
                                         self.selected_tool = *tool;
                                     }
@@ -229,7 +252,12 @@ impl EditorUi {
     }
 }
 
-fn draw_tool_card(ui: &mut egui::Ui, tool: EditorTool, selected: bool) -> egui::Response {
+fn draw_tool_card(
+    ui: &mut egui::Ui,
+    tool: EditorTool,
+    selected: bool,
+    preview_texture: TextureId,
+) -> egui::Response {
     let size = Vec2::new(ui.available_width(), TOOL_CARD_HEIGHT);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
 
@@ -249,8 +277,7 @@ fn draw_tool_card(ui: &mut egui::Ui, tool: EditorTool, selected: bool) -> egui::
         Color32::from_rgb(46, 58, 74)
     };
 
-    let painter = ui.painter();
-    painter.rect(
+    ui.painter().rect(
         rect,
         CornerRadius::same(10),
         background,
@@ -259,19 +286,23 @@ fn draw_tool_card(ui: &mut egui::Ui, tool: EditorTool, selected: bool) -> egui::
     );
 
     let preview_rect = Rect::from_min_size(rect.min + Vec2::new(10.0, 10.0), Vec2::new(62.0, 58.0));
-    painter.rect_filled(
+    ui.painter().rect_filled(
         preview_rect,
         CornerRadius::same(8),
         Color32::from_rgb(10, 12, 16),
     );
-    painter.rect_stroke(
+    ui.painter().rect_stroke(
         preview_rect,
         CornerRadius::same(8),
         Stroke::new(1.0, Color32::from_rgb(40, 50, 64)),
         StrokeKind::Outside,
     );
-    draw_tool_preview(painter, preview_rect.shrink(6.0), tool, selected || hovered);
+    let _ = ui.put(
+        preview_rect.shrink(6.0),
+        egui::Image::new((preview_texture, preview_rect.shrink(6.0).size())),
+    );
 
+    let painter = ui.painter();
     let text_left = preview_rect.max.x + 10.0;
     let title_pos = Pos2::new(text_left, rect.min.y + 14.0);
     let description_pos = Pos2::new(text_left, rect.min.y + 38.0);
@@ -310,116 +341,4 @@ fn draw_tool_card(ui: &mut egui::Ui, tool: EditorTool, selected: bool) -> egui::
     }
 
     response
-}
-
-fn draw_tool_preview(painter: &egui::Painter, rect: Rect, tool: EditorTool, active: bool) {
-    match tool {
-        EditorTool::Wire => draw_wire_preview(painter, rect, false, active),
-        EditorTool::Source => draw_source_preview(painter, rect, active),
-        EditorTool::Not => draw_gate_preview(painter, rect, "NOT", false, active),
-        EditorTool::And => draw_gate_preview(painter, rect, "AND", false, active),
-        EditorTool::Or => draw_gate_preview(painter, rect, "OR", false, active),
-        EditorTool::Xor => draw_gate_preview(painter, rect, "XOR", false, active),
-        EditorTool::Nand => draw_gate_preview(painter, rect, "NAND", false, active),
-        EditorTool::Nor => draw_gate_preview(painter, rect, "NOR", false, active),
-        EditorTool::Xnor => draw_gate_preview(painter, rect, "XNOR", false, active),
-    }
-}
-
-fn draw_source_preview(painter: &egui::Painter, rect: Rect, active: bool) {
-    let glow = if active {
-        Color32::from_rgba_unmultiplied(244, 206, 168, 70)
-    } else {
-        Color32::from_rgba_unmultiplied(188, 138, 110, 36)
-    };
-    painter.circle_filled(rect.center(), rect.width() * 0.34, glow);
-    painter.circle_filled(
-        rect.center(),
-        rect.width() * 0.22,
-        Color32::from_rgb(114, 62, 38),
-    );
-    painter.circle_stroke(
-        rect.center(),
-        rect.width() * 0.22,
-        Stroke::new(1.5, Color32::from_rgb(238, 208, 176)),
-    );
-}
-
-fn draw_wire_preview(painter: &egui::Painter, rect: Rect, removing: bool, active: bool) {
-    let y = rect.center().y;
-    let left = Pos2::new(rect.left() + 6.0, y);
-    let mid = Pos2::new(rect.center().x, y);
-    let right = Pos2::new(rect.right() - 8.0, y);
-    let wire = if active {
-        Color32::from_rgb(160, 220, 255)
-    } else {
-        Color32::from_rgb(72, 134, 176)
-    };
-    painter.line_segment([left, right], Stroke::new(4.0, wire));
-    painter.circle_filled(mid, 9.0, Color32::from_rgb(32, 84, 122));
-    painter.circle_stroke(mid, 9.0, Stroke::new(1.5, Color32::from_rgb(214, 236, 252)));
-
-    let arrow_color = Color32::from_rgb(214, 48, 34);
-    painter.line_segment(
-        [Pos2::new(mid.x - 4.0, y), Pos2::new(mid.x + 10.0, y)],
-        Stroke::new(2.0, arrow_color),
-    );
-    painter.line_segment(
-        [Pos2::new(mid.x + 10.0, y), Pos2::new(mid.x + 5.0, y - 4.0)],
-        Stroke::new(2.0, arrow_color),
-    );
-    painter.line_segment(
-        [Pos2::new(mid.x + 10.0, y), Pos2::new(mid.x + 5.0, y + 4.0)],
-        Stroke::new(2.0, arrow_color),
-    );
-
-    if removing {
-        draw_delete_mark(painter, rect);
-    }
-}
-
-fn draw_gate_preview(
-    painter: &egui::Painter,
-    rect: Rect,
-    label: &str,
-    removing: bool,
-    active: bool,
-) {
-    let gate_rect = rect.shrink2(Vec2::new(3.0, 10.0));
-    let fill = if active {
-        Color32::from_rgb(190, 202, 214)
-    } else {
-        Color32::from_rgb(68, 76, 86)
-    };
-    painter.rect_filled(gate_rect, CornerRadius::same(8), fill);
-    painter.rect_stroke(
-        gate_rect,
-        CornerRadius::same(8),
-        Stroke::new(1.5, Color32::from_rgb(224, 232, 240)),
-        StrokeKind::Outside,
-    );
-    painter.text(
-        gate_rect.center(),
-        egui::Align2::CENTER_CENTER,
-        label,
-        FontId::proportional(15.0),
-        Color32::from_rgb(142, 26, 28),
-    );
-
-    if removing {
-        draw_delete_mark(painter, rect);
-    }
-}
-
-fn draw_delete_mark(painter: &egui::Painter, rect: Rect) {
-    let center = Pos2::new(rect.right() - 7.0, rect.top() + 7.0);
-    painter.circle_filled(center, 8.0, Color32::from_rgb(154, 28, 30));
-    painter.line_segment(
-        [center + Vec2::new(-3.0, -3.0), center + Vec2::new(3.0, 3.0)],
-        Stroke::new(1.6, Color32::WHITE),
-    );
-    painter.line_segment(
-        [center + Vec2::new(3.0, -3.0), center + Vec2::new(-3.0, 3.0)],
-        Stroke::new(1.6, Color32::WHITE),
-    );
 }

@@ -1,4 +1,5 @@
 use bytemuck::{Pod, Zeroable};
+use egui::TextureId;
 use egui_wgpu::wgpu;
 use egui_winit::winit;
 use winit::dpi::PhysicalSize;
@@ -6,6 +7,8 @@ use winit::dpi::PhysicalSize;
 const TARGET_ASPECT_RATIO: f32 = 16.0 / 9.0;
 const MAX_ZOOM: f32 = 8.0;
 const MIN_ZOOM_FIT_FACTOR: f32 = 0.9;
+const TOOL_PREVIEW_WIDTH: u32 = 50;
+const TOOL_PREVIEW_HEIGHT: u32 = 46;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -125,6 +128,13 @@ struct HoverPreviewParams {
     charge: [u32; 4],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ToolPreviewParams {
+    circuit: [u32; 4],
+    charge: [u32; 4],
+}
+
 #[derive(Clone, Copy)]
 pub struct HoverPreviewState {
     pub cell: [u32; 2],
@@ -138,6 +148,178 @@ pub struct HoverPreviewRenderer {
     params_buffer: wgpu::Buffer,
 }
 
+fn shader_with_gate_header(source: &str) -> String {
+    format!("{}\n{}", include_str!("gates_render_header.wgsl"), source)
+}
+
+pub fn create_editor_tool_previews(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    egui_renderer: &mut egui_wgpu::Renderer,
+) -> [TextureId; crate::editor::EditorTool::COUNT] {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("editor-tool-preview"),
+        source: wgpu::ShaderSource::Wgsl(
+            shader_with_gate_header(include_str!("editor_tool_preview.wgsl")).into(),
+        ),
+    });
+
+    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("editor-tool-preview-bind-group-layout"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("editor-tool-preview-pipeline-layout"),
+        bind_group_layouts: &[&bind_group_layout],
+        push_constant_ranges: &[],
+    });
+
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("editor-tool-preview-pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: Default::default(),
+        depth_stencil: None,
+        multisample: Default::default(),
+        multiview: None,
+        cache: None,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("editor-tool-preview-encoder"),
+    });
+    let mut texture_ids = Vec::with_capacity(crate::editor::EditorTool::COUNT);
+
+    for tool in crate::editor::EditorTool::ALL {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("editor-tool-preview-texture"),
+            size: wgpu::Extent3d {
+                width: TOOL_PREVIEW_WIDTH,
+                height: TOOL_PREVIEW_HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        texture_ids.push(egui_renderer.register_native_texture(
+            device,
+            &view,
+            wgpu::FilterMode::Nearest,
+        ));
+
+        let (circuit, charge) = tool_preview_state(tool);
+        let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("editor-tool-preview-params-buffer"),
+            size: std::mem::size_of::<ToolPreviewParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(
+            &params_buffer,
+            0,
+            bytemuck::bytes_of(&ToolPreviewParams {
+                circuit,
+                charge: [charge, 0, 0, 0],
+            }),
+        );
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("editor-tool-preview-bind-group"),
+            layout: &bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: params_buffer.as_entire_binding(),
+            }],
+        });
+
+        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("editor-tool-preview-pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            ..Default::default()
+        });
+        render_pass.set_pipeline(&pipeline);
+        render_pass.set_bind_group(0, &bind_group, &[]);
+        render_pass.draw(0..3, 0..1);
+    }
+
+    queue.submit(Some(encoder.finish()));
+    texture_ids.try_into().expect("tool preview count mismatch")
+}
+
+fn tool_preview_state(tool: crate::editor::EditorTool) -> ([u32; 4], u32) {
+    let snapshot = match tool {
+        crate::editor::EditorTool::Wire => [2, 0, 0, 0],
+        crate::editor::EditorTool::Source => crate::simulation::CellSnapshot::source(0xff).bytes,
+        crate::editor::EditorTool::Not => {
+            crate::simulation::CellSnapshot::gate(crate::simulation::GateKind::Not).bytes
+        }
+        crate::editor::EditorTool::And => {
+            crate::simulation::CellSnapshot::gate(crate::simulation::GateKind::And).bytes
+        }
+        crate::editor::EditorTool::Or => {
+            crate::simulation::CellSnapshot::gate(crate::simulation::GateKind::Or).bytes
+        }
+        crate::editor::EditorTool::Xor => {
+            crate::simulation::CellSnapshot::gate(crate::simulation::GateKind::Xor).bytes
+        }
+        crate::editor::EditorTool::Nand => {
+            crate::simulation::CellSnapshot::gate(crate::simulation::GateKind::Nand).bytes
+        }
+        crate::editor::EditorTool::Nor => {
+            crate::simulation::CellSnapshot::gate(crate::simulation::GateKind::Nor).bytes
+        }
+        crate::editor::EditorTool::Xnor => {
+            crate::simulation::CellSnapshot::gate(crate::simulation::GateKind::Xnor).bytes
+        }
+    };
+
+    (
+        snapshot.map(u32::from),
+        if matches!(tool, crate::editor::EditorTool::Source) {
+            0xff
+        } else {
+            0
+        },
+    )
+}
+
 impl Renderer {
     pub fn new(
         device: &wgpu::Device,
@@ -145,14 +327,11 @@ impl Renderer {
         surface_format: wgpu::TextureFormat,
         surface_size: PhysicalSize<u32>,
     ) -> Self {
-        let shader_source = [
-            include_str!("gates_render_header.wgsl"),
-            include_str!("render.wgsl"),
-        ]
-        .join("\n");
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("render"),
-            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+            source: wgpu::ShaderSource::Wgsl(
+                shader_with_gate_header(include_str!("render.wgsl")).into(),
+            ),
         });
 
         let texture_entry = |binding| wgpu::BindGroupLayoutEntry {
@@ -299,15 +478,16 @@ impl Renderer {
 }
 
 impl HoverPreviewRenderer {
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, surface_format: wgpu::TextureFormat) -> Self {
-        let shader_source = [
-            include_str!("gates_render_header.wgsl"),
-            include_str!("hover_preview.wgsl"),
-        ]
-        .join("\n");
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        surface_format: wgpu::TextureFormat,
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("hover-preview"),
-            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+            source: wgpu::ShaderSource::Wgsl(
+                shader_with_gate_header(include_str!("hover_preview.wgsl")).into(),
+            ),
         });
 
         let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -382,7 +562,12 @@ impl HoverPreviewRenderer {
         let params = if let Some(preview) = preview {
             HoverPreviewParams {
                 view: [uv_scale[0], uv_scale[1], camera.offset[0], camera.offset[1]],
-                board: [crate::simulation::GRID_WIDTH, crate::simulation::GRID_HEIGHT, 0, 0],
+                board: [
+                    crate::simulation::GRID_WIDTH,
+                    crate::simulation::GRID_HEIGHT,
+                    0,
+                    0,
+                ],
                 cell: [preview.cell[0], preview.cell[1], 0, 1],
                 circuit: preview.circuit.map(u32::from),
                 charge: [u32::from(preview.charge), 0, 0, 0],
@@ -390,7 +575,12 @@ impl HoverPreviewRenderer {
         } else {
             HoverPreviewParams {
                 view: [uv_scale[0], uv_scale[1], camera.offset[0], camera.offset[1]],
-                board: [crate::simulation::GRID_WIDTH, crate::simulation::GRID_HEIGHT, 0, 0],
+                board: [
+                    crate::simulation::GRID_WIDTH,
+                    crate::simulation::GRID_HEIGHT,
+                    0,
+                    0,
+                ],
                 cell: [0, 0, 0, 0],
                 circuit: [0, 0, 0, 0],
                 charge: [0, 0, 0, 0],
