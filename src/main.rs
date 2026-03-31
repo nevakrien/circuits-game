@@ -1,4 +1,4 @@
-use circuits_game::{editor, render, simulation, windowing, wire_render, wires};
+use circuits_game::{demo_scene, editor, render, simulation, windowing, wire_render, wires};
 use egui_wgpu::wgpu;
 use egui_winit::winit;
 
@@ -420,10 +420,15 @@ async fn run() {
         &mut egui_renderer,
     ));
     let mut history = EditorHistory::default();
+    let demo_component = demo_scene::starter_component();
     let mut edited_component = wire_render::WireRenderInfo::new(wire_render::WireBufferId {
         texture_index: 0,
         layer: displayed_layer,
     });
+    for wire in demo_component.wires {
+        edited_component.add_wire_edge(wire);
+    }
+    sync_component_wires(&mut wire_overlay, &edited_component, &device, &queue);
 
     let mut current_buffer = 0;
     let mut step_requested = false;

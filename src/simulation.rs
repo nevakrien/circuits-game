@@ -540,15 +540,12 @@ fn seed_initial_charge(queue: &wgpu::Queue, texture: &wgpu::Texture) {
 
 fn seed_circuits(queue: &wgpu::Queue, texture: &wgpu::Texture) {
     let mut circuits = vec![[0u8; 4]; (GRID_WIDTH * GRID_HEIGHT * BOARD_LAYERS) as usize];
+    let component = demo_scene::starter_component();
 
-    for z in 0..BOARD_LAYERS {
-        for y in 0..GRID_HEIGHT {
-            for x in 0..GRID_WIDTH {
-                let ix = linear_index(x, y, z);
-                let cell = circuit_cell_for_coord(x, y, z);
-                circuits[ix] = [cell.tag as u8, cell.data[0], cell.data[1], cell.data[2]];
-            }
-        }
+    for placed_cell in component.cells {
+        let ix = linear_index(placed_cell.grid_cell.x, placed_cell.grid_cell.y, component.layer);
+        let cell = circuit_cell_from_snapshot(placed_cell.snapshot);
+        circuits[ix] = [cell.tag as u8, cell.data[0], cell.data[1], cell.data[2]];
     }
 
     queue.write_texture(
@@ -574,10 +571,6 @@ fn seed_circuits(queue: &wgpu::Queue, texture: &wgpu::Texture) {
 
 fn linear_index(x: u32, y: u32, z: u32) -> usize {
     (z * GRID_WIDTH * GRID_HEIGHT + y * GRID_WIDTH + x) as usize
-}
-
-fn circuit_cell_for_coord(x: u32, y: u32, z: u32) -> CircuitCell {
-    circuit_cell_from_snapshot(demo_scene::cell_at(x, y, z))
 }
 
 fn circuit_cell_from_snapshot(snapshot: CellSnapshot) -> CircuitCell {
@@ -701,8 +694,14 @@ mod tests {
         })
     }
 
-    fn cpu_cell_next(texels: &PackedChargeTexels, x: u32, y: u32, z: u32) -> u8 {
-        let cell = circuit_cell_for_coord(x, y, z);
+    fn cpu_cell_next(
+        component: &demo_scene::DemoComponent,
+        texels: &PackedChargeTexels,
+        x: u32,
+        y: u32,
+        z: u32,
+    ) -> u8 {
+        let cell = circuit_cell_from_snapshot(component.cell_at(x, y, z));
 
         match cell.tag {
             CircuitTag::Noop => 0,
@@ -729,7 +728,8 @@ mod tests {
         }
     }
 
-    fn expected_charge_after_steps(steps: u32, x: u32, y: u32, z: u32) -> u8 {
+    fn expected_charge_texels_after_steps(steps: u32) -> PackedChargeTexels {
+        let component = demo_scene::starter_component();
         let mut current =
             vec![[0u8; 4]; (CHARGE_GRID_WIDTH * CHARGE_GRID_HEIGHT * BOARD_LAYERS) as usize];
 
@@ -743,7 +743,7 @@ mod tests {
                             col,
                             row,
                             layer,
-                            cpu_cell_next(&current, col, row, layer),
+                            cpu_cell_next(&component, &current, col, row, layer),
                         );
                     }
                 }
@@ -751,7 +751,7 @@ mod tests {
             current = next;
         }
 
-        read_packed_charge(&current, x, y, z)
+        current
     }
 
     #[test]
@@ -820,6 +820,7 @@ mod tests {
 
             let texels =
                 pollster::block_on(simulation.read_charge_buffer(&device, &queue, next_buffer));
+            let expected = expected_charge_texels_after_steps(step);
 
             assert_eq!(
                 pollster::block_on(simulation.read_charge_value(
@@ -830,7 +831,7 @@ mod tests {
                     0,
                     0
                 )),
-                expected_charge_after_steps(step, 0, 0, 0)
+                read_packed_charge(&expected, 0, 0, 0)
             );
 
             for z in 0..BOARD_LAYERS {
@@ -838,7 +839,7 @@ mod tests {
                     for x in 0..GRID_WIDTH {
                         assert_eq!(
                             read_packed_charge(&texels, x, y, z),
-                            expected_charge_after_steps(step, x, y, z),
+                            read_packed_charge(&expected, x, y, z),
                             "mismatch at step={step}, coord=({x}, {y}, {z})"
                         );
                     }
