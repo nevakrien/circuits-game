@@ -3,6 +3,10 @@ use egui::{
     StrokeKind, TextureId, Vec2,
 };
 
+use egui_wgpu::wgpu;
+
+use crate::{render, simulation, wire_render, wires};
+
 const TAG_WIDTH: f32 = 54.0;
 const TAG_HEIGHT: f32 = 24.0;
 const RESET_BUTTON_WIDTH: f32 = 64.0;
@@ -105,6 +109,38 @@ pub struct EditorHistory<T> {
     redo_stack: Vec<T>,
 }
 
+#[derive(Clone)]
+pub enum EditorAction {
+    UpdateDraft {
+        before: Option<wires::DraftWire>,
+        after: Option<wires::DraftWire>,
+    },
+    CommitWire {
+        edge: wire_render::StoredWireEdge,
+        draft: wires::DraftWire,
+    },
+    DeleteWire(wire_render::StoredWireEdge),
+    PlaceCell {
+        grid_cell: wires::GridCell,
+        layer: u32,
+        previous_cell: simulation::CellSnapshot,
+        previous_charge_values: Vec<u8>,
+        new_cell: simulation::CellSnapshot,
+        new_charge_values: Vec<u8>,
+    },
+    DeleteCell {
+        grid_cell: wires::GridCell,
+        layer: u32,
+        cell: simulation::CellSnapshot,
+        charge_values: Vec<u8>,
+    },
+}
+
+pub struct EditorSession {
+    ui: EditorUi,
+    history: EditorHistory<EditorAction>,
+}
+
 impl<T> Default for EditorHistory<T> {
     fn default() -> Self {
         Self {
@@ -142,6 +178,228 @@ impl<T> EditorHistory<T> {
 
     pub fn push_undo(&mut self, action: T) {
         self.undo_stack.push(action);
+    }
+}
+
+impl EditorSession {
+    pub fn new(tool_preview_textures: [TextureId; EditorTool::COUNT]) -> Self {
+        Self {
+            ui: EditorUi::new(tool_preview_textures),
+            history: EditorHistory::default(),
+        }
+    }
+
+    pub fn selected_tool(&self) -> EditorTool {
+        self.ui.selected_tool()
+    }
+
+    pub fn show(&mut self, ctx: &egui::Context, displayed_layer: u32) -> bool {
+        self.ui.show(ctx, displayed_layer, &self.history)
+    }
+
+    pub fn cancel_draft_if_inactive(
+        &mut self,
+        wire_overlay: &mut wires::WireOverlay,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) {
+        if self.selected_tool() != EditorTool::Wire {
+            wire_overlay.restore_draft(device, queue, None);
+        }
+    }
+
+    pub fn undo(
+        &mut self,
+        simulation: &simulation::Simulation,
+        component: &mut wire_render::WireRenderInfo,
+        wire_overlay: &mut wires::WireOverlay,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> bool {
+        let Some(action) = self.history.pop_undo() else {
+            return false;
+        };
+        apply_inverse_action(&action, simulation, component, wire_overlay, device, queue);
+        self.history.push_redo(action);
+        true
+    }
+
+    pub fn redo(
+        &mut self,
+        simulation: &simulation::Simulation,
+        component: &mut wire_render::WireRenderInfo,
+        wire_overlay: &mut wires::WireOverlay,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> bool {
+        let Some(action) = self.history.pop_redo() else {
+            return false;
+        };
+        apply_action(&action, simulation, component, wire_overlay, device, queue);
+        self.history.push_undo(action);
+        true
+    }
+
+    pub fn finish_wire_attempt(
+        &mut self,
+        component: &mut wire_render::WireRenderInfo,
+        wire_overlay: &mut wires::WireOverlay,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> bool {
+        let Some(draft) = wire_overlay.current_draft() else {
+            return false;
+        };
+        let Some(edge) = wire_overlay.commit_draft(device, queue) else {
+            wire_overlay.restore_draft(device, queue, None);
+            return false;
+        };
+
+        component.add_wire_edge(edge.clone());
+        sync_component_wires(wire_overlay, component, device, queue);
+        self.history.push(EditorAction::CommitWire { edge, draft });
+        true
+    }
+
+    pub fn cancel_wire_draft(
+        &mut self,
+        wire_overlay: &mut wires::WireOverlay,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> bool {
+        self.update_draft(wire_overlay, |overlay| {
+            overlay.restore_draft(device, queue, None);
+        })
+    }
+
+    pub fn pop_wire_point(
+        &mut self,
+        wire_overlay: &mut wires::WireOverlay,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> bool {
+        self.update_draft(wire_overlay, |overlay| {
+            overlay.pop_point(device, queue);
+        })
+    }
+
+    pub fn handle_left_click(
+        &mut self,
+        simulation: &simulation::Simulation,
+        component: &mut wire_render::WireRenderInfo,
+        wire_overlay: &mut wires::WireOverlay,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        camera: render::CameraState,
+        cursor: [f32; 2],
+        displayed_layer: u32,
+        extend_wire: bool,
+    ) -> bool {
+        let Some(source) = wires::snap_cursor_to_cell(
+            camera,
+            cursor,
+            [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
+        ) else {
+            return false;
+        };
+
+        match self.selected_tool() {
+            EditorTool::Wire => {
+                let Some(point) = wires::cursor_to_board_point(
+                    camera,
+                    cursor,
+                    [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
+                ) else {
+                    return false;
+                };
+
+                let had_draft = wire_overlay.has_draft();
+                self.update_draft(wire_overlay, |overlay| {
+                    overlay.add_point(device, queue, displayed_layer, point, source);
+                });
+
+                if had_draft && !extend_wire {
+                    self.finish_wire_attempt(component, wire_overlay, device, queue)
+                } else {
+                    true
+                }
+            }
+            tool => {
+                if let Some(action) = place_cell_at_cursor(
+                    simulation,
+                    device,
+                    queue,
+                    camera,
+                    cursor,
+                    displayed_layer,
+                    tool,
+                ) {
+                    self.history.push(action);
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    pub fn handle_right_click(
+        &mut self,
+        simulation: &simulation::Simulation,
+        component: &mut wire_render::WireRenderInfo,
+        wire_overlay: &mut wires::WireOverlay,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        camera: render::CameraState,
+        cursor_position: Option<[f32; 2]>,
+        displayed_layer: u32,
+        extend_wire: bool,
+    ) -> bool {
+        if self.selected_tool() != EditorTool::Wire {
+            self.ui.reset_to_default_tool();
+            wire_overlay.restore_draft(device, queue, None);
+            return true;
+        }
+
+        if wire_overlay.has_draft() {
+            return if extend_wire {
+                self.pop_wire_point(wire_overlay, device, queue)
+            } else {
+                self.cancel_wire_draft(wire_overlay, device, queue)
+            };
+        }
+
+        if let Some(action) = delete_at_cursor(
+            simulation,
+            component,
+            wire_overlay,
+            device,
+            queue,
+            camera,
+            cursor_position,
+            displayed_layer,
+        ) {
+            self.history.push(action);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn update_draft<F>(&mut self, wire_overlay: &mut wires::WireOverlay, edit: F) -> bool
+    where
+        F: FnOnce(&mut wires::WireOverlay),
+    {
+        let before = wire_overlay.current_draft();
+        edit(wire_overlay);
+        let after = wire_overlay.current_draft();
+        if before == after {
+            return false;
+        }
+
+        self.history
+            .push(EditorAction::UpdateDraft { before, after });
+        true
     }
 }
 
@@ -302,6 +560,291 @@ impl EditorUi {
     }
 }
 
+pub fn hover_preview_state_with_visibility(
+    camera: render::CameraState,
+    cursor_position: Option<[f32; 2]>,
+    tool: EditorTool,
+    visible: bool,
+) -> Option<render::HoverPreviewState> {
+    if !visible || !tool.is_placeable() {
+        return None;
+    }
+
+    let cursor = cursor_position?;
+    let grid_cell = wires::snap_cursor_to_cell(
+        camera,
+        cursor,
+        [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
+    )?;
+
+    Some(render::HoverPreviewState {
+        cell: [grid_cell.x, grid_cell.y],
+        circuit: snapshot_for_tool(tool)?.bytes,
+        charge: charge_values_for_tool(tool).into_iter().next().unwrap_or(0),
+    })
+}
+
+fn sync_component_wires(
+    wire_overlay: &mut wires::WireOverlay,
+    component: &wire_render::WireRenderInfo,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) {
+    wire_overlay.replace_wires(device, queue, component.wire_edges().cloned().collect());
+}
+
+fn delete_at_cursor(
+    simulation: &simulation::Simulation,
+    component: &mut wire_render::WireRenderInfo,
+    wire_overlay: &mut wires::WireOverlay,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    camera: render::CameraState,
+    cursor_position: Option<[f32; 2]>,
+    displayed_layer: u32,
+) -> Option<EditorAction> {
+    let cursor = cursor_position?;
+    let grid_cell = wires::snap_cursor_to_cell(
+        camera,
+        cursor,
+        [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
+    )?;
+    let point = wires::cursor_to_board_point(
+        camera,
+        cursor,
+        [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
+    )?;
+
+    if let Some(edge) = component.remove_wire_at_point(displayed_layer, point) {
+        sync_component_wires(wire_overlay, component, device, queue);
+        Some(EditorAction::DeleteWire(edge))
+    } else {
+        let cell = simulation.read_cell(device, queue, grid_cell, displayed_layer);
+        let charge_values = (0..simulation::CHARGE_BUFFER_COUNT)
+            .map(|buffer_index| {
+                pollster::block_on(simulation.read_charge_value(
+                    device,
+                    queue,
+                    buffer_index,
+                    grid_cell.x,
+                    grid_cell.y,
+                    displayed_layer,
+                ))
+            })
+            .collect::<Vec<_>>();
+        if cell.bytes == [0, 0, 0, 0] && charge_values.iter().all(|value| *value == 0) {
+            return None;
+        }
+        simulation.clear_cell(queue, grid_cell, displayed_layer);
+        simulation.clear_charge_at(device, queue, grid_cell, displayed_layer);
+        Some(EditorAction::DeleteCell {
+            grid_cell,
+            layer: displayed_layer,
+            cell,
+            charge_values,
+        })
+    }
+}
+
+fn place_cell_at_cursor(
+    simulation: &simulation::Simulation,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    camera: render::CameraState,
+    cursor: [f32; 2],
+    displayed_layer: u32,
+    tool: EditorTool,
+) -> Option<EditorAction> {
+    let grid_cell = wires::snap_cursor_to_cell(
+        camera,
+        cursor,
+        [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
+    )?;
+    let new_cell = snapshot_for_tool(tool)?;
+    let previous_cell = simulation.read_cell(device, queue, grid_cell, displayed_layer);
+
+    if previous_cell == new_cell {
+        return None;
+    }
+
+    let previous_charge_values = (0..simulation::CHARGE_BUFFER_COUNT)
+        .map(|buffer_index| {
+            pollster::block_on(simulation.read_charge_value(
+                device,
+                queue,
+                buffer_index,
+                grid_cell.x,
+                grid_cell.y,
+                displayed_layer,
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    let new_charge_values = charge_values_for_tool(tool);
+
+    simulation.write_cell(queue, grid_cell, displayed_layer, new_cell);
+    write_charge_values(
+        simulation,
+        device,
+        queue,
+        grid_cell,
+        displayed_layer,
+        &new_charge_values,
+    );
+
+    Some(EditorAction::PlaceCell {
+        grid_cell,
+        layer: displayed_layer,
+        previous_cell,
+        previous_charge_values,
+        new_cell,
+        new_charge_values,
+    })
+}
+
+fn snapshot_for_tool(tool: EditorTool) -> Option<simulation::CellSnapshot> {
+    match tool {
+        EditorTool::Wire => None,
+        EditorTool::Source => Some(simulation::CellSnapshot::source(0xff)),
+        EditorTool::Noop => Some(simulation::CellSnapshot::noop()),
+        EditorTool::Not => Some(simulation::CellSnapshot::gate(simulation::GateKind::Not)),
+        EditorTool::And => Some(simulation::CellSnapshot::gate(simulation::GateKind::And)),
+        EditorTool::Or => Some(simulation::CellSnapshot::gate(simulation::GateKind::Or)),
+        EditorTool::Xor => Some(simulation::CellSnapshot::gate(simulation::GateKind::Xor)),
+        EditorTool::Nand => Some(simulation::CellSnapshot::gate(simulation::GateKind::Nand)),
+        EditorTool::Nor => Some(simulation::CellSnapshot::gate(simulation::GateKind::Nor)),
+        EditorTool::Xnor => Some(simulation::CellSnapshot::gate(simulation::GateKind::Xnor)),
+    }
+}
+
+fn charge_values_for_tool(tool: EditorTool) -> Vec<u8> {
+    let value = match tool {
+        EditorTool::Source => 0xff,
+        _ => 0x00,
+    };
+
+    vec![value; simulation::CHARGE_BUFFER_COUNT as usize]
+}
+
+fn write_charge_values(
+    simulation: &simulation::Simulation,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    grid_cell: wires::GridCell,
+    layer: u32,
+    charge_values: &[u8],
+) {
+    for (buffer_index, value) in charge_values.iter().copied().enumerate() {
+        simulation.write_charge_value(device, queue, buffer_index as u32, grid_cell, layer, value);
+    }
+}
+
+fn apply_action(
+    action: &EditorAction,
+    simulation: &simulation::Simulation,
+    component: &mut wire_render::WireRenderInfo,
+    wire_overlay: &mut wires::WireOverlay,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) {
+    match action {
+        EditorAction::UpdateDraft { after, .. } => {
+            wire_overlay.restore_draft(device, queue, after.as_ref());
+        }
+        EditorAction::CommitWire { edge, .. } => {
+            component.add_wire_edge(edge.clone());
+            sync_component_wires(wire_overlay, component, device, queue);
+            wire_overlay.restore_draft(device, queue, None);
+        }
+        EditorAction::DeleteWire(edge) => {
+            component.remove_matching_wire_edge(edge);
+            sync_component_wires(wire_overlay, component, device, queue);
+        }
+        EditorAction::PlaceCell {
+            grid_cell,
+            layer,
+            new_cell,
+            new_charge_values,
+            ..
+        } => {
+            simulation.write_cell(queue, *grid_cell, *layer, *new_cell);
+            write_charge_values(
+                simulation,
+                device,
+                queue,
+                *grid_cell,
+                *layer,
+                new_charge_values,
+            );
+        }
+        EditorAction::DeleteCell {
+            grid_cell, layer, ..
+        } => {
+            simulation.clear_cell(queue, *grid_cell, *layer);
+            simulation.clear_charge_at(device, queue, *grid_cell, *layer);
+        }
+    }
+}
+
+fn apply_inverse_action(
+    action: &EditorAction,
+    simulation: &simulation::Simulation,
+    component: &mut wire_render::WireRenderInfo,
+    wire_overlay: &mut wires::WireOverlay,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) {
+    match action {
+        EditorAction::UpdateDraft { before, .. } => {
+            wire_overlay.restore_draft(device, queue, before.as_ref());
+        }
+        EditorAction::CommitWire { edge, draft } => {
+            component.remove_matching_wire_edge(edge);
+            sync_component_wires(wire_overlay, component, device, queue);
+            wire_overlay.restore_draft(device, queue, Some(draft));
+        }
+        EditorAction::DeleteWire(edge) => {
+            component.add_wire_edge(edge.clone());
+            sync_component_wires(wire_overlay, component, device, queue);
+        }
+        EditorAction::PlaceCell {
+            grid_cell,
+            layer,
+            previous_cell,
+            previous_charge_values,
+            ..
+        } => {
+            simulation.write_cell(queue, *grid_cell, *layer, *previous_cell);
+            write_charge_values(
+                simulation,
+                device,
+                queue,
+                *grid_cell,
+                *layer,
+                previous_charge_values,
+            );
+        }
+        EditorAction::DeleteCell {
+            grid_cell,
+            layer,
+            cell,
+            charge_values,
+        } => {
+            simulation.write_cell(queue, *grid_cell, *layer, *cell);
+            for (buffer_index, value) in charge_values.iter().copied().enumerate() {
+                simulation.write_charge_value(
+                    device,
+                    queue,
+                    buffer_index as u32,
+                    *grid_cell,
+                    *layer,
+                    value,
+                );
+            }
+        }
+    }
+}
+
 fn draw_tool_card(
     ui: &mut egui::Ui,
     tool: EditorTool,
@@ -391,4 +934,377 @@ fn draw_tool_card(
     }
 
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use egui_winit::winit::dpi::PhysicalSize;
+
+    const TEST_SURFACE_SIZE: PhysicalSize<u32> = PhysicalSize::new(1600, 900);
+
+    async fn create_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::default();
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .await
+            .ok()?;
+
+        adapter
+            .request_device(&wgpu::DeviceDescriptor::default())
+            .await
+            .ok()
+    }
+
+    fn create_editor_test_context() -> Option<(
+        wgpu::Device,
+        wgpu::Queue,
+        simulation::Simulation,
+        wire_render::WireRenderInfo,
+        wires::WireOverlay,
+        render::CameraState,
+        EditorSession,
+    )> {
+        let (device, queue) = pollster::block_on(create_headless_device())?;
+        let simulation = simulation::Simulation::new(&device, &queue);
+        let component = wire_render::WireRenderInfo::new(wire_render::WireBufferId {
+            texture_index: 0,
+            layer: 0,
+        });
+        let wire_overlay = wires::WireOverlay::new(
+            &device,
+            &queue,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            TEST_SURFACE_SIZE,
+            [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
+        );
+        let camera = render::CameraState::new(TEST_SURFACE_SIZE);
+        let session = EditorSession::new([TextureId::Managed(0); EditorTool::COUNT]);
+
+        Some((
+            device,
+            queue,
+            simulation,
+            component,
+            wire_overlay,
+            camera,
+            session,
+        ))
+    }
+
+    fn cursor_for_cell(cell: wires::GridCell) -> [f32; 2] {
+        [
+            (cell.x as f32 + 0.5) / simulation::GRID_WIDTH as f32 * TEST_SURFACE_SIZE.width as f32,
+            (cell.y as f32 + 0.5) / simulation::GRID_HEIGHT as f32
+                * TEST_SURFACE_SIZE.height as f32,
+        ]
+    }
+
+    fn read_charge_values(
+        simulation: &simulation::Simulation,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        cell: wires::GridCell,
+        layer: u32,
+    ) -> Vec<u8> {
+        (0..simulation::CHARGE_BUFFER_COUNT)
+            .map(|buffer_index| {
+                pollster::block_on(simulation.read_charge_value(
+                    device,
+                    queue,
+                    buffer_index,
+                    cell.x,
+                    cell.y,
+                    layer,
+                ))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn placing_tools_writes_expected_cell_and_charge_values() {
+        let Some((device, queue, simulation, _, _, camera, _)) = create_editor_test_context()
+        else {
+            return;
+        };
+
+        let cases = [
+            (
+                EditorTool::Source,
+                wires::GridCell { x: 0, y: 7 },
+                simulation::CellSnapshot::source(0xff),
+                vec![0xff; simulation::CHARGE_BUFFER_COUNT as usize],
+            ),
+            (
+                EditorTool::Not,
+                wires::GridCell { x: 1, y: 7 },
+                simulation::CellSnapshot::gate(simulation::GateKind::Not),
+                vec![0x00; simulation::CHARGE_BUFFER_COUNT as usize],
+            ),
+            (
+                EditorTool::And,
+                wires::GridCell { x: 2, y: 7 },
+                simulation::CellSnapshot::gate(simulation::GateKind::And),
+                vec![0x00; simulation::CHARGE_BUFFER_COUNT as usize],
+            ),
+            (
+                EditorTool::Or,
+                wires::GridCell { x: 3, y: 7 },
+                simulation::CellSnapshot::gate(simulation::GateKind::Or),
+                vec![0x00; simulation::CHARGE_BUFFER_COUNT as usize],
+            ),
+            (
+                EditorTool::Xor,
+                wires::GridCell { x: 4, y: 7 },
+                simulation::CellSnapshot::gate(simulation::GateKind::Xor),
+                vec![0x00; simulation::CHARGE_BUFFER_COUNT as usize],
+            ),
+            (
+                EditorTool::Nand,
+                wires::GridCell { x: 5, y: 7 },
+                simulation::CellSnapshot::gate(simulation::GateKind::Nand),
+                vec![0x00; simulation::CHARGE_BUFFER_COUNT as usize],
+            ),
+            (
+                EditorTool::Nor,
+                wires::GridCell { x: 6, y: 7 },
+                simulation::CellSnapshot::gate(simulation::GateKind::Nor),
+                vec![0x00; simulation::CHARGE_BUFFER_COUNT as usize],
+            ),
+            (
+                EditorTool::Xnor,
+                wires::GridCell { x: 7, y: 7 },
+                simulation::CellSnapshot::gate(simulation::GateKind::Xnor),
+                vec![0x00; simulation::CHARGE_BUFFER_COUNT as usize],
+            ),
+        ];
+
+        for (tool, grid_cell, expected_cell, expected_charge_values) in cases {
+            let action = place_cell_at_cursor(
+                &simulation,
+                &device,
+                &queue,
+                camera,
+                cursor_for_cell(grid_cell),
+                0,
+                tool,
+            )
+            .unwrap();
+
+            match action {
+                EditorAction::PlaceCell {
+                    grid_cell: action_grid_cell,
+                    layer,
+                    previous_cell,
+                    previous_charge_values,
+                    new_cell,
+                    new_charge_values,
+                } => {
+                    assert_eq!(action_grid_cell, grid_cell);
+                    assert_eq!(layer, 0);
+                    assert_eq!(previous_cell, simulation::CellSnapshot::empty());
+                    assert_eq!(
+                        previous_charge_values,
+                        vec![0x00; simulation::CHARGE_BUFFER_COUNT as usize]
+                    );
+                    assert_eq!(new_cell, expected_cell);
+                    assert_eq!(new_charge_values, expected_charge_values);
+                }
+                _ => panic!("expected place-cell action"),
+            }
+
+            assert_eq!(
+                simulation.read_cell(&device, &queue, grid_cell, 0),
+                expected_cell
+            );
+            assert_eq!(
+                read_charge_values(&simulation, &device, &queue, grid_cell, 0),
+                expected_charge_values
+            );
+        }
+    }
+
+    #[test]
+    fn undo_and_redo_restore_previous_cell_and_charge_values() {
+        let Some((device, queue, simulation, mut component, mut wire_overlay, camera, mut session)) =
+            create_editor_test_context()
+        else {
+            return;
+        };
+
+        let grid_cell = wires::GridCell { x: 3, y: 4 };
+        let layer = 0;
+        let previous_cell = simulation::CellSnapshot::gate(simulation::GateKind::Not);
+        let previous_charge_values = [0x12, 0x34];
+
+        simulation.write_cell(&queue, grid_cell, layer, previous_cell);
+        for (buffer_index, value) in previous_charge_values.into_iter().enumerate() {
+            simulation.write_charge_value(
+                &device,
+                &queue,
+                buffer_index as u32,
+                grid_cell,
+                layer,
+                value,
+            );
+        }
+
+        let action = place_cell_at_cursor(
+            &simulation,
+            &device,
+            &queue,
+            camera,
+            cursor_for_cell(grid_cell),
+            layer,
+            EditorTool::Source,
+        )
+        .unwrap();
+        session.history.push(action);
+
+        assert_eq!(
+            simulation.read_cell(&device, &queue, grid_cell, layer),
+            simulation::CellSnapshot::source(0xff)
+        );
+        assert_eq!(
+            read_charge_values(&simulation, &device, &queue, grid_cell, layer),
+            vec![0xff; simulation::CHARGE_BUFFER_COUNT as usize]
+        );
+
+        assert!(session.undo(
+            &simulation,
+            &mut component,
+            &mut wire_overlay,
+            &device,
+            &queue,
+        ));
+        assert_eq!(
+            simulation.read_cell(&device, &queue, grid_cell, layer),
+            previous_cell
+        );
+        assert_eq!(
+            read_charge_values(&simulation, &device, &queue, grid_cell, layer),
+            previous_charge_values.to_vec()
+        );
+
+        assert!(session.redo(
+            &simulation,
+            &mut component,
+            &mut wire_overlay,
+            &device,
+            &queue,
+        ));
+        assert_eq!(
+            simulation.read_cell(&device, &queue, grid_cell, layer),
+            simulation::CellSnapshot::source(0xff)
+        );
+        assert_eq!(
+            read_charge_values(&simulation, &device, &queue, grid_cell, layer),
+            vec![0xff; simulation::CHARGE_BUFFER_COUNT as usize]
+        );
+    }
+
+    #[test]
+    fn wire_draft_point_edits_are_undoable() {
+        let Some((device, queue, simulation, mut component, mut wire_overlay, camera, mut session)) =
+            create_editor_test_context()
+        else {
+            return;
+        };
+
+        let first = wires::GridCell { x: 2, y: 2 };
+        let second = wires::GridCell { x: 5, y: 2 };
+
+        assert!(session.handle_left_click(
+            &simulation,
+            &mut component,
+            &mut wire_overlay,
+            &device,
+            &queue,
+            camera,
+            cursor_for_cell(first),
+            0,
+            true,
+        ));
+        assert_eq!(
+            wire_overlay
+                .current_draft()
+                .as_ref()
+                .map(|draft| draft.points.len()),
+            Some(1)
+        );
+
+        assert!(session.handle_left_click(
+            &simulation,
+            &mut component,
+            &mut wire_overlay,
+            &device,
+            &queue,
+            camera,
+            cursor_for_cell(second),
+            0,
+            true,
+        ));
+        assert_eq!(
+            wire_overlay
+                .current_draft()
+                .as_ref()
+                .map(|draft| draft.points.len()),
+            Some(2)
+        );
+
+        assert!(session.undo(
+            &simulation,
+            &mut component,
+            &mut wire_overlay,
+            &device,
+            &queue,
+        ));
+        assert_eq!(
+            wire_overlay
+                .current_draft()
+                .as_ref()
+                .map(|draft| draft.points.len()),
+            Some(1)
+        );
+
+        assert!(session.redo(
+            &simulation,
+            &mut component,
+            &mut wire_overlay,
+            &device,
+            &queue,
+        ));
+        assert_eq!(
+            wire_overlay
+                .current_draft()
+                .as_ref()
+                .map(|draft| draft.points.len()),
+            Some(2)
+        );
+
+        assert!(session.pop_wire_point(&mut wire_overlay, &device, &queue));
+        assert_eq!(
+            wire_overlay
+                .current_draft()
+                .as_ref()
+                .map(|draft| draft.points.len()),
+            Some(1)
+        );
+
+        assert!(session.undo(
+            &simulation,
+            &mut component,
+            &mut wire_overlay,
+            &device,
+            &queue,
+        ));
+        assert_eq!(
+            wire_overlay
+                .current_draft()
+                .as_ref()
+                .map(|draft| draft.points.len()),
+            Some(2)
+        );
+    }
 }

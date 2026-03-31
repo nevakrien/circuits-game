@@ -33,82 +33,6 @@ struct RenderSceneOptions {
     steps: u32,
 }
 
-#[derive(Clone)]
-enum EditorAction {
-    AddWire(wire_render::StoredWireEdge),
-    DeleteWire(wire_render::StoredWireEdge),
-    PlaceCell {
-        grid_cell: wires::GridCell,
-        layer: u32,
-        previous_cell: simulation::CellSnapshot,
-        previous_charge_values: Vec<u8>,
-        new_cell: simulation::CellSnapshot,
-        new_charge_values: Vec<u8>,
-    },
-    DeleteCell {
-        grid_cell: wires::GridCell,
-        layer: u32,
-        cell: simulation::CellSnapshot,
-        charge_values: Vec<u8>,
-    },
-}
-
-type EditorHistory = editor::EditorHistory<EditorAction>;
-
-trait EditorHistoryExt {
-    fn undo(
-        &mut self,
-        simulation: &simulation::Simulation,
-        component: &mut wire_render::WireRenderInfo,
-        wire_overlay: &mut wires::WireOverlay,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-    ) -> bool;
-
-    fn redo(
-        &mut self,
-        simulation: &simulation::Simulation,
-        component: &mut wire_render::WireRenderInfo,
-        wire_overlay: &mut wires::WireOverlay,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-    ) -> bool;
-}
-
-impl EditorHistoryExt for EditorHistory {
-    fn undo(
-        &mut self,
-        simulation: &simulation::Simulation,
-        component: &mut wire_render::WireRenderInfo,
-        wire_overlay: &mut wires::WireOverlay,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-    ) -> bool {
-        let Some(action) = self.pop_undo() else {
-            return false;
-        };
-        apply_inverse_action(&action, simulation, component, wire_overlay, device, queue);
-        self.push_redo(action);
-        true
-    }
-
-    fn redo(
-        &mut self,
-        simulation: &simulation::Simulation,
-        component: &mut wire_render::WireRenderInfo,
-        wire_overlay: &mut wires::WireOverlay,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-    ) -> bool {
-        let Some(action) = self.pop_redo() else {
-            return false;
-        };
-        apply_action(&action, simulation, component, wire_overlay, device, queue);
-        self.push_undo(action);
-        true
-    }
-}
-
 fn main() {
     let cli_mode = match parse_cli_args(std::env::args().skip(1)) {
         Ok(mode) => mode,
@@ -414,12 +338,11 @@ async fn run() {
         config.format,
         egui_wgpu::RendererOptions::default(),
     );
-    let mut editor_ui = editor::EditorUi::new(render::create_editor_tool_previews(
+    let mut editor_session = editor::EditorSession::new(render::create_editor_tool_previews(
         &device,
         &queue,
         &mut egui_renderer,
     ));
-    let mut history = EditorHistory::default();
     let demo_component = demo_scene::starter_component();
     let mut edited_component = wire_render::WireRenderInfo::new(wire_render::WireBufferId {
         texture_index: 0,
@@ -428,7 +351,11 @@ async fn run() {
     for wire in demo_component.wires {
         edited_component.add_wire_edge(wire);
     }
-    sync_component_wires(&mut wire_overlay, &edited_component, &device, &queue);
+    wire_overlay.replace_wires(
+        &device,
+        &queue,
+        edited_component.wire_edges().cloned().collect(),
+    );
 
     let mut current_buffer = 0;
     let mut step_requested = false;
@@ -447,11 +374,9 @@ async fn run() {
                         let raw_input = egui_state.take_egui_input(&window);
                         let mut reset_camera = false;
                         let full_output = egui_ctx.run(raw_input, |ctx| {
-                            reset_camera = editor_ui.show(ctx, displayed_layer, &history);
+                            reset_camera = editor_session.show(ctx, displayed_layer);
                         });
-                        if editor_ui.selected_tool() != editor::EditorTool::Wire {
-                            wire_overlay.cancel_draft(&device, &queue);
-                        }
+                        editor_session.cancel_draft_if_inactive(&mut wire_overlay, &device, &queue);
                         egui_state.handle_platform_output(&window, full_output.platform_output);
                         let paint_jobs =
                             egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
@@ -495,10 +420,10 @@ async fn run() {
                         hover_preview.update(
                             &queue,
                             camera,
-                            hover_preview_state_with_visibility(
+                            editor::hover_preview_state_with_visibility(
                                 camera,
                                 cursor_position,
-                                editor_ui.selected_tool(),
+                                editor_session.selected_tool(),
                                 !egui_ctx.is_pointer_over_area(),
                             ),
                         );
@@ -612,7 +537,7 @@ async fn run() {
 
                                     if !event.repeat && control_down && code == KeyCode::KeyZ {
                                         let changed = if shift_down {
-                                            history.redo(
+                                            editor_session.redo(
                                                 &simulation,
                                                 &mut edited_component,
                                                 &mut wire_overlay,
@@ -620,7 +545,7 @@ async fn run() {
                                                 &queue,
                                             )
                                         } else {
-                                            history.undo(
+                                            editor_session.undo(
                                                 &simulation,
                                                 &mut edited_component,
                                                 &mut wire_overlay,
@@ -629,21 +554,21 @@ async fn run() {
                                             )
                                         };
                                         if changed {
-                                            wire_overlay.cancel_draft(&device, &queue);
+                                            wire_overlay.restore_draft(&device, &queue, None);
                                             window.request_redraw();
                                         }
                                         return;
                                     }
 
                                     if !event.repeat && control_down && code == KeyCode::KeyY {
-                                        if history.redo(
+                                        if editor_session.redo(
                                             &simulation,
                                             &mut edited_component,
                                             &mut wire_overlay,
                                             &device,
                                             &queue,
                                         ) {
-                                            wire_overlay.cancel_draft(&device, &queue);
+                                            wire_overlay.restore_draft(&device, &queue, None);
                                             window.request_redraw();
                                         }
                                         return;
@@ -700,27 +625,37 @@ async fn run() {
                                     }
 
                                     if !event.repeat && code == KeyCode::Enter {
-                                        if editor_ui.selected_tool() == editor::EditorTool::Wire {
-                                            if let Some(action) = finish_wire_attempt(
-                                                &mut wire_overlay,
+                                        if editor_session.selected_tool()
+                                            == editor::EditorTool::Wire
+                                        {
+                                            if editor_session.finish_wire_attempt(
                                                 &mut edited_component,
+                                                &mut wire_overlay,
                                                 &device,
                                                 &queue,
-                                            ) {
-                                                history.push(action);
-                                            }
+                                            ) {}
                                             window.request_redraw();
                                         }
                                     }
 
                                     if !event.repeat && code == KeyCode::Escape {
-                                        wire_overlay.cancel_draft(&device, &queue);
+                                        editor_session.cancel_wire_draft(
+                                            &mut wire_overlay,
+                                            &device,
+                                            &queue,
+                                        );
                                         window.request_redraw();
                                     }
 
                                     if !event.repeat && code == KeyCode::Backspace {
-                                        if editor_ui.selected_tool() == editor::EditorTool::Wire {
-                                            wire_overlay.pop_point(&device, &queue);
+                                        if editor_session.selected_tool()
+                                            == editor::EditorTool::Wire
+                                        {
+                                            editor_session.pop_wire_point(
+                                                &mut wire_overlay,
+                                                &device,
+                                                &queue,
+                                            );
                                         }
                                         window.request_redraw();
                                     }
@@ -757,57 +692,20 @@ async fn run() {
                         }
 
                         if let Some(cursor) = cursor_position {
-                            if let Some(source) = wires::snap_cursor_to_cell(
+                            let extend_wire = pressed_keys.contains(&KeyCode::ShiftLeft)
+                                || pressed_keys.contains(&KeyCode::ShiftRight);
+                            if editor_session.handle_left_click(
+                                &simulation,
+                                &mut edited_component,
+                                &mut wire_overlay,
+                                &device,
+                                &queue,
                                 camera,
                                 cursor,
-                                [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
+                                displayed_layer,
+                                extend_wire,
                             ) {
-                                match editor_ui.selected_tool() {
-                                    editor::EditorTool::Wire => {
-                                        if let Some(point) = wires::cursor_to_board_point(
-                                            camera,
-                                            cursor,
-                                            [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
-                                        ) {
-                                            let had_draft = wire_overlay.has_draft();
-                                            wire_overlay.add_point(
-                                                &device,
-                                                &queue,
-                                                displayed_layer,
-                                                point,
-                                                source,
-                                            );
-                                            let extend_wire = pressed_keys
-                                                .contains(&KeyCode::ShiftLeft)
-                                                || pressed_keys.contains(&KeyCode::ShiftRight);
-                                            if had_draft && !extend_wire {
-                                                if let Some(action) = finish_wire_attempt(
-                                                    &mut wire_overlay,
-                                                    &mut edited_component,
-                                                    &device,
-                                                    &queue,
-                                                ) {
-                                                    history.push(action);
-                                                }
-                                            }
-                                            window.request_redraw();
-                                        }
-                                    }
-                                    tool => {
-                                        if let Some(action) = place_cell_at_cursor(
-                                            &simulation,
-                                            &device,
-                                            &queue,
-                                            camera,
-                                            cursor,
-                                            displayed_layer,
-                                            tool,
-                                        ) {
-                                            history.push(action);
-                                        }
-                                        window.request_redraw();
-                                    }
-                                }
+                                window.request_redraw();
                             }
                         }
                     }
@@ -821,20 +719,9 @@ async fn run() {
                             return;
                         }
 
-                        if editor_ui.selected_tool() != editor::EditorTool::Wire {
-                            editor_ui.reset_to_default_tool();
-                            wire_overlay.cancel_draft(&device, &queue);
-                            window.request_redraw();
-                            return;
-                        }
-
-                        if wire_overlay.has_draft() {
-                            wire_overlay.cancel_draft(&device, &queue);
-                            window.request_redraw();
-                            return;
-                        }
-
-                        if let Some(action) = delete_at_cursor(
+                        let extend_wire = pressed_keys.contains(&KeyCode::ShiftLeft)
+                            || pressed_keys.contains(&KeyCode::ShiftRight);
+                        if editor_session.handle_right_click(
                             &simulation,
                             &mut edited_component,
                             &mut wire_overlay,
@@ -843,10 +730,10 @@ async fn run() {
                             camera,
                             cursor_position,
                             displayed_layer,
+                            extend_wire,
                         ) {
-                            history.push(action);
+                            window.request_redraw();
                         }
-                        window.request_redraw();
                     }
                     WindowEvent::Resized(size) => {
                         if size.width > 0 && size.height > 0 {
@@ -864,567 +751,4 @@ async fn run() {
             _ => {}
         })
         .unwrap();
-}
-
-fn sync_component_wires(
-    wire_overlay: &mut wires::WireOverlay,
-    component: &wire_render::WireRenderInfo,
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-) {
-    wire_overlay.replace_wires(device, queue, component.wire_edges().cloned().collect());
-}
-
-fn finish_wire_attempt(
-    wire_overlay: &mut wires::WireOverlay,
-    component: &mut wire_render::WireRenderInfo,
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-) -> Option<EditorAction> {
-    if let Some(edge) = wire_overlay.commit_draft(device, queue) {
-        component.add_wire_edge(edge.clone());
-        sync_component_wires(wire_overlay, component, device, queue);
-        Some(EditorAction::AddWire(edge))
-    } else {
-        wire_overlay.cancel_draft(device, queue);
-        None
-    }
-}
-
-fn delete_at_cursor(
-    simulation: &simulation::Simulation,
-    component: &mut wire_render::WireRenderInfo,
-    wire_overlay: &mut wires::WireOverlay,
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    camera: render::CameraState,
-    cursor_position: Option<[f32; 2]>,
-    displayed_layer: u32,
-) -> Option<EditorAction> {
-    let Some(cursor) = cursor_position else {
-        return None;
-    };
-    let Some(grid_cell) = wires::snap_cursor_to_cell(
-        camera,
-        cursor,
-        [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
-    ) else {
-        return None;
-    };
-    let Some(point) = wires::cursor_to_board_point(
-        camera,
-        cursor,
-        [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
-    ) else {
-        return None;
-    };
-
-    if let Some(edge) = component.remove_wire_at_point(displayed_layer, point) {
-        sync_component_wires(wire_overlay, component, device, queue);
-        Some(EditorAction::DeleteWire(edge))
-    } else {
-        let cell = simulation.read_cell(device, queue, grid_cell, displayed_layer);
-        let charge_values = (0..simulation::CHARGE_BUFFER_COUNT)
-            .map(|buffer_index| {
-                pollster::block_on(simulation.read_charge_value(
-                    device,
-                    queue,
-                    buffer_index,
-                    grid_cell.x,
-                    grid_cell.y,
-                    displayed_layer,
-                ))
-            })
-            .collect::<Vec<_>>();
-        if cell.bytes == [0, 0, 0, 0] && charge_values.iter().all(|value| *value == 0) {
-            return None;
-        }
-        simulation.clear_cell(queue, grid_cell, displayed_layer);
-        simulation.clear_charge_at(device, queue, grid_cell, displayed_layer);
-        Some(EditorAction::DeleteCell {
-            grid_cell,
-            layer: displayed_layer,
-            cell,
-            charge_values,
-        })
-    }
-}
-
-fn place_cell_at_cursor(
-    simulation: &simulation::Simulation,
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    camera: render::CameraState,
-    cursor: [f32; 2],
-    displayed_layer: u32,
-    tool: editor::EditorTool,
-) -> Option<EditorAction> {
-    let grid_cell = wires::snap_cursor_to_cell(
-        camera,
-        cursor,
-        [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
-    )?;
-    let new_cell = snapshot_for_tool(tool)?;
-    let previous_cell = simulation.read_cell(device, queue, grid_cell, displayed_layer);
-
-    if previous_cell == new_cell {
-        return None;
-    }
-
-    let previous_charge_values = (0..simulation::CHARGE_BUFFER_COUNT)
-        .map(|buffer_index| {
-            pollster::block_on(simulation.read_charge_value(
-                device,
-                queue,
-                buffer_index,
-                grid_cell.x,
-                grid_cell.y,
-                displayed_layer,
-            ))
-        })
-        .collect::<Vec<_>>();
-
-    let new_charge_values = charge_values_for_tool(tool);
-
-    simulation.write_cell(queue, grid_cell, displayed_layer, new_cell);
-    write_charge_values(
-        simulation,
-        device,
-        queue,
-        grid_cell,
-        displayed_layer,
-        &new_charge_values,
-    );
-
-    Some(EditorAction::PlaceCell {
-        grid_cell,
-        layer: displayed_layer,
-        previous_cell,
-        previous_charge_values,
-        new_cell,
-        new_charge_values,
-    })
-}
-
-fn hover_preview_state_with_visibility(
-    camera: render::CameraState,
-    cursor_position: Option<[f32; 2]>,
-    tool: editor::EditorTool,
-    visible: bool,
-) -> Option<render::HoverPreviewState> {
-    if !visible || !tool.is_placeable() {
-        return None;
-    }
-
-    let cursor = cursor_position?;
-    let grid_cell = wires::snap_cursor_to_cell(
-        camera,
-        cursor,
-        [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
-    )?;
-
-    Some(render::HoverPreviewState {
-        cell: [grid_cell.x, grid_cell.y],
-        circuit: snapshot_for_tool(tool)?.bytes,
-        charge: charge_values_for_tool(tool).into_iter().next().unwrap_or(0),
-    })
-}
-
-fn snapshot_for_tool(tool: editor::EditorTool) -> Option<simulation::CellSnapshot> {
-    match tool {
-        editor::EditorTool::Wire => None,
-        editor::EditorTool::Source => Some(simulation::CellSnapshot::source(0xff)),
-        editor::EditorTool::Noop => Some(simulation::CellSnapshot::noop()),
-        editor::EditorTool::Not => Some(simulation::CellSnapshot::gate(simulation::GateKind::Not)),
-        editor::EditorTool::And => Some(simulation::CellSnapshot::gate(simulation::GateKind::And)),
-        editor::EditorTool::Or => Some(simulation::CellSnapshot::gate(simulation::GateKind::Or)),
-        editor::EditorTool::Xor => Some(simulation::CellSnapshot::gate(simulation::GateKind::Xor)),
-        editor::EditorTool::Nand => {
-            Some(simulation::CellSnapshot::gate(simulation::GateKind::Nand))
-        }
-        editor::EditorTool::Nor => Some(simulation::CellSnapshot::gate(simulation::GateKind::Nor)),
-        editor::EditorTool::Xnor => {
-            Some(simulation::CellSnapshot::gate(simulation::GateKind::Xnor))
-        }
-    }
-}
-
-fn charge_values_for_tool(tool: editor::EditorTool) -> Vec<u8> {
-    let value = match tool {
-        editor::EditorTool::Source => 0xff,
-        _ => 0x00,
-    };
-
-    vec![value; simulation::CHARGE_BUFFER_COUNT as usize]
-}
-
-fn write_charge_values(
-    simulation: &simulation::Simulation,
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    grid_cell: wires::GridCell,
-    layer: u32,
-    charge_values: &[u8],
-) {
-    for (buffer_index, value) in charge_values.iter().copied().enumerate() {
-        simulation.write_charge_value(device, queue, buffer_index as u32, grid_cell, layer, value);
-    }
-}
-
-fn apply_action(
-    action: &EditorAction,
-    simulation: &simulation::Simulation,
-    component: &mut wire_render::WireRenderInfo,
-    wire_overlay: &mut wires::WireOverlay,
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-) {
-    match action {
-        EditorAction::AddWire(edge) => {
-            component.add_wire_edge(edge.clone());
-            sync_component_wires(wire_overlay, component, device, queue);
-        }
-        EditorAction::DeleteWire(edge) => {
-            component.remove_matching_wire_edge(edge);
-            sync_component_wires(wire_overlay, component, device, queue);
-        }
-        EditorAction::PlaceCell {
-            grid_cell,
-            layer,
-            new_cell,
-            new_charge_values,
-            ..
-        } => {
-            simulation.write_cell(queue, *grid_cell, *layer, *new_cell);
-            write_charge_values(
-                simulation,
-                device,
-                queue,
-                *grid_cell,
-                *layer,
-                new_charge_values,
-            );
-        }
-        EditorAction::DeleteCell {
-            grid_cell, layer, ..
-        } => {
-            simulation.clear_cell(queue, *grid_cell, *layer);
-            simulation.clear_charge_at(device, queue, *grid_cell, *layer);
-        }
-    }
-}
-
-fn apply_inverse_action(
-    action: &EditorAction,
-    simulation: &simulation::Simulation,
-    component: &mut wire_render::WireRenderInfo,
-    wire_overlay: &mut wires::WireOverlay,
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-) {
-    match action {
-        EditorAction::AddWire(edge) => {
-            component.remove_matching_wire_edge(edge);
-            sync_component_wires(wire_overlay, component, device, queue);
-        }
-        EditorAction::DeleteWire(edge) => {
-            component.add_wire_edge(edge.clone());
-            sync_component_wires(wire_overlay, component, device, queue);
-        }
-        EditorAction::PlaceCell {
-            grid_cell,
-            layer,
-            previous_cell,
-            previous_charge_values,
-            ..
-        } => {
-            simulation.write_cell(queue, *grid_cell, *layer, *previous_cell);
-            write_charge_values(
-                simulation,
-                device,
-                queue,
-                *grid_cell,
-                *layer,
-                previous_charge_values,
-            );
-        }
-        EditorAction::DeleteCell {
-            grid_cell,
-            layer,
-            cell,
-            charge_values,
-        } => {
-            simulation.write_cell(queue, *grid_cell, *layer, *cell);
-            for (buffer_index, value) in charge_values.iter().copied().enumerate() {
-                simulation.write_charge_value(
-                    device,
-                    queue,
-                    buffer_index as u32,
-                    *grid_cell,
-                    *layer,
-                    value,
-                );
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use winit::dpi::PhysicalSize;
-
-    const TEST_SURFACE_SIZE: PhysicalSize<u32> = PhysicalSize::new(1600, 900);
-
-    async fn create_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-        let instance = wgpu::Instance::default();
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions::default())
-            .await
-            .ok()?;
-
-        adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
-            .await
-            .ok()
-    }
-
-    fn create_editor_test_context() -> Option<(
-        wgpu::Device,
-        wgpu::Queue,
-        simulation::Simulation,
-        wire_render::WireRenderInfo,
-        wires::WireOverlay,
-        render::CameraState,
-    )> {
-        let (device, queue) = pollster::block_on(create_headless_device())?;
-        let simulation = simulation::Simulation::new(&device, &queue);
-        let component = wire_render::WireRenderInfo::new(wire_render::WireBufferId {
-            texture_index: 0,
-            layer: 0,
-        });
-        let wire_overlay = wires::WireOverlay::new(
-            &device,
-            &queue,
-            wgpu::TextureFormat::Bgra8UnormSrgb,
-            TEST_SURFACE_SIZE,
-            [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
-        );
-        let camera = render::CameraState::new(TEST_SURFACE_SIZE);
-
-        Some((device, queue, simulation, component, wire_overlay, camera))
-    }
-
-    fn cursor_for_cell(cell: wires::GridCell) -> [f32; 2] {
-        [
-            (cell.x as f32 + 0.5) / simulation::GRID_WIDTH as f32 * TEST_SURFACE_SIZE.width as f32,
-            (cell.y as f32 + 0.5) / simulation::GRID_HEIGHT as f32
-                * TEST_SURFACE_SIZE.height as f32,
-        ]
-    }
-
-    fn read_charge_values(
-        simulation: &simulation::Simulation,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        cell: wires::GridCell,
-        layer: u32,
-    ) -> Vec<u8> {
-        (0..simulation::CHARGE_BUFFER_COUNT)
-            .map(|buffer_index| {
-                pollster::block_on(simulation.read_charge_value(
-                    device,
-                    queue,
-                    buffer_index,
-                    cell.x,
-                    cell.y,
-                    layer,
-                ))
-            })
-            .collect()
-    }
-
-    #[test]
-    fn placing_tools_writes_expected_cell_and_charge_values() {
-        let Some((device, queue, simulation, _, _, camera)) = create_editor_test_context() else {
-            return;
-        };
-
-        let cases = [
-            (
-                editor::EditorTool::Source,
-                wires::GridCell { x: 0, y: 7 },
-                simulation::CellSnapshot::source(0xff),
-                vec![0xff; simulation::CHARGE_BUFFER_COUNT as usize],
-            ),
-            (
-                editor::EditorTool::Not,
-                wires::GridCell { x: 1, y: 7 },
-                simulation::CellSnapshot::gate(simulation::GateKind::Not),
-                vec![0x00; simulation::CHARGE_BUFFER_COUNT as usize],
-            ),
-            (
-                editor::EditorTool::And,
-                wires::GridCell { x: 2, y: 7 },
-                simulation::CellSnapshot::gate(simulation::GateKind::And),
-                vec![0x00; simulation::CHARGE_BUFFER_COUNT as usize],
-            ),
-            (
-                editor::EditorTool::Or,
-                wires::GridCell { x: 3, y: 7 },
-                simulation::CellSnapshot::gate(simulation::GateKind::Or),
-                vec![0x00; simulation::CHARGE_BUFFER_COUNT as usize],
-            ),
-            (
-                editor::EditorTool::Xor,
-                wires::GridCell { x: 4, y: 7 },
-                simulation::CellSnapshot::gate(simulation::GateKind::Xor),
-                vec![0x00; simulation::CHARGE_BUFFER_COUNT as usize],
-            ),
-            (
-                editor::EditorTool::Nand,
-                wires::GridCell { x: 5, y: 7 },
-                simulation::CellSnapshot::gate(simulation::GateKind::Nand),
-                vec![0x00; simulation::CHARGE_BUFFER_COUNT as usize],
-            ),
-            (
-                editor::EditorTool::Nor,
-                wires::GridCell { x: 6, y: 7 },
-                simulation::CellSnapshot::gate(simulation::GateKind::Nor),
-                vec![0x00; simulation::CHARGE_BUFFER_COUNT as usize],
-            ),
-            (
-                editor::EditorTool::Xnor,
-                wires::GridCell { x: 7, y: 7 },
-                simulation::CellSnapshot::gate(simulation::GateKind::Xnor),
-                vec![0x00; simulation::CHARGE_BUFFER_COUNT as usize],
-            ),
-        ];
-
-        for (tool, grid_cell, expected_cell, expected_charge_values) in cases {
-            let action = place_cell_at_cursor(
-                &simulation,
-                &device,
-                &queue,
-                camera,
-                cursor_for_cell(grid_cell),
-                0,
-                tool,
-            )
-            .unwrap();
-
-            match action {
-                EditorAction::PlaceCell {
-                    grid_cell: action_grid_cell,
-                    layer,
-                    previous_cell,
-                    previous_charge_values,
-                    new_cell,
-                    new_charge_values,
-                } => {
-                    assert_eq!(action_grid_cell, grid_cell);
-                    assert_eq!(layer, 0);
-                    assert_eq!(previous_cell, simulation::CellSnapshot::empty());
-                    assert_eq!(
-                        previous_charge_values,
-                        vec![0x00; simulation::CHARGE_BUFFER_COUNT as usize]
-                    );
-                    assert_eq!(new_cell, expected_cell);
-                    assert_eq!(new_charge_values, expected_charge_values);
-                }
-                _ => panic!("expected place-cell action"),
-            }
-
-            assert_eq!(
-                simulation.read_cell(&device, &queue, grid_cell, 0),
-                expected_cell
-            );
-            assert_eq!(
-                read_charge_values(&simulation, &device, &queue, grid_cell, 0),
-                expected_charge_values
-            );
-        }
-    }
-
-    #[test]
-    fn undo_and_redo_restore_previous_cell_and_charge_values() {
-        let Some((device, queue, simulation, mut component, mut wire_overlay, camera)) =
-            create_editor_test_context()
-        else {
-            return;
-        };
-
-        let grid_cell = wires::GridCell { x: 3, y: 4 };
-        let layer = 0;
-        let previous_cell = simulation::CellSnapshot::gate(simulation::GateKind::Not);
-        let previous_charge_values = [0x12, 0x34];
-
-        simulation.write_cell(&queue, grid_cell, layer, previous_cell);
-        for (buffer_index, value) in previous_charge_values.into_iter().enumerate() {
-            simulation.write_charge_value(
-                &device,
-                &queue,
-                buffer_index as u32,
-                grid_cell,
-                layer,
-                value,
-            );
-        }
-
-        let action = place_cell_at_cursor(
-            &simulation,
-            &device,
-            &queue,
-            camera,
-            cursor_for_cell(grid_cell),
-            layer,
-            editor::EditorTool::Source,
-        )
-        .unwrap();
-
-        let mut history = EditorHistory::default();
-        history.push(action);
-
-        assert_eq!(
-            simulation.read_cell(&device, &queue, grid_cell, layer),
-            simulation::CellSnapshot::source(0xff)
-        );
-        assert_eq!(
-            read_charge_values(&simulation, &device, &queue, grid_cell, layer),
-            vec![0xff; simulation::CHARGE_BUFFER_COUNT as usize]
-        );
-
-        assert!(history.undo(
-            &simulation,
-            &mut component,
-            &mut wire_overlay,
-            &device,
-            &queue,
-        ));
-        assert_eq!(
-            simulation.read_cell(&device, &queue, grid_cell, layer),
-            previous_cell
-        );
-        assert_eq!(
-            read_charge_values(&simulation, &device, &queue, grid_cell, layer),
-            previous_charge_values.to_vec()
-        );
-
-        assert!(history.redo(
-            &simulation,
-            &mut component,
-            &mut wire_overlay,
-            &device,
-            &queue,
-        ));
-        assert_eq!(
-            simulation.read_cell(&device, &queue, grid_cell, layer),
-            simulation::CellSnapshot::source(0xff)
-        );
-        assert_eq!(
-            read_charge_values(&simulation, &device, &queue, grid_cell, layer),
-            vec![0xff; simulation::CHARGE_BUFFER_COUNT as usize]
-        );
-    }
 }

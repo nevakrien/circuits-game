@@ -1,7 +1,7 @@
 use crate::{
     simulation::{CellSnapshot, GateKind},
     wire_render::{StoredWireEdge, WireEndpointId},
-    wires::{GridCell, WirePoint, DEFAULT_WIRE_COLOR},
+    wires::{DEFAULT_WIRE_COLOR, GridCell, WirePoint},
 };
 
 pub struct DemoComponent {

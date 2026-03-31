@@ -43,6 +43,13 @@ pub struct WirePoint {
     pub y: f32,
 }
 
+#[derive(Clone, PartialEq, Debug)]
+pub struct DraftWire {
+    pub layer: u32,
+    pub source: GridCell,
+    pub points: Vec<WirePoint>,
+}
+
 #[derive(Clone)]
 struct AestheticWire {
     layer: u32,
@@ -224,6 +231,32 @@ impl WireOverlay {
 
     pub fn has_draft(&self) -> bool {
         !self.draft_points.is_empty()
+    }
+
+    pub fn current_draft(&self) -> Option<DraftWire> {
+        Some(DraftWire {
+            layer: self.draft_layer,
+            source: self.draft_source?,
+            points: self.draft_points.clone(),
+        })
+    }
+
+    pub fn restore_draft(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        draft: Option<&DraftWire>,
+    ) {
+        if let Some(draft) = draft {
+            self.draft_layer = draft.layer;
+            self.draft_source = Some(draft.source);
+            self.draft_points = draft.points.clone();
+        } else {
+            self.draft_source = None;
+            self.draft_points.clear();
+        }
+
+        self.sync_segments(device, queue);
     }
 
     pub fn add_point(
