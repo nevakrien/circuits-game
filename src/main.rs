@@ -427,7 +427,12 @@ async fn run() {
                                 !egui_ctx.is_pointer_over_area(),
                             ),
                         );
-                        wire_overlay.update_camera(&queue, camera);
+                        wire_overlay.set_draft_color(
+                            &device,
+                            &queue,
+                            editor_session.selected_wire_color(),
+                        );
+                        wire_overlay.update_camera(&device, &queue, camera);
 
                         let next_buffer = (current_buffer + 1) % simulation::CHARGE_BUFFER_COUNT;
 
@@ -740,7 +745,7 @@ async fn run() {
                             windowing::resize_surface(&surface, &device, &mut config, size);
                             camera.resize(size);
                             renderer.update_view_layer(&queue, camera, displayed_layer);
-                            wire_overlay.resize(&queue, camera, size);
+                            wire_overlay.resize(&device, &queue, camera, size);
                         }
                     }
                     WindowEvent::CloseRequested => target.exit(),

@@ -68,9 +68,11 @@ pub struct WireOverlay {
     surface_size: PhysicalSize<u32>,
     board_size: [u32; 2],
     wires: Vec<AestheticWire>,
+    thickness_px: f32,
     draft_layer: u32,
     draft_source: Option<GridCell>,
     draft_points: Vec<WirePoint>,
+    draft_color: [f32; 4],
     hover_point: Option<WirePoint>,
 }
 
@@ -187,9 +189,15 @@ impl WireOverlay {
             surface_size,
             board_size,
             wires: Vec::new(),
+            thickness_px: effective_wire_thickness_px(
+                CameraState::new(surface_size),
+                surface_size,
+                board_size,
+            ),
             draft_layer: 0,
             draft_source: None,
             draft_points: Vec::new(),
+            draft_color: DEFAULT_WIRE_COLOR,
             hover_point: None,
         };
 
@@ -202,19 +210,44 @@ impl WireOverlay {
 
     pub fn resize(
         &mut self,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
         camera: CameraState,
         surface_size: PhysicalSize<u32>,
     ) {
         self.surface_size = surface_size;
+        let thickness_px = effective_wire_thickness_px(camera, surface_size, self.board_size);
         self.update_view(queue, camera_params(camera, surface_size, self.board_size));
+        if (self.thickness_px - thickness_px).abs() > f32::EPSILON {
+            self.thickness_px = thickness_px;
+            self.sync_segments(device, queue);
+        }
     }
 
-    pub fn update_camera(&self, queue: &wgpu::Queue, camera: CameraState) {
+    pub fn update_camera(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        camera: CameraState,
+    ) {
+        let thickness_px = effective_wire_thickness_px(camera, self.surface_size, self.board_size);
         self.update_view(
             queue,
             camera_params(camera, self.surface_size, self.board_size),
         );
+        if (self.thickness_px - thickness_px).abs() > f32::EPSILON {
+            self.thickness_px = thickness_px;
+            self.sync_segments(device, queue);
+        }
+    }
+
+    pub fn set_draft_color(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, color: [f32; 4]) {
+        if self.draft_color == color {
+            return;
+        }
+
+        self.draft_color = color;
+        self.sync_segments(device, queue);
     }
 
     pub fn update_hover(
@@ -311,6 +344,7 @@ impl WireOverlay {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        color: [f32; 4],
     ) -> Option<StoredWireEdge> {
         let Some(source) = self.draft_source else {
             return None;
@@ -328,7 +362,7 @@ impl WireOverlay {
             source_id: WireEndpointId::from_grid_cell(source, self.draft_layer),
             destination_id: WireEndpointId::from_grid_cell(destination, self.draft_layer),
             points: self.draft_points.clone(),
-            color: DEFAULT_WIRE_COLOR,
+            color,
         };
         self.draft_points.clear();
         self.draft_source = None;
@@ -452,6 +486,7 @@ impl WireOverlay {
                 wire.source,
                 &wire.points,
                 wire.color,
+                self.thickness_px,
             );
         }
 
@@ -462,7 +497,8 @@ impl WireOverlay {
                     self.draft_layer,
                     source,
                     &self.draft_points,
-                    DEFAULT_WIRE_COLOR,
+                    self.draft_color,
+                    self.thickness_px,
                 );
             }
 
@@ -475,7 +511,8 @@ impl WireOverlay {
                         self.draft_layer,
                         source,
                         &preview,
-                        DEFAULT_WIRE_COLOR,
+                        self.draft_color,
+                        self.thickness_px,
                     );
                 }
             }
@@ -491,6 +528,7 @@ fn append_segments(
     source: GridCell,
     points: &[WirePoint],
     color: [f32; 4],
+    thickness_px: f32,
 ) {
     if points.len() < 2 {
         return;
@@ -524,7 +562,7 @@ fn append_segments(
                 path_start / total_length,
                 path_end / total_length,
                 length,
-                WIRE_THICKNESS_PX,
+                thickness_px,
             ],
             color,
         });
@@ -554,6 +592,18 @@ fn camera_params(
         ],
         board: [board_size[0] as f32, board_size[1] as f32, 0.0, 0.0],
     }
+}
+
+fn effective_wire_thickness_px(
+    camera: CameraState,
+    surface_size: PhysicalSize<u32>,
+    board_size: [u32; 2],
+) -> f32 {
+    let view = camera.view_params();
+    let cell_width_px = surface_size.width.max(1) as f32 / (board_size[0].max(1) as f32 * view[0]);
+    let cell_height_px =
+        surface_size.height.max(1) as f32 / (board_size[1].max(1) as f32 * view[1]);
+    WIRE_THICKNESS_PX.min(cell_width_px.min(cell_height_px))
 }
 
 pub fn cursor_to_board_point(
@@ -606,6 +656,7 @@ mod tests {
                 WirePoint { x: 3.0, y: 4.0 },
             ],
             DEFAULT_WIRE_COLOR,
+            WIRE_THICKNESS_PX,
         );
 
         assert_eq!(segments.len(), 2);
@@ -614,5 +665,21 @@ mod tests {
         assert!((segments[0].path[1] - 0.4).abs() < 0.0001);
         assert!((segments[1].path[0] - 0.4).abs() < 0.0001);
         assert!((segments[1].path[1] - 1.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn wire_thickness_never_exceeds_cell_size() {
+        let surface = PhysicalSize::new(1600, 900);
+        let fit_camera = CameraState::new(surface);
+        assert_eq!(
+            effective_wire_thickness_px(fit_camera, surface, [8, 8]),
+            WIRE_THICKNESS_PX
+        );
+
+        let mut zoomed_out_camera = CameraState::new(surface);
+        zoomed_out_camera.zoom = 0.01;
+        assert!(
+            effective_wire_thickness_px(zoomed_out_camera, surface, [8, 8]) < WIRE_THICKNESS_PX
+        );
     }
 }

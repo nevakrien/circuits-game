@@ -16,6 +16,16 @@ const PANEL_HEIGHT: f32 = 420.0;
 const PANEL_MARGIN: f32 = 12.0;
 const PANEL_INNER_WIDTH: f32 = PANEL_WIDTH - 24.0;
 const TOOL_CARD_HEIGHT: f32 = 78.0;
+const WIRE_COLOR_MENU_WIDTH: f32 = 152.0;
+
+const WIRE_COLOR_OPTIONS: [([f32; 4], &str); 6] = [
+    (wires::DEFAULT_WIRE_COLOR, "Blue"),
+    ([0.87, 0.32, 0.28, 1.0], "Red"),
+    ([0.27, 0.74, 0.43, 1.0], "Green"),
+    ([0.93, 0.76, 0.25, 1.0], "Gold"),
+    ([0.64, 0.42, 0.88, 1.0], "Purple"),
+    ([0.93, 0.48, 0.76, 1.0], "Pink"),
+];
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EditorTool {
     Wire,
@@ -101,6 +111,7 @@ const TOOL_OPTIONS: &[EditorTool] = &EditorTool::ALL;
 pub struct EditorUi {
     expanded: bool,
     selected_tool: EditorTool,
+    selected_wire_color: [f32; 4],
     tool_preview_textures: [TextureId; EditorTool::COUNT],
 }
 
@@ -193,6 +204,10 @@ impl EditorSession {
         self.ui.selected_tool()
     }
 
+    pub fn selected_wire_color(&self) -> [f32; 4] {
+        self.ui.selected_wire_color()
+    }
+
     pub fn show(&mut self, ctx: &egui::Context, displayed_layer: u32) -> bool {
         self.ui.show(ctx, displayed_layer, &self.history)
     }
@@ -250,7 +265,8 @@ impl EditorSession {
         let Some(draft) = wire_overlay.current_draft() else {
             return false;
         };
-        let Some(edge) = wire_overlay.commit_draft(device, queue) else {
+        let Some(edge) = wire_overlay.commit_draft(device, queue, self.ui.selected_wire_color())
+        else {
             wire_overlay.restore_draft(device, queue, None);
             return false;
         };
@@ -408,12 +424,17 @@ impl EditorUi {
         Self {
             expanded: false,
             selected_tool: EditorTool::Wire,
+            selected_wire_color: wires::DEFAULT_WIRE_COLOR,
             tool_preview_textures,
         }
     }
 
     pub fn selected_tool(&self) -> EditorTool {
         self.selected_tool
+    }
+
+    pub fn selected_wire_color(&self) -> [f32; 4] {
+        self.selected_wire_color
     }
 
     pub fn reset_to_default_tool(&mut self) {
@@ -439,13 +460,17 @@ impl EditorUi {
         let tag_rect = Rect::from_min_size(origin, Vec2::new(TAG_WIDTH, TAG_HEIGHT));
         let mut reset_requested = false;
 
-        let expanded_rect = Rect::from_min_size(origin, Vec2::new(PANEL_WIDTH, panel_height));
+        let expanded_rect = Rect::from_min_size(
+            origin,
+            Vec2::new(PANEL_WIDTH + WIRE_COLOR_MENU_WIDTH + 8.0, panel_height),
+        );
+        let mut wire_menu_anchor = None;
         let pointer_pos = ctx.input(|input| input.pointer.hover_pos());
         let hovered_activation = pointer_pos.is_some_and(|pos| tag_rect.contains(pos));
         let hovered_panel =
             self.expanded && pointer_pos.is_some_and(|pos| expanded_rect.contains(pos));
         let visible_width = if self.expanded || hovered_activation {
-            PANEL_WIDTH
+            PANEL_WIDTH + WIRE_COLOR_MENU_WIDTH + 8.0
         } else {
             TAG_WIDTH
         };
@@ -508,8 +533,19 @@ impl EditorUi {
                                         ui,
                                         *tool,
                                         *tool == self.selected_tool,
+                                        if *tool == EditorTool::Wire {
+                                            Some(self.selected_wire_color)
+                                        } else {
+                                            None
+                                        },
                                         self.tool_preview_textures[tool.preview_index()],
                                     );
+                                    if *tool == EditorTool::Wire
+                                        && (response.hovered()
+                                            || self.selected_tool == EditorTool::Wire)
+                                    {
+                                        wire_menu_anchor = Some(response.rect);
+                                    }
                                     if response.clicked() {
                                         self.selected_tool = *tool;
                                     }
@@ -541,6 +577,17 @@ impl EditorUi {
                     );
                 }
             });
+
+        if self.expanded {
+            if let Some(anchor) = wire_menu_anchor {
+                show_wire_color_menu(
+                    ctx,
+                    anchor,
+                    &mut self.selected_wire_color,
+                    &mut self.selected_tool,
+                );
+            }
+        }
 
         egui::Area::new(Id::new("editor_reset_view_button"))
             .order(Order::Foreground)
@@ -849,6 +896,7 @@ fn draw_tool_card(
     ui: &mut egui::Ui,
     tool: EditorTool,
     selected: bool,
+    color_chip: Option<[f32; 4]>,
     preview_texture: TextureId,
 ) -> egui::Response {
     let size = Vec2::new(ui.available_width(), TOOL_CARD_HEIGHT);
@@ -933,7 +981,112 @@ fn draw_tool_card(
         );
     }
 
+    if let Some(color_chip) = color_chip {
+        let swatch_rect = Rect::from_min_size(
+            Pos2::new(rect.right() - 28.0, rect.bottom() - 28.0),
+            Vec2::new(16.0, 16.0),
+        );
+        ui.painter().rect_filled(
+            swatch_rect,
+            CornerRadius::same(6),
+            color32_from_wire(color_chip),
+        );
+        ui.painter().rect_stroke(
+            swatch_rect,
+            CornerRadius::same(6),
+            Stroke::new(1.0, Color32::from_rgb(230, 236, 242)),
+            StrokeKind::Outside,
+        );
+    }
+
     response
+}
+
+fn show_wire_color_menu(
+    ctx: &egui::Context,
+    anchor: Rect,
+    selected_wire_color: &mut [f32; 4],
+    selected_tool: &mut EditorTool,
+) {
+    egui::Area::new(Id::new("wire_color_submenu"))
+        .order(Order::Foreground)
+        .fixed_pos(Pos2::new(anchor.right() + 8.0, anchor.top()))
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(Color32::from_rgba_unmultiplied(10, 12, 16, 236))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(58, 72, 90)))
+                .corner_radius(CornerRadius::same(12))
+                .inner_margin(10.0)
+                .show(ui, |ui| {
+                    ui.set_width(WIRE_COLOR_MENU_WIDTH);
+                    ui.label(
+                        RichText::new("Wire Color")
+                            .strong()
+                            .color(Color32::from_rgb(230, 236, 242)),
+                    );
+                    ui.label(
+                        RichText::new("Choose the color for new wires")
+                            .small()
+                            .color(Color32::from_rgb(160, 174, 190)),
+                    );
+                    ui.add_space(8.0);
+
+                    for (color, label) in WIRE_COLOR_OPTIONS {
+                        let selected = *selected_wire_color == color;
+                        let response = ui.add(
+                            egui::Button::new(
+                                RichText::new(label).color(Color32::from_rgb(230, 236, 242)),
+                            )
+                            .min_size(Vec2::new(ui.available_width(), 28.0))
+                            .fill(if selected {
+                                Color32::from_rgb(34, 44, 58)
+                            } else {
+                                Color32::from_rgb(16, 20, 27)
+                            })
+                            .stroke(Stroke::new(
+                                1.0,
+                                if selected {
+                                    Color32::from_rgb(120, 156, 194)
+                                } else {
+                                    Color32::from_rgb(46, 58, 74)
+                                },
+                            )),
+                        );
+
+                        let swatch_rect = Rect::from_min_size(
+                            Pos2::new(response.rect.left() + 8.0, response.rect.center().y - 7.0),
+                            Vec2::new(14.0, 14.0),
+                        );
+                        ui.painter().rect_filled(
+                            swatch_rect,
+                            CornerRadius::same(5),
+                            color32_from_wire(color),
+                        );
+                        ui.painter().rect_stroke(
+                            swatch_rect,
+                            CornerRadius::same(5),
+                            Stroke::new(1.0, Color32::from_rgb(230, 236, 242)),
+                            StrokeKind::Outside,
+                        );
+
+                        if response.clicked() {
+                            *selected_wire_color = color;
+                            *selected_tool = EditorTool::Wire;
+                        }
+
+                        ui.add_space(4.0);
+                    }
+                });
+        });
+}
+
+fn color32_from_wire(color: [f32; 4]) -> Color32 {
+    Color32::from_rgba_premultiplied(
+        (color[0] * 255.0).round() as u8,
+        (color[1] * 255.0).round() as u8,
+        (color[2] * 255.0).round() as u8,
+        (color[3] * 255.0).round() as u8,
+    )
 }
 
 #[cfg(test)]
@@ -1306,5 +1459,45 @@ mod tests {
                 .map(|draft| draft.points.len()),
             Some(2)
         );
+    }
+
+    #[test]
+    fn committed_wires_use_selected_wire_color() {
+        let Some((device, queue, simulation, mut component, mut wire_overlay, camera, mut session)) =
+            create_editor_test_context()
+        else {
+            return;
+        };
+
+        let selected_color = [0.87, 0.32, 0.28, 1.0];
+        session.ui.selected_wire_color = selected_color;
+        wire_overlay.set_draft_color(&device, &queue, selected_color);
+
+        assert!(session.handle_left_click(
+            &simulation,
+            &mut component,
+            &mut wire_overlay,
+            &device,
+            &queue,
+            camera,
+            cursor_for_cell(wires::GridCell { x: 1, y: 1 }),
+            0,
+            true,
+        ));
+        assert!(session.handle_left_click(
+            &simulation,
+            &mut component,
+            &mut wire_overlay,
+            &device,
+            &queue,
+            camera,
+            cursor_for_cell(wires::GridCell { x: 4, y: 1 }),
+            0,
+            true,
+        ));
+        assert!(session.finish_wire_attempt(&mut component, &mut wire_overlay, &device, &queue));
+
+        let wire = component.wire_edges().next().unwrap();
+        assert_eq!(wire.color, selected_color);
     }
 }
