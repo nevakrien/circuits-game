@@ -1,6 +1,6 @@
 use egui_wgpu::wgpu;
 
-use crate::wires::GridCell;
+use crate::{demo_scene, wires::GridCell};
 
 pub const GRID_WIDTH: u32 = 8;
 pub const GRID_HEIGHT: u32 = 8;
@@ -577,11 +577,26 @@ fn linear_index(x: u32, y: u32, z: u32) -> usize {
 }
 
 fn circuit_cell_for_coord(x: u32, y: u32, z: u32) -> CircuitCell {
-    if z == 0 {
-        return primary_board_cell(x, y);
-    }
+    circuit_cell_from_snapshot(demo_scene::cell_at(x, y, z))
+}
 
-    noop_cell()
+fn circuit_cell_from_snapshot(snapshot: CellSnapshot) -> CircuitCell {
+    CircuitCell {
+        tag: match snapshot.bytes[0] {
+            0 => CircuitTag::Noop,
+            1 => CircuitTag::Source,
+            2 => CircuitTag::Wire,
+            3 => CircuitTag::Not,
+            4 => CircuitTag::And,
+            5 => CircuitTag::Or,
+            6 => CircuitTag::Xor,
+            7 => CircuitTag::Nand,
+            8 => CircuitTag::Nor,
+            9 => CircuitTag::Xnor,
+            _ => CircuitTag::Noop,
+        },
+        data: [snapshot.bytes[1], snapshot.bytes[2], snapshot.bytes[3]],
+    }
 }
 
 fn encode_spatial_id(coord: (u32, u32, u32)) -> [u8; 3] {
@@ -601,6 +616,10 @@ impl CellSnapshot {
 
     pub fn source(value: u8) -> Self {
         Self::from_cell(source_cell(value))
+    }
+
+    pub fn wire(coord: (u32, u32, u32)) -> Self {
+        Self::from_cell(wire_cell(coord))
     }
 
     pub fn gate(kind: GateKind) -> Self {
@@ -642,32 +661,6 @@ fn gate_cell(tag: CircuitTag) -> CircuitCell {
     CircuitCell {
         tag,
         data: [0, 0, 0],
-    }
-}
-
-fn primary_board_cell(x: u32, y: u32) -> CircuitCell {
-    match (x, y) {
-        (1, 1) => source_cell(0xff),
-        (3, 1) => source_cell(0x00),
-        (5, 1) => source_cell(0xff),
-        (6, 1) => source_cell(0xff),
-        (1, 2) => wire_cell((1, 1, 0)),
-        (3, 2) => wire_cell((3, 1, 0)),
-        (5, 2) => wire_cell((5, 1, 0)),
-        (6, 2) => wire_cell((6, 1, 0)),
-        (2, 3) => gate_cell(CircuitTag::And),
-        (4, 3) => gate_cell(CircuitTag::Or),
-        (6, 3) => gate_cell(CircuitTag::Not),
-        (2, 4) => wire_cell((2, 3, 0)),
-        (4, 4) => wire_cell((4, 3, 0)),
-        (6, 4) => wire_cell((6, 3, 0)),
-        (3, 5) => gate_cell(CircuitTag::Xor),
-        (5, 5) => gate_cell(CircuitTag::Nand),
-        (3, 6) => wire_cell((3, 5, 0)),
-        (4, 6) => wire_cell((3, 6, 0)),
-        (5, 6) => wire_cell((5, 5, 0)),
-        (6, 6) => wire_cell((5, 6, 0)),
-        _ => noop_cell(),
     }
 }
 
@@ -719,7 +712,7 @@ mod tests {
                 read_packed_charge(texels, src_x as u32, src_y as u32, src_z as u32)
             }
             CircuitTag::Not => {
-                let input = read_packed_charge(texels, x, y - 1, z);
+                let input = read_packed_charge(texels, x.saturating_sub(1), y, z);
                 gate_output(cell.tag, 0, input)
             }
             CircuitTag::And
@@ -728,8 +721,9 @@ mod tests {
             | CircuitTag::Nand
             | CircuitTag::Nor
             | CircuitTag::Xnor => {
-                let lhs = read_packed_charge(texels, x - 1, y - 1, z);
-                let rhs = read_packed_charge(texels, x + 1, y - 1, z);
+                let input_x = x.saturating_sub(1);
+                let lhs = read_packed_charge(texels, input_x, y.saturating_sub(1), z);
+                let rhs = read_packed_charge(texels, input_x, (y + 1).min(GRID_HEIGHT - 1), z);
                 gate_output(cell.tag, lhs, rhs)
             }
         }

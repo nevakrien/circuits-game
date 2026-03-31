@@ -111,7 +111,7 @@ fn update_not(
     _ = circuit;
     _ = payload;
 
-    let src = vec3u(coord.x, max(coord.y, 1u) - 1u, coord.z);
+    let src = vec3u(max(coord.x, 1u) - 1u, coord.y, coord.z);
     return charge_bool(!read_bool(min(src, dims - vec3u(1u, 1u, 1u))));
 }
 
@@ -125,9 +125,9 @@ fn update_binary_gate(
     _ = current_charge;
     _ = payload;
 
-    let sample_y = max(coord.y, 1u) - 1u;
-    let lhs = read_bool(vec3u(max(coord.x, 1u) - 1u, sample_y, coord.z));
-    let rhs = read_bool(vec3u(min(coord.x + 1u, dims.x - 1u), sample_y, coord.z));
+    let sample_x = max(coord.x, 1u) - 1u;
+    let lhs = read_bool(vec3u(sample_x, max(coord.y, 1u) - 1u, coord.z));
+    let rhs = read_bool(vec3u(sample_x, min(coord.y + 1u, dims.y - 1u), coord.z));
 
     switch (circuit.x & 0xffu) {
         case 4u: {

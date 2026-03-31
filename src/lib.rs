@@ -1,4 +1,5 @@
 pub mod allocator;
+pub mod demo_scene;
 pub mod wire_render;
 pub mod editor;
 pub mod render;
