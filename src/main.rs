@@ -170,7 +170,8 @@ async fn render_scene_to_png(options: &RenderSceneOptions) -> Result<(), String>
         view_formats: &[],
     });
 
-    let simulation = simulation::Simulation::new(&device, &queue);
+    let board = simulation::BoardTextures::new(&device, &queue);
+    let simulation = simulation::Simulation::new(&device);
     let renderer = render::Renderer::new(
         &device,
         &queue,
@@ -189,7 +190,13 @@ async fn render_scene_to_png(options: &RenderSceneOptions) -> Result<(), String>
         let mut step_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("scene-capture-step"),
         });
-        simulation.step(&device, &mut step_encoder, current_buffer, next_buffer);
+        simulation.step(
+            &device,
+            &mut step_encoder,
+            &board,
+            current_buffer,
+            next_buffer,
+        );
         queue.submit(Some(step_encoder.finish()));
         current_buffer = next_buffer;
     }
@@ -201,8 +208,8 @@ async fn render_scene_to_png(options: &RenderSceneOptions) -> Result<(), String>
         &device,
         &mut encoder,
         &output_texture,
-        simulation.charge_view(current_buffer),
-        simulation.circuit_view(),
+        board.charge_view(current_buffer),
+        board.circuit_view(),
     );
 
     let bytes_per_pixel = 4;
@@ -312,7 +319,8 @@ async fn run() {
     let surface = instance.create_surface(window.clone()).unwrap();
     let mut config = windowing::configure_surface(&surface, &adapter, &device, window.inner_size());
 
-    let simulation = simulation::Simulation::new(&device, &queue);
+    let board = simulation::BoardTextures::new(&device, &queue);
+    let simulation = simulation::Simulation::new(&device);
     let renderer = render::Renderer::new(&device, &queue, config.format, window.inner_size());
     let hover_preview = render::HoverPreviewRenderer::new(&device, &queue, config.format);
     let mut camera = render::CameraState::new(window.inner_size());
@@ -458,7 +466,13 @@ async fn run() {
                             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
                         if step_requested {
-                            simulation.step(&device, &mut encoder, current_buffer, next_buffer);
+                            simulation.step(
+                                &device,
+                                &mut encoder,
+                                &board,
+                                current_buffer,
+                                next_buffer,
+                            );
                         }
 
                         egui_renderer.update_buffers(
@@ -473,16 +487,16 @@ async fn run() {
                             &device,
                             &mut encoder,
                             &frame.texture,
-                            simulation.charge_view(display_frame),
-                            simulation.circuit_view(),
+                            board.charge_view(display_frame),
+                            board.circuit_view(),
                         );
 
                         wire_overlay.draw(
                             &device,
                             &mut encoder,
                             &frame.texture,
-                            simulation.charge_view(current_buffer),
-                            simulation.charge_view(display_frame),
+                            board.charge_view(current_buffer),
+                            board.charge_view(display_frame),
                         );
 
                         hover_preview.draw(&device, &mut encoder, &frame.texture);
@@ -543,7 +557,7 @@ async fn run() {
                                     if !event.repeat && control_down && code == KeyCode::KeyZ {
                                         let changed = if shift_down {
                                             editor_session.redo(
-                                                &simulation,
+                                                &board,
                                                 &mut edited_component,
                                                 &mut wire_overlay,
                                                 &device,
@@ -551,7 +565,7 @@ async fn run() {
                                             )
                                         } else {
                                             editor_session.undo(
-                                                &simulation,
+                                                &board,
                                                 &mut edited_component,
                                                 &mut wire_overlay,
                                                 &device,
@@ -566,7 +580,7 @@ async fn run() {
 
                                     if !event.repeat && control_down && code == KeyCode::KeyY {
                                         if editor_session.redo(
-                                            &simulation,
+                                            &board,
                                             &mut edited_component,
                                             &mut wire_overlay,
                                             &device,
@@ -698,7 +712,7 @@ async fn run() {
                             let extend_wire = pressed_keys.contains(&KeyCode::ShiftLeft)
                                 || pressed_keys.contains(&KeyCode::ShiftRight);
                             if editor_session.handle_left_click(
-                                &simulation,
+                                &board,
                                 &mut edited_component,
                                 &mut wire_overlay,
                                 &device,
@@ -725,7 +739,7 @@ async fn run() {
                         let extend_wire = pressed_keys.contains(&KeyCode::ShiftLeft)
                             || pressed_keys.contains(&KeyCode::ShiftRight);
                         if editor_session.handle_right_click(
-                            &simulation,
+                            &board,
                             &mut edited_component,
                             &mut wire_overlay,
                             &device,

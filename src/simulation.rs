@@ -37,6 +37,7 @@ struct CircuitCell {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct CellSnapshot {
+    // One circuit cell is encoded into one RGBA texel.
     pub bytes: [u8; 4],
 }
 
@@ -51,15 +52,17 @@ pub enum GateKind {
     Xnor,
 }
 
+pub struct BoardTextures {
+    charge_buffers: Vec<(wgpu::Texture, wgpu::TextureView)>,
+    circuit: (wgpu::Texture, wgpu::TextureView),
+}
+
 pub struct Simulation {
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
-    _charge_textures: Vec<wgpu::Texture>,
-    charge_views: Vec<wgpu::TextureView>,
-    _circuit_texture: wgpu::Texture,
-    circuit_view: wgpu::TextureView,
 }
 
+// Charge is packed 2x2 cells per RGBA texel, so one `[u8; 4]` stores four cell charges.
 pub type PackedChargeTexels = Vec<[u8; 4]>;
 
 pub fn packed_charge_texel_coord(x: u32, y: u32, z: u32) -> (u32, u32, u32) {
@@ -89,12 +92,12 @@ fn charge_readback_bytes_per_row() -> u32 {
     unpadded.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
 }
 
-impl Simulation {
+impl BoardTextures {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
-        let charge_textures: Vec<_> = (0..CHARGE_BUFFER_COUNT)
+        let charge_buffers: Vec<_> = (0..CHARGE_BUFFER_COUNT)
             .map(|_| {
-                device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("simulation-charge"),
+                let texture = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("board-charge"),
                     size: wgpu::Extent3d {
                         width: CHARGE_GRID_WIDTH,
                         height: CHARGE_GRID_HEIGHT,
@@ -109,22 +112,18 @@ impl Simulation {
                         | wgpu::TextureUsages::COPY_DST
                         | wgpu::TextureUsages::COPY_SRC,
                     view_formats: &[],
-                })
-            })
-            .collect();
-
-        let charge_views: Vec<_> = charge_textures
-            .iter()
-            .map(|texture| {
-                texture.create_view(&wgpu::TextureViewDescriptor {
+                });
+                let view = texture.create_view(&wgpu::TextureViewDescriptor {
                     dimension: Some(wgpu::TextureViewDimension::D3),
                     ..Default::default()
-                })
+                });
+
+                (texture, view)
             })
             .collect();
 
         let circuit_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("simulation-circuits"),
+            label: Some("board-circuits"),
             size: wgpu::Extent3d {
                 width: GRID_WIDTH,
                 height: GRID_HEIGHT,
@@ -139,87 +138,26 @@ impl Simulation {
                 | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-
         let circuit_view = circuit_texture.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D3),
             ..Default::default()
         });
 
         seed_circuits(queue, &circuit_texture);
-        seed_initial_charge(queue, &charge_textures[0]);
-
-        let basic_cell_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("wire"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("basic_cell.wgsl").into()),
-        });
-
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("simulation-bind-group-layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        view_dimension: wgpu::TextureViewDimension::D3,
-                        sample_type: wgpu::TextureSampleType::Uint,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        view_dimension: wgpu::TextureViewDimension::D3,
-                        sample_type: wgpu::TextureSampleType::Uint,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: CHARGE_TEXTURE_FORMAT,
-                        view_dimension: wgpu::TextureViewDimension::D3,
-                    },
-                    count: None,
-                },
-            ],
-        });
-
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("simulation-pipeline-layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
-        });
-
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("wire-pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &basic_cell_shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        seed_initial_charge(queue, &charge_buffers[0].0);
 
         Self {
-            pipeline,
-            bind_group_layout,
-            _charge_textures: charge_textures,
-            charge_views,
-            _circuit_texture: circuit_texture,
-            circuit_view,
+            charge_buffers,
+            circuit: (circuit_texture, circuit_view),
         }
     }
 
     pub fn charge_view(&self, buffer_index: u32) -> &wgpu::TextureView {
-        &self.charge_views[buffer_index as usize]
+        &self.charge_buffers[buffer_index as usize].1
     }
 
     pub fn circuit_view(&self) -> &wgpu::TextureView {
-        &self.circuit_view
+        &self.circuit.1
     }
 
     pub fn clear_cell(&self, queue: &wgpu::Queue, grid_cell: GridCell, layer: u32) {
@@ -240,7 +178,7 @@ impl Simulation {
     ) {
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
-                texture: &self._circuit_texture,
+                texture: &self.circuit.0,
                 mip_level: 0,
                 origin: wgpu::Origin3d {
                     x: grid_cell.x,
@@ -272,18 +210,18 @@ impl Simulation {
     ) -> CellSnapshot {
         let bytes_per_row = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("simulation-circuit-readback"),
+            label: Some("board-circuit-readback"),
             size: u64::from(bytes_per_row),
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("simulation-circuit-readback"),
+            label: Some("board-circuit-readback"),
         });
 
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &self._circuit_texture,
+                texture: &self.circuit.0,
                 mip_level: 0,
                 origin: wgpu::Origin3d {
                     x: grid_cell.x,
@@ -361,7 +299,7 @@ impl Simulation {
 
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
-                texture: &self._charge_textures[buffer_index as usize],
+                texture: &self.charge_buffers[buffer_index as usize].0,
                 mip_level: 0,
                 origin: wgpu::Origin3d {
                     x: packed_x,
@@ -394,19 +332,19 @@ impl Simulation {
         let size =
             u64::from(bytes_per_row) * u64::from(CHARGE_GRID_HEIGHT) * u64::from(BOARD_LAYERS);
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("simulation-charge-readback"),
+            label: Some("board-charge-readback"),
             size,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("simulation-charge-readback"),
+            label: Some("board-charge-readback"),
         });
 
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &self._charge_textures[buffer_index as usize],
+                texture: &self.charge_buffers[buffer_index as usize].0,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -475,11 +413,77 @@ impl Simulation {
         let texels = self.read_charge_buffer(device, queue, buffer_index).await;
         read_packed_charge(&texels, x, y, z)
     }
+}
+
+impl Simulation {
+    pub fn new(device: &wgpu::Device) -> Self {
+        let basic_cell_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("wire"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("basic_cell.wgsl").into()),
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("simulation-bind-group-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        sample_type: wgpu::TextureSampleType::Uint,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        sample_type: wgpu::TextureSampleType::Uint,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: CHARGE_TEXTURE_FORMAT,
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("simulation-pipeline-layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("wire-pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &basic_cell_shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        Self {
+            pipeline,
+            bind_group_layout,
+        }
+    }
 
     pub fn step(
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
+        board: &BoardTextures,
         current_buffer: u32,
         next_buffer: u32,
     ) {
@@ -489,15 +493,15 @@ impl Simulation {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(self.charge_view(current_buffer)),
+                    resource: wgpu::BindingResource::TextureView(board.charge_view(current_buffer)),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&self.circuit_view),
+                    resource: wgpu::BindingResource::TextureView(board.circuit_view()),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::TextureView(self.charge_view(next_buffer)),
+                    resource: wgpu::BindingResource::TextureView(board.charge_view(next_buffer)),
                 },
             ],
         });
@@ -804,7 +808,8 @@ mod tests {
             return;
         };
 
-        let simulation = Simulation::new(&device, &queue);
+        let board = BoardTextures::new(&device, &queue);
+        let simulation = Simulation::new(&device);
         let mut current_buffer = 0;
 
         for step in 1..=GRID_HEIGHT {
@@ -812,22 +817,14 @@ mod tests {
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("simulation-test-step"),
             });
-            simulation.step(&device, &mut encoder, current_buffer, next_buffer);
+            simulation.step(&device, &mut encoder, &board, current_buffer, next_buffer);
             queue.submit(Some(encoder.finish()));
 
-            let texels =
-                pollster::block_on(simulation.read_charge_buffer(&device, &queue, next_buffer));
+            let texels = pollster::block_on(board.read_charge_buffer(&device, &queue, next_buffer));
             let expected = expected_charge_texels_after_steps(step);
 
             assert_eq!(
-                pollster::block_on(simulation.read_charge_value(
-                    &device,
-                    &queue,
-                    next_buffer,
-                    0,
-                    0,
-                    0
-                )),
+                pollster::block_on(board.read_charge_value(&device, &queue, next_buffer, 0, 0, 0)),
                 read_packed_charge(&expected, 0, 0, 0)
             );
 

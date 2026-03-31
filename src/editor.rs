@@ -246,7 +246,7 @@ impl EditorSession {
 
     pub fn undo(
         &mut self,
-        simulation: &simulation::Simulation,
+        simulation: &simulation::BoardTextures,
         component: &mut wire_render::WireRenderInfo,
         wire_overlay: &mut wires::WireOverlay,
         device: &wgpu::Device,
@@ -261,7 +261,7 @@ impl EditorSession {
 
     pub fn redo(
         &mut self,
-        simulation: &simulation::Simulation,
+        simulation: &simulation::BoardTextures,
         component: &mut wire_render::WireRenderInfo,
         wire_overlay: &mut wires::WireOverlay,
         device: &wgpu::Device,
@@ -333,7 +333,7 @@ impl EditorSession {
 
     pub fn handle_left_click(
         &mut self,
-        simulation: &simulation::Simulation,
+        simulation: &simulation::BoardTextures,
         component: &mut wire_render::WireRenderInfo,
         wire_overlay: &mut wires::WireOverlay,
         device: &wgpu::Device,
@@ -393,7 +393,7 @@ impl EditorSession {
 
     pub fn handle_right_click(
         &mut self,
-        simulation: &simulation::Simulation,
+        simulation: &simulation::BoardTextures,
         component: &mut wire_render::WireRenderInfo,
         wire_overlay: &mut wires::WireOverlay,
         device: &wgpu::Device,
@@ -673,7 +673,7 @@ fn sync_component_wires(
 }
 
 fn delete_at_cursor(
-    simulation: &simulation::Simulation,
+    simulation: &simulation::BoardTextures,
     component: &mut wire_render::WireRenderInfo,
     wire_overlay: &mut wires::WireOverlay,
     device: &wgpu::Device,
@@ -726,7 +726,7 @@ fn delete_at_cursor(
 }
 
 fn place_cell_at_cursor(
-    simulation: &simulation::Simulation,
+    simulation: &simulation::BoardTextures,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     camera: render::CameraState,
@@ -806,7 +806,7 @@ fn charge_values_for_tool(tool: EditorTool) -> Vec<u8> {
 }
 
 fn write_charge_values(
-    simulation: &simulation::Simulation,
+    simulation: &simulation::BoardTextures,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     grid_cell: wires::GridCell,
@@ -820,7 +820,7 @@ fn write_charge_values(
 
 fn apply_action(
     action: &EditorAction,
-    simulation: &simulation::Simulation,
+    simulation: &simulation::BoardTextures,
     component: &mut wire_render::WireRenderInfo,
     wire_overlay: &mut wires::WireOverlay,
     device: &wgpu::Device,
@@ -867,7 +867,7 @@ fn apply_action(
 
 fn apply_inverse_action(
     action: &EditorAction,
-    simulation: &simulation::Simulation,
+    simulation: &simulation::BoardTextures,
     component: &mut wire_render::WireRenderInfo,
     wire_overlay: &mut wires::WireOverlay,
     device: &wgpu::Device,
@@ -1148,14 +1148,14 @@ mod tests {
     fn create_editor_test_context() -> Option<(
         wgpu::Device,
         wgpu::Queue,
-        simulation::Simulation,
+        simulation::BoardTextures,
         wire_render::WireRenderInfo,
         wires::WireOverlay,
         render::CameraState,
         EditorSession,
     )> {
         let (device, queue) = pollster::block_on(create_headless_device())?;
-        let simulation = simulation::Simulation::new(&device, &queue);
+        let simulation = simulation::BoardTextures::new(&device, &queue);
         let component = wire_render::WireRenderInfo::new(wire_render::WireBufferId {
             texture_index: 0,
             layer: 0,
@@ -1190,7 +1190,7 @@ mod tests {
     }
 
     fn read_charge_values(
-        simulation: &simulation::Simulation,
+        simulation: &simulation::BoardTextures,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         cell: wires::GridCell,
