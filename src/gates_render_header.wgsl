@@ -20,20 +20,43 @@ const GATE_GLYPH_ATLAS: array<array<u32, 5>, 7> = array<array<u32, 5>, 7>(
     array<u32, 5>(0x63u, 0x14u, 0x08u, 0x14u, 0x63u),
 );
 
+fn sharp_cut(distance: f32, epsilon: f32) -> f32 {
+    if (distance <= -epsilon) {
+        return 1.0;
+    }
+    if (distance >= epsilon) {
+        return 0.0;
+    }
+    let t = smoothstep(-epsilon, epsilon, distance);
+    let sharpened = t * t * t;
+    return 1.0 - sharpened;
+}
+
 fn segment_mask(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>, half_width: f32) -> f32 {
     let ab = b - a;
     let t = clamp(dot(p - a, ab) / max(dot(ab, ab), 0.0001), 0.0, 1.0);
     let closest = a + ab * t;
     let distance = length(p - closest);
-    return 1.0 - smoothstep(half_width, half_width + 0.02, distance);
+    return sharp_cut(distance - half_width, 0.012);
 }
 
-fn rounded_box_mask(centered: vec2<f32>, half_size: vec2<f32>, radius: f32, softness: f32) -> f32 {
+fn rounded_box_mask(centered: vec2<f32>, half_size: vec2<f32>, radius: f32) -> f32 {
     let q = abs(centered) - half_size + vec2(radius, radius);
     let outside = length(max(q, vec2(0.0, 0.0)));
     let inside = min(max(q.x, q.y), 0.0);
     let distance = outside + inside - radius;
-    return 1.0 - smoothstep(0.0, softness, distance);
+    return sharp_cut(distance, 0.01);
+}
+
+fn circle_mask(centered: vec2<f32>, center: vec2<f32>, radius: f32) -> f32 {
+    let distance = length(centered - center);
+    return sharp_cut(distance - radius, 0.006);
+}
+
+fn diamond_mask(centered: vec2<f32>, center: vec2<f32>, radius: f32) -> f32 {
+    let delta = abs(centered - center);
+    let distance = delta.x + delta.y - radius;
+    return sharp_cut(distance, 0.006);
 }
 
 fn glyph_mask(local_uv: vec2<f32>, glyph_ix: u32) -> f32 {
@@ -60,7 +83,8 @@ fn gate_label_mask(local_uv: vec2<f32>, tag: u32) -> f32 {
     let gate_ix = tag - 3u;
     let len = GATE_LABEL_LENGTHS[gate_ix];
     let glyphs = GATE_LABEL_LETTERS[gate_ix];
-    let uv = (local_uv - vec2(0.11, 0.17)) / vec2(0.78, 0.66);
+    // Keep labels tighter and more central so the gate body has side room for connectors.
+    let uv = (local_uv - vec2(0.24, 0.2)) / vec2(0.52, 0.6);
 
     if (any(uv < vec2(0.0, 0.0)) || any(uv >= vec2(1.0, 1.0))) {
         return 0.0;
@@ -87,7 +111,7 @@ fn render_noop(local_uv: vec2<f32>, centered: vec2<f32>, charge: u32) -> vec3<f3
 
     let base = vec3(0.04, 0.04, 0.05);
     let radius = length(centered);
-    let circle = 1.0 - smoothstep(0.18, 0.28, radius);
+    let circle = sharp_cut(radius - 0.23, 0.01);
     let glow = 1.0 - smoothstep(0.12, 0.38, radius);
     let charge_level = f32(charge) / 255.0;
     let node_color = mix(base, vec3(0.85, 0.9, 0.95), charge_level * 0.8);
@@ -102,7 +126,7 @@ fn render_source(local_uv: vec2<f32>, centered: vec2<f32>, charge: u32) -> vec3<
 
     let base = vec3(0.04, 0.04, 0.05);
     let radius = length(centered);
-    let circle = 1.0 - smoothstep(0.18, 0.28, radius);
+    let circle = sharp_cut(radius - 0.23, 0.01);
     let glow = 1.0 - smoothstep(0.12, 0.38, radius);
     let source_color = vec3(0.28, 0.16, 0.10);
     let charge_level = f32(charge) / 255.0;
@@ -117,7 +141,7 @@ fn render_source(local_uv: vec2<f32>, centered: vec2<f32>, charge: u32) -> vec3<
 fn render_wire(coord: vec2<u32>, centered: vec2<f32>, charge: u32, circuit: vec4<u32>) -> vec3<f32> {
     let base = vec3(0.04, 0.04, 0.05);
     let radius = length(centered);
-    let circle = 1.0 - smoothstep(0.18, 0.28, radius);
+    let circle = sharp_cut(radius - 0.23, 0.01);
     let glow = 1.0 - smoothstep(0.12, 0.38, radius);
     let wire_color = vec3(0.18, 0.44, 0.64);
     let charge_level = f32(charge) / 255.0;
@@ -152,14 +176,36 @@ fn render_gate(local_uv: vec2<f32>, centered: vec2<f32>, charge: u32, circuit: v
     let glow = 1.0 - smoothstep(0.12, 0.38, radius);
     let tag = circuit.x & 0xffu;
     let charge_level = f32(charge) / 255.0;
-    let body_mask = rounded_box_mask(centered, vec2(0.39, 0.27), 0.08, 0.025);
-    let border_mask = body_mask - rounded_box_mask(centered, vec2(0.35, 0.23), 0.07, 0.025);
+    let body_mask = rounded_box_mask(centered, vec2(0.39, 0.27), 0.08);
+    let border_mask = body_mask - rounded_box_mask(centered, vec2(0.35, 0.23), 0.07);
+    let wire_blue = vec3(0.18, 0.44, 0.64);
     let body_color = mix(vec3(0.24, 0.28, 0.32), vec3(0.92, 0.96, 1.0), charge_level * 0.42);
     let label = gate_label_mask(local_uv, tag) * body_mask;
+    let input_corner_top = vec2(-0.38, -0.2);
+    let input_corner_bottom = vec2(-0.38, 0.2);
+    let input_single = vec2(-0.38, 0.0);
+    let output_center = vec2(0.385, 0.0);
+
+    let input_top = circle_mask(centered, input_corner_top, 0.032);
+    let input_bottom = circle_mask(centered, input_corner_bottom, 0.032);
+    let input_single_c = circle_mask(centered, input_single, 0.032);
+    let input_mask = select(
+        max(input_top, input_bottom),
+        input_single_c,
+        tag == 3u,
+    );
+
+    let output_outer = diamond_mask(centered, output_center, 0.064);
+    let output_inner = diamond_mask(centered, output_center, 0.037);
+    let output_outline = output_outer - output_inner;
+    let gate_border_mask = border_mask - output_outer;
 
     var color = base;
     color = mix(color, body_color, body_mask);
-    color = mix(color, vec3(0.92, 0.95, 1.0), border_mask * 0.7);
+    color = mix(color, wire_blue, gate_border_mask * 0.82);
+    color = mix(color, vec3(1.0, 1.0, 1.0), input_mask);
+    color = mix(color, vec3(0.01, 0.01, 0.015), output_inner);
+    color = mix(color, vec3(1.0, 1.0, 1.0), output_outline);
     color = mix(color, vec3(0.6, 0.07, 0.08), label);
     color += vec3(0.22, 0.28, 0.34) * (charge_level * glow * 0.24);
     return color;
