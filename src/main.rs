@@ -352,10 +352,7 @@ async fn run() {
         &mut egui_renderer,
     ));
     let demo_component = demo_scene::starter_component();
-    let mut edited_component = wire_render::WireRenderInfo::new(wire_render::WireBufferId {
-        texture_index: 0,
-        layer: displayed_layer,
-    });
+    let mut edited_component = wire_render::WireRenderInfo::new();
     for wire in demo_component.wires {
         edited_component.add_wire_edge(wire);
     }
@@ -364,6 +361,7 @@ async fn run() {
         &queue,
         edited_component.wire_edges().cloned().collect(),
     );
+    wire_overlay.set_visible_layer(&device, &queue, displayed_layer);
 
     let mut current_buffer = 0;
     let mut step_requested = false;
@@ -384,7 +382,7 @@ async fn run() {
                         let full_output = egui_ctx.run(raw_input, |ctx| {
                             reset_camera = editor_session.show(ctx, displayed_layer);
                         });
-                        editor_session.cancel_draft_if_inactive(&mut wire_overlay, &device, &queue);
+                        editor_session.sync_tool_state(&mut wire_overlay, &device, &queue);
                         egui_state.handle_platform_output(&window, full_output.platform_output);
                         let paint_jobs =
                             egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
@@ -532,10 +530,6 @@ async fn run() {
 
                         if step_requested {
                             current_buffer = next_buffer;
-                            edited_component.set_buffer_id(wire_render::WireBufferId {
-                                texture_index: current_buffer,
-                                layer: displayed_layer,
-                            });
                             step_requested = false;
                         }
                     }
@@ -599,10 +593,11 @@ async fn run() {
                                     if !event.repeat && code == KeyCode::ArrowUp {
                                         displayed_layer = (displayed_layer + 1)
                                             .min(simulation::BOARD_LAYERS.saturating_sub(1));
-                                        edited_component.set_buffer_id(wire_render::WireBufferId {
-                                            texture_index: current_buffer,
-                                            layer: displayed_layer,
-                                        });
+                                        wire_overlay.set_visible_layer(
+                                            &device,
+                                            &queue,
+                                            displayed_layer,
+                                        );
                                         let hover = cursor_position.and_then(|cursor| {
                                             wires::cursor_to_board_point(
                                                 camera,
@@ -613,7 +608,6 @@ async fn run() {
                                         wire_overlay.update_hover(
                                             &device,
                                             &queue,
-                                            displayed_layer,
                                             hover,
                                         );
                                         window.request_redraw();
@@ -621,10 +615,11 @@ async fn run() {
 
                                     if !event.repeat && code == KeyCode::ArrowDown {
                                         displayed_layer = displayed_layer.saturating_sub(1);
-                                        edited_component.set_buffer_id(wire_render::WireBufferId {
-                                            texture_index: current_buffer,
-                                            layer: displayed_layer,
-                                        });
+                                        wire_overlay.set_visible_layer(
+                                            &device,
+                                            &queue,
+                                            displayed_layer,
+                                        );
                                         let hover = cursor_position.and_then(|cursor| {
                                             wires::cursor_to_board_point(
                                                 camera,
@@ -635,7 +630,6 @@ async fn run() {
                                         wire_overlay.update_hover(
                                             &device,
                                             &queue,
-                                            displayed_layer,
                                             hover,
                                         );
                                         window.request_redraw();
@@ -695,7 +689,7 @@ async fn run() {
                             cursor,
                             [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
                         );
-                        wire_overlay.update_hover(&device, &queue, displayed_layer, hover);
+                        wire_overlay.update_hover(&device, &queue, hover);
                         window.request_redraw();
                     }
                     WindowEvent::MouseInput {

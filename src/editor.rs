@@ -150,6 +150,7 @@ pub enum EditorAction {
 pub struct EditorSession {
     ui: EditorUi,
     history: EditorHistory<EditorAction>,
+    previous_tool: EditorTool,
 }
 
 impl<T> Default for EditorHistory<T> {
@@ -218,6 +219,7 @@ impl EditorSession {
         Self {
             ui: EditorUi::new(tool_preview_textures),
             history: EditorHistory::default(),
+            previous_tool: EditorTool::Wire,
         }
     }
 
@@ -233,15 +235,24 @@ impl EditorSession {
         self.ui.show(ctx, displayed_layer, &self.history)
     }
 
-    pub fn cancel_draft_if_inactive(
+    pub fn sync_tool_state(
         &mut self,
         wire_overlay: &mut wires::WireOverlay,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) {
-        if self.selected_tool() != EditorTool::Wire {
-            wire_overlay.restore_draft(device, queue, None);
+        let selected_tool = self.selected_tool();
+        if self.previous_tool == selected_tool {
+            return;
         }
+
+        if selected_tool != EditorTool::Wire {
+            self.update_draft(wire_overlay, |overlay| {
+                overlay.restore_draft(device, queue, None);
+            });
+        }
+
+        self.previous_tool = selected_tool;
     }
 
     pub fn undo(
@@ -405,7 +416,8 @@ impl EditorSession {
     ) -> bool {
         if self.selected_tool() != EditorTool::Wire {
             self.ui.reset_to_default_tool();
-            wire_overlay.restore_draft(device, queue, None);
+            self.previous_tool = self.selected_tool();
+            self.cancel_wire_draft(wire_overlay, device, queue);
             return true;
         }
 
@@ -1156,10 +1168,7 @@ mod tests {
     )> {
         let (device, queue) = pollster::block_on(create_headless_device())?;
         let simulation = simulation::BoardTextures::new(&device, &queue);
-        let component = wire_render::WireRenderInfo::new(wire_render::WireBufferId {
-            texture_index: 0,
-            layer: 0,
-        });
+        let component = wire_render::WireRenderInfo::new();
         let wire_overlay = wires::WireOverlay::new(
             &device,
             &queue,

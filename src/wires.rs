@@ -69,6 +69,7 @@ pub struct WireOverlay {
     board_size: [u32; 2],
     wires: Vec<AestheticWire>,
     thickness_px: f32,
+    visible_layer: u32,
     draft_layer: u32,
     draft_source: Option<GridCell>,
     draft_points: Vec<WirePoint>,
@@ -194,6 +195,7 @@ impl WireOverlay {
                 surface_size,
                 board_size,
             ),
+            visible_layer: 0,
             draft_layer: 0,
             draft_source: None,
             draft_points: Vec::new(),
@@ -250,14 +252,21 @@ impl WireOverlay {
         self.sync_segments(device, queue);
     }
 
+    pub fn set_visible_layer(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, layer: u32) {
+        if self.visible_layer == layer {
+            return;
+        }
+
+        self.visible_layer = layer;
+        self.sync_segments(device, queue);
+    }
+
     pub fn update_hover(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        layer: u32,
         hover_point: Option<WirePoint>,
     ) {
-        self.draft_layer = layer;
         self.hover_point = hover_point;
         self.sync_segments(device, queue);
     }
@@ -480,6 +489,10 @@ impl WireOverlay {
         let mut segments = Vec::new();
 
         for wire in &self.wires {
+            if wire.layer != self.visible_layer {
+                continue;
+            }
+
             append_segments(
                 &mut segments,
                 wire.layer,
@@ -490,30 +503,33 @@ impl WireOverlay {
             );
         }
 
-        if let Some(source) = self.draft_source {
-            if self.draft_points.len() >= 2 {
-                append_segments(
-                    &mut segments,
-                    self.draft_layer,
-                    source,
-                    &self.draft_points,
-                    self.draft_color,
-                    self.thickness_px,
-                );
-            }
-
-            if let (Some(hover), Some(last)) = (self.hover_point, self.draft_points.last().copied())
-            {
-                if point_distance(hover, last) >= MIN_POINT_DELTA {
-                    let preview = [last, hover];
+        if self.draft_layer == self.visible_layer {
+            if let Some(source) = self.draft_source {
+                if self.draft_points.len() >= 2 {
                     append_segments(
                         &mut segments,
                         self.draft_layer,
                         source,
-                        &preview,
+                        &self.draft_points,
                         self.draft_color,
                         self.thickness_px,
                     );
+                }
+
+                if let (Some(hover), Some(last)) =
+                    (self.hover_point, self.draft_points.last().copied())
+                {
+                    if point_distance(hover, last) >= MIN_POINT_DELTA {
+                        let preview = [last, hover];
+                        append_segments(
+                            &mut segments,
+                            self.draft_layer,
+                            source,
+                            &preview,
+                            self.draft_color,
+                            self.thickness_px,
+                        );
+                    }
                 }
             }
         }
@@ -681,5 +697,102 @@ mod tests {
         assert!(
             effective_wire_thickness_px(zoomed_out_camera, surface, [8, 8]) < WIRE_THICKNESS_PX
         );
+    }
+
+    #[test]
+    fn hover_updates_do_not_retag_active_draft() {
+        let instance = wgpu::Instance::default();
+        let adapter =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+                .expect("adapter");
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                .expect("device");
+        let mut overlay = WireOverlay::new(
+            &device,
+            &queue,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            PhysicalSize::new(1600, 900),
+            [8, 8],
+        );
+
+        overlay.add_point(
+            &device,
+            &queue,
+            2,
+            WirePoint { x: 1.0, y: 1.0 },
+            GridCell { x: 1, y: 1 },
+        );
+        overlay.add_point(
+            &device,
+            &queue,
+            2,
+            WirePoint { x: 3.0, y: 1.0 },
+            GridCell { x: 1, y: 1 },
+        );
+
+        overlay.set_visible_layer(&device, &queue, 1);
+        overlay.update_hover(&device, &queue, Some(WirePoint { x: 4.0, y: 1.0 }));
+
+        assert_eq!(overlay.current_draft().unwrap().layer, 2);
+    }
+
+    #[test]
+    fn build_segments_only_includes_visible_layer() {
+        let instance = wgpu::Instance::default();
+        let adapter =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+                .expect("adapter");
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                .expect("device");
+        let mut overlay = WireOverlay::new(
+            &device,
+            &queue,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            PhysicalSize::new(1600, 900),
+            [8, 8],
+        );
+
+        overlay.replace_wires(
+            &device,
+            &queue,
+            vec![
+                StoredWireEdge {
+                    source_id: WireEndpointId {
+                        x: 1,
+                        y: 1,
+                        layer: 0,
+                    },
+                    destination_id: WireEndpointId {
+                        x: 2,
+                        y: 1,
+                        layer: 0,
+                    },
+                    points: vec![WirePoint { x: 1.0, y: 1.0 }, WirePoint { x: 2.0, y: 1.0 }],
+                    color: DEFAULT_WIRE_COLOR,
+                },
+                StoredWireEdge {
+                    source_id: WireEndpointId {
+                        x: 3,
+                        y: 3,
+                        layer: 1,
+                    },
+                    destination_id: WireEndpointId {
+                        x: 4,
+                        y: 3,
+                        layer: 1,
+                    },
+                    points: vec![WirePoint { x: 3.0, y: 3.0 }, WirePoint { x: 4.0, y: 3.0 }],
+                    color: DEFAULT_WIRE_COLOR,
+                },
+            ],
+        );
+
+        overlay.set_visible_layer(&device, &queue, 1);
+
+        let segments = overlay.build_segments();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].source_coord[..3], [3, 3, 1]);
     }
 }
