@@ -1,20 +1,23 @@
-const GATE_LABEL_LENGTHS: array<u32, 7> = array<u32, 7>(3u, 3u, 2u, 3u, 4u, 3u, 4u);
-const GATE_LABEL_LETTERS: array<vec4<u32>, 7> = array<vec4<u32>, 7>(
-    vec4<u32>(2u, 3u, 5u, 0u),
-    vec4<u32>(0u, 2u, 1u, 0u),
-    vec4<u32>(3u, 4u, 0u, 0u),
-    vec4<u32>(6u, 3u, 4u, 0u),
-    vec4<u32>(2u, 0u, 2u, 1u),
-    vec4<u32>(2u, 3u, 4u, 0u),
-    vec4<u32>(6u, 2u, 3u, 4u),
+const GATE_LABEL_LENGTHS: array<u32, 8> = array<u32, 8>(4u, 3u, 3u, 2u, 3u, 4u, 3u, 4u);
+const GATE_LABEL_LETTERS: array<vec4<u32>, 8> = array<vec4<u32>, 8>(
+    vec4<u32>(3u, 4u, 4u, 5u),
+    vec4<u32>(3u, 4u, 7u, 0u),
+    vec4<u32>(0u, 3u, 1u, 0u),
+    vec4<u32>(4u, 6u, 0u, 0u),
+    vec4<u32>(8u, 4u, 6u, 0u),
+    vec4<u32>(3u, 0u, 3u, 1u),
+    vec4<u32>(3u, 4u, 6u, 0u),
+    vec4<u32>(8u, 3u, 4u, 6u),
 );
 
 // Glyph columns sourced from Adafruit_GFX classic 5x7 font (glcdfont.c).
-const GATE_GLYPH_ATLAS: array<array<u32, 5>, 7> = array<array<u32, 5>, 7>(
+const GATE_GLYPH_ATLAS: array<array<u32, 5>, 9> = array<array<u32, 5>, 9>(
     array<u32, 5>(0x7Cu, 0x12u, 0x11u, 0x12u, 0x7Cu),
     array<u32, 5>(0x7Fu, 0x41u, 0x41u, 0x41u, 0x3Eu),
     array<u32, 5>(0x7Fu, 0x04u, 0x08u, 0x10u, 0x7Fu),
+    array<u32, 5>(0x7Fu, 0x08u, 0x10u, 0x20u, 0x7Fu),
     array<u32, 5>(0x3Eu, 0x41u, 0x41u, 0x41u, 0x3Eu),
+    array<u32, 5>(0x7Fu, 0x09u, 0x09u, 0x09u, 0x06u),
     array<u32, 5>(0x7Fu, 0x09u, 0x19u, 0x29u, 0x46u),
     array<u32, 5>(0x03u, 0x01u, 0x7Fu, 0x01u, 0x03u),
     array<u32, 5>(0x63u, 0x14u, 0x08u, 0x14u, 0x63u),
@@ -85,7 +88,7 @@ fn gate_input_mask(centered: vec2<f32>, tag: u32) -> f32 {
         circle_mask(centered, GATE_INPUT_BOTTOM_CENTER, GATE_INPUT_RADIUS),
     );
     let single_input_mask = circle_mask(centered, GATE_INPUT_SINGLE_CENTER, GATE_INPUT_RADIUS);
-    return select(dual_input_mask, single_input_mask, tag == 3u);
+    return select(dual_input_mask, single_input_mask, tag == 2u || tag == 3u);
 }
 
 fn glyph_mask(local_uv: vec2<f32>, glyph_ix: u32) -> f32 {
@@ -109,7 +112,7 @@ fn gate_label_mask(local_uv: vec2<f32>, tag: u32) -> f32 {
         return 0.0;
     }
 
-    let gate_ix = tag - 3u;
+    let gate_ix = tag - 2u;
     let len = GATE_LABEL_LENGTHS[gate_ix];
     let glyphs = GATE_LABEL_LETTERS[gate_ix];
     // Keep labels tighter and more central so the gate body has side room for connectors.
@@ -134,7 +137,7 @@ fn gate_label_mask(local_uv: vec2<f32>, tag: u32) -> f32 {
     return glyph_mask(char_uv, glyph_ix);
 }
 
-fn render_noop(local_uv: vec2<f32>, centered: vec2<f32>, charge: u32) -> vec3<f32> {
+fn render_empty(local_uv: vec2<f32>, centered: vec2<f32>, charge: u32) -> vec3<f32> {
     _ = local_uv;
     let radius = length(centered);
     let circle = sharp_cut(radius - 0.23, 0.01);
@@ -151,33 +154,6 @@ fn render_source(local_uv: vec2<f32>, centered: vec2<f32>, charge: u32) -> vec3<
     let glow = 1.0 - smoothstep(0.12, 0.38, radius);
     let charge_level = f32(charge) / 255.0;
     return render_lit_circle(circle, glow, charge_level, vec3(0.28, 0.16, 0.10), vec3(0.95, 0.82, 0.68), vec3(0.24, 0.18, 0.08));
-}
-
-fn render_wire(coord: vec2<u32>, centered: vec2<f32>, charge: u32, circuit: vec4<u32>) -> vec3<f32> {
-    let radius = length(centered);
-    let circle = sharp_cut(radius - 0.23, 0.01);
-    let glow = 1.0 - smoothstep(0.12, 0.38, radius);
-    let charge_level = f32(charge) / 255.0;
-
-    let src = vec2<f32>(f32(circuit.y & 0xffu), f32(circuit.z & 0xffu));
-    var flow = vec2<f32>(coord) - src;
-    if (all(flow == vec2(0.0, 0.0))) {
-        flow = vec2(0.0, -1.0);
-    }
-    flow = normalize(flow);
-
-    let tip = flow * 0.14;
-    let tail = -flow * 0.14;
-    let wing = vec2(-flow.y, flow.x) * 0.055;
-    let shaft = segment_mask(centered, tail, tip, 0.02);
-    let head_left = segment_mask(centered, tip, tip - flow * 0.085 + wing, 0.016);
-    let head_right = segment_mask(centered, tip, tip - flow * 0.085 - wing, 0.016);
-    let arrow = max(shaft, max(head_left, head_right)) * circle;
-    let arrow_color = mix(vec3(0.5, 0.03, 0.04), vec3(1.0, 0.2, 0.1), 0.35 + charge_level * 0.65);
-
-    var color = render_lit_circle(circle, glow, charge_level, vec3(0.18, 0.44, 0.64), vec3(0.88, 0.96, 1.0), vec3(0.16, 0.30, 0.42));
-    color = mix(color, arrow_color, arrow);
-    return color;
 }
 
 fn render_gate(local_uv: vec2<f32>, centered: vec2<f32>, charge: u32, circuit: vec4<u32>) -> vec3<f32> {
@@ -207,18 +183,16 @@ fn render_gate(local_uv: vec2<f32>, centered: vec2<f32>, charge: u32, circuit: v
 }
 
 fn render_cell_color(coord: vec2<u32>, local_uv: vec2<f32>, centered: vec2<f32>, charge: u32, circuit: vec4<u32>) -> vec3<f32> {
+    _ = coord;
     switch (circuit.x & 0xffu) {
         case 1u: {
             return render_source(local_uv, centered, charge);
         }
-        case 2u: {
-            return render_wire(coord, centered, charge, circuit);
-        }
-        case 3u, 4u, 5u, 6u, 7u, 8u, 9u: {
+        case 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u: {
             return render_gate(local_uv, centered, charge, circuit);
         }
         default: {
-            return render_noop(local_uv, centered, charge);
+            return render_empty(local_uv, centered, charge);
         }
     }
 }

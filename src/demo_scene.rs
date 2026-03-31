@@ -38,16 +38,16 @@ pub fn starter_component() -> DemoComponent {
             placed_cell(0, 0, CellSnapshot::source(0xff)),
             placed_cell(0, 2, CellSnapshot::source(0x00)),
             placed_cell(1, 1, CellSnapshot::gate(GateKind::And)),
-            placed_cell(2, 1, CellSnapshot::wire((1, 1, layer))),
+            placed_cell(2, 1, CellSnapshot::noop()),
             placed_cell(2, 3, CellSnapshot::source(0xff)),
             placed_cell(3, 2, CellSnapshot::gate(GateKind::Or)),
-            placed_cell(4, 1, CellSnapshot::wire((3, 2, layer))),
-            placed_cell(4, 2, CellSnapshot::wire((3, 2, layer))),
+            placed_cell(4, 2, CellSnapshot::noop()),
             placed_cell(4, 4, CellSnapshot::source(0xff)),
-            placed_cell(5, 1, CellSnapshot::gate(GateKind::Not)),
+            placed_cell(5, 0, CellSnapshot::source(0xff)),
+            placed_cell(5, 2, CellSnapshot::gate(GateKind::Not)),
             placed_cell(5, 3, CellSnapshot::gate(GateKind::Nand)),
-            placed_cell(6, 1, CellSnapshot::wire((5, 1, layer))),
-            placed_cell(6, 3, CellSnapshot::wire((5, 3, layer))),
+            placed_cell(6, 1, CellSnapshot::gate(GateKind::And)),
+            placed_cell(6, 3, CellSnapshot::noop()),
             placed_cell(7, 2, CellSnapshot::gate(GateKind::Xnor)),
         ],
         wires: vec![
@@ -63,11 +63,12 @@ pub fn starter_component() -> DemoComponent {
                 (1, 1),
                 &[(0.73, 2.5), (1.11, 2.5), (1.11, 1.76)],
             ),
+            wire(layer, (1, 1), (2, 1), &[(1.885, 1.5), (2.11, 1.5)]),
             wire(
                 layer,
-                (1, 1),
+                (2, 1),
                 (3, 2),
-                &[(1.885, 1.5), (2.11, 1.5), (2.11, 2.24), (3.11, 2.24)],
+                &[(2.885, 1.5), (3.11, 1.5), (3.11, 2.24)],
             ),
             wire(
                 layer,
@@ -75,17 +76,13 @@ pub fn starter_component() -> DemoComponent {
                 (3, 2),
                 &[(2.73, 3.5), (3.11, 3.5), (3.11, 2.76)],
             ),
+            wire(layer, (3, 2), (4, 2), &[(3.885, 2.5), (4.11, 2.5)]),
+            wire(layer, (4, 2), (5, 2), &[(4.885, 2.5), (5.11, 2.5)]),
             wire(
                 layer,
-                (3, 2),
-                (5, 1),
-                &[(3.885, 2.5), (4.11, 2.5), (4.11, 1.5), (5.11, 1.5)],
-            ),
-            wire(
-                layer,
-                (3, 2),
+                (4, 2),
                 (5, 3),
-                &[(3.885, 2.5), (4.11, 2.5), (4.11, 3.24), (5.11, 3.24)],
+                &[(4.885, 2.5), (5.11, 2.5), (5.11, 3.24)],
             ),
             wire(
                 layer,
@@ -95,15 +92,28 @@ pub fn starter_component() -> DemoComponent {
             ),
             wire(
                 layer,
-                (5, 1),
-                (7, 2),
-                &[(5.885, 1.5), (6.11, 1.5), (6.11, 2.24), (7.11, 2.24)],
+                (5, 0),
+                (6, 1),
+                &[(5.73, 0.5), (6.11, 0.5), (6.11, 1.24)],
             ),
             wire(
                 layer,
-                (5, 3),
+                (5, 2),
+                (6, 1),
+                &[(5.885, 2.5), (6.11, 2.5), (6.11, 1.76)],
+            ),
+            wire(
+                layer,
+                (6, 1),
                 (7, 2),
-                &[(5.885, 3.5), (6.11, 3.5), (6.11, 2.76), (7.11, 2.76)],
+                &[(6.885, 1.5), (7.11, 1.5), (7.11, 2.24)],
+            ),
+            wire(layer, (5, 3), (6, 3), &[(5.885, 3.5), (6.11, 3.5)]),
+            wire(
+                layer,
+                (6, 3),
+                (7, 2),
+                &[(6.885, 3.5), (7.11, 3.5), (7.11, 2.76)],
             ),
         ],
     }
@@ -154,8 +164,16 @@ mod tests {
             component.cell_at(7, 2, 0),
             CellSnapshot::gate(GateKind::Xnor)
         );
+        assert_eq!(
+            component.cell_at(5, 2, 0),
+            CellSnapshot::gate(GateKind::Not)
+        );
+        assert_eq!(
+            component.cell_at(6, 1, 0),
+            CellSnapshot::gate(GateKind::And)
+        );
         assert_eq!(component.cell_at(7, 2, 1), CellSnapshot::empty());
-        assert_eq!(component.wires.len(), 9);
+        assert_eq!(component.wires.len(), 14);
         assert!(component.wires.iter().all(|wire| wire.source_id.layer == 0));
     }
 }

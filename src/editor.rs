@@ -16,6 +16,7 @@ const TOOL_CARD_HEIGHT: f32 = 78.0;
 pub enum EditorTool {
     Wire,
     Source,
+    Noop,
     Not,
     And,
     Or,
@@ -26,9 +27,10 @@ pub enum EditorTool {
 }
 
 impl EditorTool {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Wire,
         Self::Source,
+        Self::Noop,
         Self::Not,
         Self::And,
         Self::Or,
@@ -48,13 +50,14 @@ impl EditorTool {
         match self {
             Self::Wire => 0,
             Self::Source => 1,
-            Self::Not => 2,
-            Self::And => 3,
-            Self::Or => 4,
-            Self::Xor => 5,
-            Self::Nand => 6,
-            Self::Nor => 7,
-            Self::Xnor => 8,
+            Self::Noop => 2,
+            Self::Not => 3,
+            Self::And => 4,
+            Self::Or => 5,
+            Self::Xor => 6,
+            Self::Nand => 7,
+            Self::Nor => 8,
+            Self::Xnor => 9,
         }
     }
 
@@ -62,6 +65,7 @@ impl EditorTool {
         match self {
             Self::Wire => "Wire",
             Self::Source => "Source",
+            Self::Noop => "NO-OP",
             Self::Not => "NOT",
             Self::And => "AND",
             Self::Or => "OR",
@@ -74,8 +78,9 @@ impl EditorTool {
 
     fn description(self) -> &'static str {
         match self {
-            Self::Wire => "Reads the input",
+            Self::Wire => "Connect components",
             Self::Source => "Constant",
+            Self::Noop => "Pass-through",
             Self::Not => "Not Gate",
             Self::And => "And Gate",
             Self::Or => "Or Gate",

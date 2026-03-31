@@ -828,6 +828,12 @@ async fn run() {
                             return;
                         }
 
+                        if wire_overlay.has_draft() {
+                            wire_overlay.cancel_draft(&device, &queue);
+                            window.request_redraw();
+                            return;
+                        }
+
                         if let Some(action) = delete_at_cursor(
                             &simulation,
                             &mut edited_component,
@@ -1028,6 +1034,7 @@ fn snapshot_for_tool(tool: editor::EditorTool) -> Option<simulation::CellSnapsho
     match tool {
         editor::EditorTool::Wire => None,
         editor::EditorTool::Source => Some(simulation::CellSnapshot::source(0xff)),
+        editor::EditorTool::Noop => Some(simulation::CellSnapshot::noop()),
         editor::EditorTool::Not => Some(simulation::CellSnapshot::gate(simulation::GateKind::Not)),
         editor::EditorTool::And => Some(simulation::CellSnapshot::gate(simulation::GateKind::And)),
         editor::EditorTool::Or => Some(simulation::CellSnapshot::gate(simulation::GateKind::Or)),

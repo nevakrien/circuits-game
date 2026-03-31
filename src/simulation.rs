@@ -17,9 +17,9 @@ const CIRCUIT_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Ui
 #[repr(u8)]
 #[derive(Clone, Copy)]
 enum CircuitTag {
-    Noop = 0,
+    Empty = 0,
     Source = 1,
-    Wire = 2,
+    Noop = 2,
     Not = 3,
     And = 4,
     Or = 5,
@@ -227,7 +227,7 @@ impl Simulation {
             queue,
             grid_cell,
             layer,
-            CellSnapshot::from_cell(noop_cell()),
+            CellSnapshot::from_cell(empty_cell()),
         );
     }
 
@@ -543,7 +543,11 @@ fn seed_circuits(queue: &wgpu::Queue, texture: &wgpu::Texture) {
     let component = demo_scene::starter_component();
 
     for placed_cell in component.cells {
-        let ix = linear_index(placed_cell.grid_cell.x, placed_cell.grid_cell.y, component.layer);
+        let ix = linear_index(
+            placed_cell.grid_cell.x,
+            placed_cell.grid_cell.y,
+            component.layer,
+        );
         let cell = circuit_cell_from_snapshot(placed_cell.snapshot);
         circuits[ix] = [cell.tag as u8, cell.data[0], cell.data[1], cell.data[2]];
     }
@@ -576,9 +580,9 @@ fn linear_index(x: u32, y: u32, z: u32) -> usize {
 fn circuit_cell_from_snapshot(snapshot: CellSnapshot) -> CircuitCell {
     CircuitCell {
         tag: match snapshot.bytes[0] {
-            0 => CircuitTag::Noop,
+            0 => CircuitTag::Empty,
             1 => CircuitTag::Source,
-            2 => CircuitTag::Wire,
+            2 => CircuitTag::Noop,
             3 => CircuitTag::Not,
             4 => CircuitTag::And,
             5 => CircuitTag::Or,
@@ -586,14 +590,10 @@ fn circuit_cell_from_snapshot(snapshot: CellSnapshot) -> CircuitCell {
             7 => CircuitTag::Nand,
             8 => CircuitTag::Nor,
             9 => CircuitTag::Xnor,
-            _ => CircuitTag::Noop,
+            _ => CircuitTag::Empty,
         },
         data: [snapshot.bytes[1], snapshot.bytes[2], snapshot.bytes[3]],
     }
-}
-
-fn encode_spatial_id(coord: (u32, u32, u32)) -> [u8; 3] {
-    [coord.0 as u8, coord.1 as u8, coord.2 as u8]
 }
 
 impl CellSnapshot {
@@ -604,15 +604,15 @@ impl CellSnapshot {
     }
 
     pub fn empty() -> Self {
-        Self::from_cell(noop_cell())
+        Self::from_cell(empty_cell())
     }
 
     pub fn source(value: u8) -> Self {
         Self::from_cell(source_cell(value))
     }
 
-    pub fn wire(coord: (u32, u32, u32)) -> Self {
-        Self::from_cell(wire_cell(coord))
+    pub fn noop() -> Self {
+        Self::from_cell(noop_cell())
     }
 
     pub fn gate(kind: GateKind) -> Self {
@@ -629,9 +629,9 @@ impl CellSnapshot {
     }
 }
 
-fn noop_cell() -> CircuitCell {
+fn empty_cell() -> CircuitCell {
     CircuitCell {
-        tag: CircuitTag::Noop,
+        tag: CircuitTag::Empty,
         data: [0, 0, 0],
     }
 }
@@ -643,10 +643,10 @@ fn source_cell(value: u8) -> CircuitCell {
     }
 }
 
-fn wire_cell(coord: (u32, u32, u32)) -> CircuitCell {
+fn noop_cell() -> CircuitCell {
     CircuitCell {
-        tag: CircuitTag::Wire,
-        data: encode_spatial_id(coord),
+        tag: CircuitTag::Noop,
+        data: [0, 0, 0],
     }
 }
 
@@ -704,12 +704,9 @@ mod tests {
         let cell = circuit_cell_from_snapshot(component.cell_at(x, y, z));
 
         match cell.tag {
-            CircuitTag::Noop => 0,
+            CircuitTag::Empty => 0,
             CircuitTag::Source => cell.data[0],
-            CircuitTag::Wire => {
-                let [src_x, src_y, src_z] = cell.data;
-                read_packed_charge(texels, src_x as u32, src_y as u32, src_z as u32)
-            }
+            CircuitTag::Noop => read_packed_charge(texels, x.saturating_sub(1), y, z),
             CircuitTag::Not => {
                 let input = read_packed_charge(texels, x.saturating_sub(1), y, z);
                 gate_output(cell.tag, 0, input)

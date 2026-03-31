@@ -48,7 +48,7 @@ fn store_byte(packed: ptr<function, vec4<u32>>, coord: vec2<u32>, value: u32) {
     }
 }
 
-fn update_noop(
+fn update_empty(
     dims: vec3<u32>,
     coord: vec3<u32>,
     current_charge: u32,
@@ -63,6 +63,21 @@ fn update_noop(
     return 0u;
 }
 
+fn update_noop(
+    dims: vec3<u32>,
+    coord: vec3<u32>,
+    current_charge: u32,
+    circuit: vec4<u32>,
+    payload: vec3<u32>,
+) -> u32 {
+    _ = current_charge;
+    _ = circuit;
+    _ = payload;
+
+    let src = vec3u(max(coord.x, 1u) - 1u, coord.y, coord.z);
+    return read_byte(history, min(src, dims - vec3u(1u, 1u, 1u))) & 0xffu;
+}
+
 fn update_source(
     dims: vec3<u32>,
     coord: vec3<u32>,
@@ -75,21 +90,6 @@ fn update_source(
     _ = current_charge;
     _ = circuit;
     return payload.x;
-}
-
-fn update_wire(
-    dims: vec3<u32>,
-    coord: vec3<u32>,
-    current_charge: u32,
-    circuit: vec4<u32>,
-    payload: vec3<u32>,
-) -> u32 {
-    _ = coord;
-    _ = current_charge;
-    _ = circuit;
-
-    let src = min(payload, dims - vec3u(1u, 1u, 1u));
-    return read_byte(history, src) & 0xffu;
 }
 
 fn charge_bool(value: bool) -> u32 {
@@ -163,13 +163,13 @@ fn update_tag(
 ) -> u32 {
     switch (circuit.x & 0xffu) {
         case 0u: {
-            return update_noop(dims, coord, current_charge, circuit, payload);
+            return update_empty(dims, coord, current_charge, circuit, payload);
         }
         case 1u: {
             return update_source(dims, coord, current_charge, circuit, payload);
         }
         case 2u: {
-            return update_wire(dims, coord, current_charge, circuit, payload);
+            return update_noop(dims, coord, current_charge, circuit, payload);
         }
         case 3u: {
             return update_not(dims, coord, current_charge, circuit, payload);
