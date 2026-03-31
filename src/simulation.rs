@@ -160,11 +160,11 @@ impl BoardTextures {
         &self.circuit.1
     }
 
-    pub fn clear_cell(&self, queue: &wgpu::Queue, grid_cell: GridCell, layer: u32) {
+    pub fn clear_cell(&self, queue: &wgpu::Queue, grid_cell: GridCell, arena_z: u32) {
         self.write_cell(
             queue,
             grid_cell,
-            layer,
+            arena_z,
             CellSnapshot::from_cell(empty_cell()),
         );
     }
@@ -173,7 +173,7 @@ impl BoardTextures {
         &self,
         queue: &wgpu::Queue,
         grid_cell: GridCell,
-        layer: u32,
+        arena_z: u32,
         cell: CellSnapshot,
     ) {
         queue.write_texture(
@@ -183,7 +183,7 @@ impl BoardTextures {
                 origin: wgpu::Origin3d {
                     x: grid_cell.x,
                     y: grid_cell.y,
-                    z: layer,
+                    z: arena_z,
                 },
                 aspect: wgpu::TextureAspect::All,
             },
@@ -206,7 +206,7 @@ impl BoardTextures {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         grid_cell: GridCell,
-        layer: u32,
+        arena_z: u32,
     ) -> CellSnapshot {
         let bytes_per_row = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
@@ -226,7 +226,7 @@ impl BoardTextures {
                 origin: wgpu::Origin3d {
                     x: grid_cell.x,
                     y: grid_cell.y,
-                    z: layer,
+                    z: arena_z,
                 },
                 aspect: wgpu::TextureAspect::All,
             },
@@ -271,10 +271,10 @@ impl BoardTextures {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         grid_cell: GridCell,
-        layer: u32,
+        arena_z: u32,
     ) {
         for buffer_index in 0..CHARGE_BUFFER_COUNT {
-            self.write_charge_value(device, queue, buffer_index, grid_cell, layer, 0);
+            self.write_charge_value(device, queue, buffer_index, grid_cell, arena_z, 0);
         }
     }
 
@@ -284,16 +284,16 @@ impl BoardTextures {
         queue: &wgpu::Queue,
         buffer_index: u32,
         grid_cell: GridCell,
-        layer: u32,
+        arena_z: u32,
         value: u8,
     ) {
         let (packed_x, packed_y, packed_z) =
-            packed_charge_texel_coord(grid_cell.x, grid_cell.y, layer);
+            packed_charge_texel_coord(grid_cell.x, grid_cell.y, arena_z);
         let channel = packed_charge_channel(grid_cell.x, grid_cell.y);
 
         let mut texel = [
             pollster::block_on(self.read_charge_buffer(device, queue, buffer_index))
-                [packed_charge_texel_index(grid_cell.x, grid_cell.y, layer)],
+                [packed_charge_texel_index(grid_cell.x, grid_cell.y, arena_z)],
         ];
         texel[0][channel] = value;
 
@@ -550,7 +550,7 @@ fn seed_circuits(queue: &wgpu::Queue, texture: &wgpu::Texture) {
         let ix = linear_index(
             placed_cell.grid_cell.x,
             placed_cell.grid_cell.y,
-            component.layer,
+            component.arena_z,
         );
         let cell = circuit_cell_from_snapshot(placed_cell.snapshot);
         circuits[ix] = [cell.tag as u8, cell.data[0], cell.data[1], cell.data[2]];

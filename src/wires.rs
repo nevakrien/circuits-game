@@ -45,14 +45,14 @@ pub struct WirePoint {
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct DraftWire {
-    pub layer: u32,
+    pub arena_z: u32,
     pub source: GridCell,
     pub points: Vec<WirePoint>,
 }
 
 #[derive(Clone)]
 struct AestheticWire {
-    layer: u32,
+    arena_z: u32,
     source: GridCell,
     points: Vec<WirePoint>,
     color: [f32; 4],
@@ -69,8 +69,8 @@ pub struct WireOverlay {
     board_size: [u32; 2],
     wires: Vec<AestheticWire>,
     thickness_px: f32,
-    visible_layer: u32,
-    draft_layer: u32,
+    visible_arena_z: u32,
+    draft_arena_z: u32,
     draft_source: Option<GridCell>,
     draft_points: Vec<WirePoint>,
     draft_color: [f32; 4],
@@ -195,8 +195,8 @@ impl WireOverlay {
                 surface_size,
                 board_size,
             ),
-            visible_layer: 0,
-            draft_layer: 0,
+            visible_arena_z: 0,
+            draft_arena_z: 0,
             draft_source: None,
             draft_points: Vec::new(),
             draft_color: DEFAULT_WIRE_COLOR,
@@ -252,12 +252,17 @@ impl WireOverlay {
         self.sync_segments(device, queue);
     }
 
-    pub fn set_visible_layer(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, layer: u32) {
-        if self.visible_layer == layer {
+    pub fn set_visible_arena_z(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        arena_z: u32,
+    ) {
+        if self.visible_arena_z == arena_z {
             return;
         }
 
-        self.visible_layer = layer;
+        self.visible_arena_z = arena_z;
         self.sync_segments(device, queue);
     }
 
@@ -277,7 +282,7 @@ impl WireOverlay {
 
     pub fn current_draft(&self) -> Option<DraftWire> {
         Some(DraftWire {
-            layer: self.draft_layer,
+            arena_z: self.draft_arena_z,
             source: self.draft_source?,
             points: self.draft_points.clone(),
         })
@@ -290,7 +295,7 @@ impl WireOverlay {
         draft: Option<&DraftWire>,
     ) {
         if let Some(draft) = draft {
-            self.draft_layer = draft.layer;
+            self.draft_arena_z = draft.arena_z;
             self.draft_source = Some(draft.source);
             self.draft_points = draft.points.clone();
         } else {
@@ -305,11 +310,11 @@ impl WireOverlay {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        layer: u32,
+        arena_z: u32,
         point: WirePoint,
         source: GridCell,
     ) {
-        self.draft_layer = layer;
+        self.draft_arena_z = arena_z;
         if self.draft_points.is_empty() {
             self.draft_source = Some(source);
         }
@@ -368,8 +373,8 @@ impl WireOverlay {
         })?;
 
         let edge = StoredWireEdge {
-            source_id: WireEndpointId::from_grid_cell(source, self.draft_layer),
-            destination_id: WireEndpointId::from_grid_cell(destination, self.draft_layer),
+            source_id: WireEndpointId::from_grid_cell(source, self.draft_arena_z),
+            destination_id: WireEndpointId::from_grid_cell(destination, self.draft_arena_z),
             points: self.draft_points.clone(),
             color,
         };
@@ -388,7 +393,7 @@ impl WireOverlay {
         self.wires = wires
             .into_iter()
             .map(|wire| AestheticWire {
-                layer: wire.source_id.layer,
+                arena_z: wire.source_id.arena_z,
                 source: wire.source_id.as_grid_cell(),
                 points: wire.points,
                 color: wire.color,
@@ -489,13 +494,13 @@ impl WireOverlay {
         let mut segments = Vec::new();
 
         for wire in &self.wires {
-            if wire.layer != self.visible_layer {
+            if wire.arena_z != self.visible_arena_z {
                 continue;
             }
 
             append_segments(
                 &mut segments,
-                wire.layer,
+                wire.arena_z,
                 wire.source,
                 &wire.points,
                 wire.color,
@@ -503,12 +508,12 @@ impl WireOverlay {
             );
         }
 
-        if self.draft_layer == self.visible_layer {
+        if self.draft_arena_z == self.visible_arena_z {
             if let Some(source) = self.draft_source {
                 if self.draft_points.len() >= 2 {
                     append_segments(
                         &mut segments,
-                        self.draft_layer,
+                        self.draft_arena_z,
                         source,
                         &self.draft_points,
                         self.draft_color,
@@ -523,7 +528,7 @@ impl WireOverlay {
                         let preview = [last, hover];
                         append_segments(
                             &mut segments,
-                            self.draft_layer,
+                            self.draft_arena_z,
                             source,
                             &preview,
                             self.draft_color,
@@ -540,7 +545,7 @@ impl WireOverlay {
 
 fn append_segments(
     out: &mut Vec<WireSegmentInstance>,
-    layer: u32,
+    arena_z: u32,
     source: GridCell,
     points: &[WirePoint],
     color: [f32; 4],
@@ -558,7 +563,7 @@ fn append_segments(
         return;
     }
 
-    let source_coord = [source.x, source.y, layer, 0];
+    let source_coord = [source.x, source.y, arena_z, 0];
     let mut path_start = 0.0;
 
     for pair in points.windows(2) {
@@ -731,14 +736,14 @@ mod tests {
             GridCell { x: 1, y: 1 },
         );
 
-        overlay.set_visible_layer(&device, &queue, 1);
+        overlay.set_visible_arena_z(&device, &queue, 1);
         overlay.update_hover(&device, &queue, Some(WirePoint { x: 4.0, y: 1.0 }));
 
-        assert_eq!(overlay.current_draft().unwrap().layer, 2);
+        assert_eq!(overlay.current_draft().unwrap().arena_z, 2);
     }
 
     #[test]
-    fn build_segments_only_includes_visible_layer() {
+    fn build_segments_only_includes_visible_arena_z() {
         let instance = wgpu::Instance::default();
         let adapter =
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
@@ -762,12 +767,12 @@ mod tests {
                     source_id: WireEndpointId {
                         x: 1,
                         y: 1,
-                        layer: 0,
+                        arena_z: 0,
                     },
                     destination_id: WireEndpointId {
                         x: 2,
                         y: 1,
-                        layer: 0,
+                        arena_z: 0,
                     },
                     points: vec![WirePoint { x: 1.0, y: 1.0 }, WirePoint { x: 2.0, y: 1.0 }],
                     color: DEFAULT_WIRE_COLOR,
@@ -776,12 +781,12 @@ mod tests {
                     source_id: WireEndpointId {
                         x: 3,
                         y: 3,
-                        layer: 1,
+                        arena_z: 1,
                     },
                     destination_id: WireEndpointId {
                         x: 4,
                         y: 3,
-                        layer: 1,
+                        arena_z: 1,
                     },
                     points: vec![WirePoint { x: 3.0, y: 3.0 }, WirePoint { x: 4.0, y: 3.0 }],
                     color: DEFAULT_WIRE_COLOR,
@@ -789,7 +794,7 @@ mod tests {
             ],
         );
 
-        overlay.set_visible_layer(&device, &queue, 1);
+        overlay.set_visible_arena_z(&device, &queue, 1);
 
         let segments = overlay.build_segments();
         assert_eq!(segments.len(), 1);

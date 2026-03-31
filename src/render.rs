@@ -14,7 +14,7 @@ const TOOL_PREVIEW_HEIGHT: u32 = 46;
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct RenderParams {
     view: [f32; 4],
-    layer: [u32; 4],
+    arena_z: [u32; 4],
 }
 
 #[derive(Clone, Copy)]
@@ -414,17 +414,17 @@ impl Renderer {
     }
 
     pub fn update_view(&self, queue: &wgpu::Queue, camera: CameraState) {
-        self.update_view_layer(queue, camera, 0);
+        self.update_view_arena_z(queue, camera, 0);
     }
 
-    pub fn update_view_layer(&self, queue: &wgpu::Queue, camera: CameraState, layer: u32) {
+    pub fn update_view_arena_z(&self, queue: &wgpu::Queue, camera: CameraState, arena_z: u32) {
         let uv_scale = camera.view_params();
         queue.write_buffer(
             &self.params_buffer,
             0,
             bytemuck::bytes_of(&RenderParams {
                 view: [uv_scale[0], uv_scale[1], camera.offset[0], camera.offset[1]],
-                layer: [layer, 0, 0, 0],
+                arena_z: [arena_z, 0, 0, 0],
             }),
         );
     }

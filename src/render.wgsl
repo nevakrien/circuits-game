@@ -6,7 +6,7 @@ var circuit_tex: texture_3d<u32>;
 
 struct RenderParams {
     view: vec4<f32>,
-    layer: vec4<u32>,
+    arena_z: vec4<u32>,
 }
 
 @group(0) @binding(2)
@@ -69,14 +69,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         return vec4(0.0, 0.0, 0.0, 1.0);
     }
 
-    let layer = min(render_params.layer.x, dims.z - 1u);
+    let arena_z = min(render_params.arena_z.x, dims.z - 1u);
     let cell = uv * vec2<f32>(dims.xy);
     let coord = min(vec2<u32>(cell), dims.xy - vec2(1u, 1u));
     let local_uv = fract(cell);
     let centered = local_uv - vec2(0.5, 0.5);
 
-    let sample_coord = vec3<i32>(vec2<i32>(coord), i32(layer));
-    let charge = read_byte(charge_tex, vec3u(coord, layer)) & 0xffu;
+    let sample_coord = vec3<i32>(vec2<i32>(coord), i32(arena_z));
+    let charge = read_byte(charge_tex, vec3u(coord, arena_z)) & 0xffu;
     let circuit = textureLoad(circuit_tex, sample_coord, 0);
 
     var color = render_cell_color(coord, local_uv, centered, charge, circuit);

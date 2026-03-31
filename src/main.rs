@@ -16,7 +16,7 @@ use std::{
 
 const DEFAULT_RENDER_WIDTH: u32 = 1600;
 const DEFAULT_RENDER_HEIGHT: u32 = 900;
-const DEFAULT_RENDER_LAYER: u32 = 0;
+const DEFAULT_RENDER_ARENA_Z: u32 = 0;
 const DEFAULT_RENDER_STEPS: u32 = 0;
 
 enum CliMode {
@@ -29,7 +29,7 @@ struct RenderSceneOptions {
     output_path: PathBuf,
     width: u32,
     height: u32,
-    layer: u32,
+    arena_z: u32,
     steps: u32,
 }
 
@@ -66,7 +66,7 @@ Options:
   --output <path>           Output PNG path (default: target/render/scene.png)
   --width <pixels>          Output width (default: 1600)
   --height <pixels>         Output height (default: 900)
-  --layer <index>           Layer to render (default: 0)
+  --arena-z <index>         Packed arena z to render (default: 0)
   --steps <count>           Simulation steps before capture (default: 0)
   -h, --help                Show this help"
 }
@@ -79,7 +79,7 @@ where
         output_path: PathBuf::from("target/render/scene.png"),
         width: DEFAULT_RENDER_WIDTH,
         height: DEFAULT_RENDER_HEIGHT,
-        layer: DEFAULT_RENDER_LAYER,
+        arena_z: DEFAULT_RENDER_ARENA_Z,
         steps: DEFAULT_RENDER_STEPS,
     };
     let mut render_scene = false;
@@ -106,11 +106,11 @@ where
                     .ok_or_else(|| "Missing value for --height".to_string())?;
                 options.height = parse_u32_flag("--height", &value)?;
             }
-            "--layer" => {
+            "--arena-z" => {
                 let value = args
                     .next()
-                    .ok_or_else(|| "Missing value for --layer".to_string())?;
-                options.layer = parse_u32_flag("--layer", &value)?;
+                    .ok_or_else(|| "Missing value for --arena-z".to_string())?;
+                options.arena_z = parse_u32_flag("--arena-z", &value)?;
             }
             "--steps" => {
                 let value = args
@@ -179,10 +179,10 @@ async fn render_scene_to_png(options: &RenderSceneOptions) -> Result<(), String>
         surface_size,
     );
     let camera = render::CameraState::new(surface_size);
-    let layer = options
-        .layer
+    let arena_z = options
+        .arena_z
         .min(simulation::BOARD_LAYERS.saturating_sub(1));
-    renderer.update_view_layer(&queue, camera, layer);
+    renderer.update_view_arena_z(&queue, camera, arena_z);
 
     let mut current_buffer = 0;
     for _ in 0..options.steps {
@@ -331,7 +331,7 @@ async fn run() {
         window.inner_size(),
         [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
     );
-    let mut displayed_layer = 0;
+    let mut displayed_arena_z = 0;
     let egui_ctx = egui::Context::default();
     let mut egui_state = egui_winit::State::new(
         egui_ctx.clone(),
@@ -361,7 +361,7 @@ async fn run() {
         &queue,
         edited_component.wire_edges().cloned().collect(),
     );
-    wire_overlay.set_visible_layer(&device, &queue, displayed_layer);
+    wire_overlay.set_visible_arena_z(&device, &queue, displayed_arena_z);
 
     let mut current_buffer = 0;
     let mut step_requested = false;
@@ -380,7 +380,7 @@ async fn run() {
                         let raw_input = egui_state.take_egui_input(&window);
                         let mut reset_camera = false;
                         let full_output = egui_ctx.run(raw_input, |ctx| {
-                            reset_camera = editor_session.show(ctx, displayed_layer);
+                            reset_camera = editor_session.show(ctx, displayed_arena_z);
                         });
                         editor_session.sync_tool_state(&mut wire_overlay, &device, &queue);
                         egui_state.handle_platform_output(&window, full_output.platform_output);
@@ -422,7 +422,7 @@ async fn run() {
                             camera.zoom_by(1.0 / zoom_step);
                         }
 
-                        renderer.update_view_layer(&queue, camera, displayed_layer);
+                        renderer.update_view_arena_z(&queue, camera, displayed_arena_z);
                         hover_preview.update(
                             &queue,
                             camera,
@@ -591,12 +591,12 @@ async fn run() {
                                     }
 
                                     if !event.repeat && code == KeyCode::ArrowUp {
-                                        displayed_layer = (displayed_layer + 1)
+                                        displayed_arena_z = (displayed_arena_z + 1)
                                             .min(simulation::BOARD_LAYERS.saturating_sub(1));
-                                        wire_overlay.set_visible_layer(
+                                        wire_overlay.set_visible_arena_z(
                                             &device,
                                             &queue,
-                                            displayed_layer,
+                                            displayed_arena_z,
                                         );
                                         let hover = cursor_position.and_then(|cursor| {
                                             wires::cursor_to_board_point(
@@ -614,11 +614,11 @@ async fn run() {
                                     }
 
                                     if !event.repeat && code == KeyCode::ArrowDown {
-                                        displayed_layer = displayed_layer.saturating_sub(1);
-                                        wire_overlay.set_visible_layer(
+                                        displayed_arena_z = displayed_arena_z.saturating_sub(1);
+                                        wire_overlay.set_visible_arena_z(
                                             &device,
                                             &queue,
-                                            displayed_layer,
+                                            displayed_arena_z,
                                         );
                                         let hover = cursor_position.and_then(|cursor| {
                                             wires::cursor_to_board_point(
@@ -713,7 +713,7 @@ async fn run() {
                                 &queue,
                                 camera,
                                 cursor,
-                                displayed_layer,
+                                displayed_arena_z,
                                 extend_wire,
                             ) {
                                 window.request_redraw();
@@ -740,7 +740,7 @@ async fn run() {
                             &queue,
                             camera,
                             cursor_position,
-                            displayed_layer,
+                            displayed_arena_z,
                             extend_wire,
                         ) {
                             window.request_redraw();
@@ -750,7 +750,7 @@ async fn run() {
                         if size.width > 0 && size.height > 0 {
                             windowing::resize_surface(&surface, &device, &mut config, size);
                             camera.resize(size);
-                            renderer.update_view_layer(&queue, camera, displayed_layer);
+                            renderer.update_view_arena_z(&queue, camera, displayed_arena_z);
                             wire_overlay.resize(&device, &queue, camera, size);
                         }
                     }

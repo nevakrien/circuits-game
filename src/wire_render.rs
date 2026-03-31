@@ -8,15 +8,15 @@ const WIRE_DELETE_DISTANCE: f32 = 0.35;
 pub struct WireEndpointId {
     pub x: u32,
     pub y: u32,
-    pub layer: u32,
+    pub arena_z: u32,
 }
 
 impl WireEndpointId {
-    pub fn from_grid_cell(cell: GridCell, layer: u32) -> Self {
+    pub fn from_grid_cell(cell: GridCell, arena_z: u32) -> Self {
         Self {
             x: cell.x,
             y: cell.y,
-            layer,
+            arena_z,
         }
     }
 
@@ -106,14 +106,18 @@ impl WireRenderInfo {
         Some(removed)
     }
 
-    pub fn remove_wire_at_point(&mut self, layer: u32, point: WirePoint) -> Option<StoredWireEdge> {
+    pub fn remove_wire_at_point(
+        &mut self,
+        arena_z: u32,
+        point: WirePoint,
+    ) -> Option<StoredWireEdge> {
         let (key, index) = self
             .wire_edges
             .iter()
             .filter(|(_, edges)| {
                 edges
                     .first()
-                    .is_some_and(|edge| edge.source_id.layer == layer)
+                    .is_some_and(|edge| edge.source_id.arena_z == arena_z)
             })
             .find_map(|(key, edges)| {
                 edges
@@ -175,12 +179,12 @@ mod tests {
             source_id: WireEndpointId {
                 x: 1,
                 y: 2,
-                layer: 1,
+                arena_z: 1,
             },
             destination_id: WireEndpointId {
                 x: 3,
                 y: 4,
-                layer: 1,
+                arena_z: 1,
             },
             points: vec![WirePoint { x: 1.0, y: 2.0 }, WirePoint { x: 3.0, y: 4.0 }],
             color: [1.0, 1.0, 1.0, 1.0],
@@ -198,12 +202,12 @@ mod tests {
         let source_id = WireEndpointId {
             x: 2,
             y: 1,
-            layer: 2,
+            arena_z: 2,
         };
         let destination_id = WireEndpointId {
             x: 4,
             y: 1,
-            layer: 2,
+            arena_z: 2,
         };
         component.add_wire_edge(StoredWireEdge {
             source_id,
@@ -224,12 +228,12 @@ mod tests {
         let source_id = WireEndpointId {
             x: 2,
             y: 1,
-            layer: 2,
+            arena_z: 2,
         };
         let destination_id = WireEndpointId {
             x: 4,
             y: 1,
-            layer: 2,
+            arena_z: 2,
         };
 
         component.add_wire_edge(StoredWireEdge {
@@ -259,12 +263,12 @@ mod tests {
         let source_id = WireEndpointId {
             x: 2,
             y: 1,
-            layer: 2,
+            arena_z: 2,
         };
         let destination_id = WireEndpointId {
             x: 4,
             y: 1,
-            layer: 2,
+            arena_z: 2,
         };
         let first = StoredWireEdge {
             source_id,
@@ -289,18 +293,18 @@ mod tests {
     }
 
     #[test]
-    fn removes_wire_when_click_hits_segment_on_same_layer() {
+    fn removes_wire_when_click_hits_segment_on_same_arena_z() {
         let mut component = WireRenderInfo::new();
         component.add_wire_edge(StoredWireEdge {
             source_id: WireEndpointId {
                 x: 1,
                 y: 1,
-                layer: 1,
+                arena_z: 1,
             },
             destination_id: WireEndpointId {
                 x: 4,
                 y: 1,
-                layer: 1,
+                arena_z: 1,
             },
             points: vec![WirePoint { x: 1.0, y: 1.0 }, WirePoint { x: 4.0, y: 1.0 }],
             color: [1.0, 1.0, 1.0, 1.0],
@@ -313,18 +317,18 @@ mod tests {
     }
 
     #[test]
-    fn keeps_wire_when_click_hits_different_layer() {
+    fn keeps_wire_when_click_hits_different_arena_z() {
         let mut component = WireRenderInfo::new();
         component.add_wire_edge(StoredWireEdge {
             source_id: WireEndpointId {
                 x: 1,
                 y: 1,
-                layer: 1,
+                arena_z: 1,
             },
             destination_id: WireEndpointId {
                 x: 4,
                 y: 1,
-                layer: 1,
+                arena_z: 1,
             },
             points: vec![WirePoint { x: 1.0, y: 1.0 }, WirePoint { x: 4.0, y: 1.0 }],
             color: [1.0, 1.0, 1.0, 1.0],

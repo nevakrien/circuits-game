@@ -4,6 +4,17 @@ I am aiming for ridiclout levels of performance so that larger chips can be buil
 
 
 # Software Design
+
+## Terminology
+
+The project still has older code that talks about `layer`, but that is not the intended product model.
+
+- We edit a **component plan**, not a layer.
+- Runtime state belongs to **component instances**.
+- The packed `z` coordinate inside a 3D texture is an implementation detail for batching, not a user-facing editing concept.
+
+See `docs/component-model-notes.md` for the current direction.
+
 for circuts to not care about insertion and excution order the only way to do an update is a double buffer. 
 where we only read from previous steps and write to the current one. update happens explictly in these ticks,
 which is very parallalizem friednly

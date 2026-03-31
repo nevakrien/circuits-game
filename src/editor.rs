@@ -133,7 +133,7 @@ pub enum EditorAction {
     DeleteWire(wire_render::StoredWireEdge),
     PlaceCell {
         grid_cell: wires::GridCell,
-        layer: u32,
+        arena_z: u32,
         previous_cell: simulation::CellSnapshot,
         previous_charge_values: Vec<u8>,
         new_cell: simulation::CellSnapshot,
@@ -141,7 +141,7 @@ pub enum EditorAction {
     },
     DeleteCell {
         grid_cell: wires::GridCell,
-        layer: u32,
+        arena_z: u32,
         cell: simulation::CellSnapshot,
         charge_values: Vec<u8>,
     },
@@ -231,8 +231,8 @@ impl EditorSession {
         self.ui.selected_wire_color()
     }
 
-    pub fn show(&mut self, ctx: &egui::Context, displayed_layer: u32) -> bool {
-        self.ui.show(ctx, displayed_layer, &self.history)
+    pub fn show(&mut self, ctx: &egui::Context, displayed_arena_z: u32) -> bool {
+        self.ui.show(ctx, displayed_arena_z, &self.history)
     }
 
     pub fn sync_tool_state(
@@ -351,7 +351,7 @@ impl EditorSession {
         queue: &wgpu::Queue,
         camera: render::CameraState,
         cursor: [f32; 2],
-        displayed_layer: u32,
+        displayed_arena_z: u32,
         extend_wire: bool,
     ) -> bool {
         let Some(source) = wires::snap_cursor_to_cell(
@@ -374,7 +374,7 @@ impl EditorSession {
 
                 let had_draft = wire_overlay.has_draft();
                 self.update_draft(wire_overlay, |overlay| {
-                    overlay.add_point(device, queue, displayed_layer, point, source);
+                    overlay.add_point(device, queue, displayed_arena_z, point, source);
                 });
 
                 if had_draft && !extend_wire {
@@ -390,7 +390,7 @@ impl EditorSession {
                     queue,
                     camera,
                     cursor,
-                    displayed_layer,
+                    displayed_arena_z,
                     tool,
                 ) {
                     self.history.push(action);
@@ -411,7 +411,7 @@ impl EditorSession {
         queue: &wgpu::Queue,
         camera: render::CameraState,
         cursor_position: Option<[f32; 2]>,
-        displayed_layer: u32,
+        displayed_arena_z: u32,
         extend_wire: bool,
     ) -> bool {
         if self.selected_tool() != EditorTool::Wire {
@@ -437,7 +437,7 @@ impl EditorSession {
             queue,
             camera,
             cursor_position,
-            displayed_layer,
+            displayed_arena_z,
         ) {
             self.history.push(action);
             true
@@ -488,7 +488,7 @@ impl EditorUi {
     pub fn show<T>(
         &mut self,
         ctx: &egui::Context,
-        displayed_layer: u32,
+        displayed_arena_z: u32,
         history: &EditorHistory<T>,
     ) -> bool {
         let screen_rect = ctx.content_rect();
@@ -543,7 +543,7 @@ impl EditorUi {
                         ui.horizontal(|ui| {
                             ui.heading("Editor");
                             ui.label(
-                                RichText::new(format!("Layer {}", displayed_layer))
+                                RichText::new(format!("Arena Z {}", displayed_arena_z))
                                     .small()
                                     .color(Color32::from_rgb(170, 184, 198)),
                             );
@@ -692,7 +692,7 @@ fn delete_at_cursor(
     queue: &wgpu::Queue,
     camera: render::CameraState,
     cursor_position: Option<[f32; 2]>,
-    displayed_layer: u32,
+    displayed_arena_z: u32,
 ) -> Option<EditorAction> {
     let cursor = cursor_position?;
     let grid_cell = wires::snap_cursor_to_cell(
@@ -706,11 +706,11 @@ fn delete_at_cursor(
         [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
     )?;
 
-    if let Some(edge) = component.remove_wire_at_point(displayed_layer, point) {
+    if let Some(edge) = component.remove_wire_at_point(displayed_arena_z, point) {
         sync_component_wires(wire_overlay, component, device, queue);
         Some(EditorAction::DeleteWire(edge))
     } else {
-        let cell = simulation.read_cell(device, queue, grid_cell, displayed_layer);
+        let cell = simulation.read_cell(device, queue, grid_cell, displayed_arena_z);
         let charge_values = (0..simulation::CHARGE_BUFFER_COUNT)
             .map(|buffer_index| {
                 pollster::block_on(simulation.read_charge_value(
@@ -719,18 +719,18 @@ fn delete_at_cursor(
                     buffer_index,
                     grid_cell.x,
                     grid_cell.y,
-                    displayed_layer,
+                    displayed_arena_z,
                 ))
             })
             .collect::<Vec<_>>();
         if cell.bytes == [0, 0, 0, 0] && charge_values.iter().all(|value| *value == 0) {
             return None;
         }
-        simulation.clear_cell(queue, grid_cell, displayed_layer);
-        simulation.clear_charge_at(device, queue, grid_cell, displayed_layer);
+        simulation.clear_cell(queue, grid_cell, displayed_arena_z);
+        simulation.clear_charge_at(device, queue, grid_cell, displayed_arena_z);
         Some(EditorAction::DeleteCell {
             grid_cell,
-            layer: displayed_layer,
+            arena_z: displayed_arena_z,
             cell,
             charge_values,
         })
@@ -743,7 +743,7 @@ fn place_cell_at_cursor(
     queue: &wgpu::Queue,
     camera: render::CameraState,
     cursor: [f32; 2],
-    displayed_layer: u32,
+    displayed_arena_z: u32,
     tool: EditorTool,
 ) -> Option<EditorAction> {
     let grid_cell = wires::snap_cursor_to_cell(
@@ -752,7 +752,7 @@ fn place_cell_at_cursor(
         [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
     )?;
     let new_cell = snapshot_for_tool(tool)?;
-    let previous_cell = simulation.read_cell(device, queue, grid_cell, displayed_layer);
+    let previous_cell = simulation.read_cell(device, queue, grid_cell, displayed_arena_z);
 
     if previous_cell == new_cell {
         return None;
@@ -766,26 +766,26 @@ fn place_cell_at_cursor(
                 buffer_index,
                 grid_cell.x,
                 grid_cell.y,
-                displayed_layer,
+                displayed_arena_z,
             ))
         })
         .collect::<Vec<_>>();
 
     let new_charge_values = charge_values_for_tool(tool);
 
-    simulation.write_cell(queue, grid_cell, displayed_layer, new_cell);
+    simulation.write_cell(queue, grid_cell, displayed_arena_z, new_cell);
     write_charge_values(
         simulation,
         device,
         queue,
         grid_cell,
-        displayed_layer,
+        displayed_arena_z,
         &new_charge_values,
     );
 
     Some(EditorAction::PlaceCell {
         grid_cell,
-        layer: displayed_layer,
+        arena_z: displayed_arena_z,
         previous_cell,
         previous_charge_values,
         new_cell,
@@ -822,11 +822,18 @@ fn write_charge_values(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     grid_cell: wires::GridCell,
-    layer: u32,
+    arena_z: u32,
     charge_values: &[u8],
 ) {
     for (buffer_index, value) in charge_values.iter().copied().enumerate() {
-        simulation.write_charge_value(device, queue, buffer_index as u32, grid_cell, layer, value);
+        simulation.write_charge_value(
+            device,
+            queue,
+            buffer_index as u32,
+            grid_cell,
+            arena_z,
+            value,
+        );
     }
 }
 
@@ -853,26 +860,26 @@ fn apply_action(
         }
         EditorAction::PlaceCell {
             grid_cell,
-            layer,
+            arena_z,
             new_cell,
             new_charge_values,
             ..
         } => {
-            simulation.write_cell(queue, *grid_cell, *layer, *new_cell);
+            simulation.write_cell(queue, *grid_cell, *arena_z, *new_cell);
             write_charge_values(
                 simulation,
                 device,
                 queue,
                 *grid_cell,
-                *layer,
+                *arena_z,
                 new_charge_values,
             );
         }
         EditorAction::DeleteCell {
-            grid_cell, layer, ..
+            grid_cell, arena_z, ..
         } => {
-            simulation.clear_cell(queue, *grid_cell, *layer);
-            simulation.clear_charge_at(device, queue, *grid_cell, *layer);
+            simulation.clear_cell(queue, *grid_cell, *arena_z);
+            simulation.clear_charge_at(device, queue, *grid_cell, *arena_z);
         }
     }
 }
@@ -903,35 +910,35 @@ fn apply_inverse_action(
         }
         EditorAction::PlaceCell {
             grid_cell,
-            layer,
+            arena_z,
             previous_cell,
             previous_charge_values,
             ..
         } => {
-            simulation.write_cell(queue, *grid_cell, *layer, *previous_cell);
+            simulation.write_cell(queue, *grid_cell, *arena_z, *previous_cell);
             write_charge_values(
                 simulation,
                 device,
                 queue,
                 *grid_cell,
-                *layer,
+                *arena_z,
                 previous_charge_values,
             );
         }
         EditorAction::DeleteCell {
             grid_cell,
-            layer,
+            arena_z,
             cell,
             charge_values,
         } => {
-            simulation.write_cell(queue, *grid_cell, *layer, *cell);
+            simulation.write_cell(queue, *grid_cell, *arena_z, *cell);
             for (buffer_index, value) in charge_values.iter().copied().enumerate() {
                 simulation.write_charge_value(
                     device,
                     queue,
                     buffer_index as u32,
                     *grid_cell,
-                    *layer,
+                    *arena_z,
                     value,
                 );
             }
@@ -1203,7 +1210,7 @@ mod tests {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         cell: wires::GridCell,
-        layer: u32,
+        arena_z: u32,
     ) -> Vec<u8> {
         (0..simulation::CHARGE_BUFFER_COUNT)
             .map(|buffer_index| {
@@ -1213,7 +1220,7 @@ mod tests {
                     buffer_index,
                     cell.x,
                     cell.y,
-                    layer,
+                    arena_z,
                 ))
             })
             .collect()
@@ -1337,14 +1344,14 @@ mod tests {
             match action {
                 EditorAction::PlaceCell {
                     grid_cell: action_grid_cell,
-                    layer,
+                    arena_z,
                     previous_cell,
                     previous_charge_values,
                     new_cell,
                     new_charge_values,
                 } => {
                     assert_eq!(action_grid_cell, grid_cell);
-                    assert_eq!(layer, 0);
+                    assert_eq!(arena_z, 0);
                     assert_eq!(previous_cell, simulation::CellSnapshot::empty());
                     assert_eq!(
                         previous_charge_values,
