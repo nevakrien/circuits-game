@@ -7,7 +7,31 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
 };
 
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    fs::File,
+    io::BufWriter,
+    path::{Path, PathBuf},
+};
+
+const DEFAULT_RENDER_WIDTH: u32 = 1600;
+const DEFAULT_RENDER_HEIGHT: u32 = 900;
+const DEFAULT_RENDER_LAYER: u32 = 0;
+const DEFAULT_RENDER_STEPS: u32 = 0;
+
+enum CliMode {
+    Interactive,
+    RenderScene(RenderSceneOptions),
+    Help,
+}
+
+struct RenderSceneOptions {
+    output_path: PathBuf,
+    width: u32,
+    height: u32,
+    layer: u32,
+    steps: u32,
+}
 
 #[derive(Clone)]
 enum EditorAction {
@@ -86,7 +110,269 @@ impl EditorHistoryExt for EditorHistory {
 }
 
 fn main() {
-    pollster::block_on(run());
+    let cli_mode = match parse_cli_args(std::env::args().skip(1)) {
+        Ok(mode) => mode,
+        Err(error) => {
+            eprintln!("{error}\n\n{}", cli_usage());
+            std::process::exit(2);
+        }
+    };
+
+    match cli_mode {
+        CliMode::Interactive => pollster::block_on(run()),
+        CliMode::RenderScene(options) => {
+            if let Err(error) = pollster::block_on(render_scene_to_png(&options)) {
+                eprintln!("Failed to render scene: {error}");
+                std::process::exit(1);
+            }
+            println!("Rendered scene to {}", options.output_path.display());
+        }
+        CliMode::Help => {
+            println!("{}", cli_usage());
+        }
+    }
+}
+
+fn cli_usage() -> &'static str {
+    "Usage:
+  cargo run -- [--render-scene [options]]
+
+Options:
+  --render-scene            Render to an image instead of opening a window
+  --output <path>           Output PNG path (default: target/render/scene.png)
+  --width <pixels>          Output width (default: 1600)
+  --height <pixels>         Output height (default: 900)
+  --layer <index>           Layer to render (default: 0)
+  --steps <count>           Simulation steps before capture (default: 0)
+  -h, --help                Show this help"
+}
+
+fn parse_cli_args<I>(args: I) -> Result<CliMode, String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut options = RenderSceneOptions {
+        output_path: PathBuf::from("target/render/scene.png"),
+        width: DEFAULT_RENDER_WIDTH,
+        height: DEFAULT_RENDER_HEIGHT,
+        layer: DEFAULT_RENDER_LAYER,
+        steps: DEFAULT_RENDER_STEPS,
+    };
+    let mut render_scene = false;
+
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--render-scene" => render_scene = true,
+            "--output" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "Missing value for --output".to_string())?;
+                options.output_path = PathBuf::from(value);
+            }
+            "--width" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "Missing value for --width".to_string())?;
+                options.width = parse_u32_flag("--width", &value)?;
+            }
+            "--height" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "Missing value for --height".to_string())?;
+                options.height = parse_u32_flag("--height", &value)?;
+            }
+            "--layer" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "Missing value for --layer".to_string())?;
+                options.layer = parse_u32_flag("--layer", &value)?;
+            }
+            "--steps" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "Missing value for --steps".to_string())?;
+                options.steps = parse_u32_flag("--steps", &value)?;
+            }
+            "-h" | "--help" => return Ok(CliMode::Help),
+            _ => return Err(format!("Unknown argument: {arg}")),
+        }
+    }
+
+    if options.width == 0 {
+        return Err("--width must be greater than 0".to_string());
+    }
+    if options.height == 0 {
+        return Err("--height must be greater than 0".to_string());
+    }
+
+    if render_scene {
+        Ok(CliMode::RenderScene(options))
+    } else {
+        Ok(CliMode::Interactive)
+    }
+}
+
+fn parse_u32_flag(flag: &str, value: &str) -> Result<u32, String> {
+    value
+        .parse::<u32>()
+        .map_err(|_| format!("Invalid value for {flag}: {value}"))
+}
+
+async fn render_scene_to_png(options: &RenderSceneOptions) -> Result<(), String> {
+    let instance = wgpu::Instance::default();
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions::default())
+        .await
+        .map_err(|error| format!("Unable to create adapter: {error}"))?;
+    let (device, queue) = adapter
+        .request_device(&wgpu::DeviceDescriptor::default())
+        .await
+        .map_err(|error| format!("Unable to create device: {error}"))?;
+
+    let surface_size = winit::dpi::PhysicalSize::new(options.width, options.height);
+    let output_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("scene-capture"),
+        size: wgpu::Extent3d {
+            width: options.width,
+            height: options.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+
+    let simulation = simulation::Simulation::new(&device, &queue);
+    let renderer = render::Renderer::new(
+        &device,
+        &queue,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        surface_size,
+    );
+    let camera = render::CameraState::new(surface_size);
+    let layer = options
+        .layer
+        .min(simulation::BOARD_LAYERS.saturating_sub(1));
+    renderer.update_view_layer(&queue, camera, layer);
+
+    let mut current_buffer = 0;
+    for _ in 0..options.steps {
+        let next_buffer = (current_buffer + 1) % simulation::CHARGE_BUFFER_COUNT;
+        let mut step_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("scene-capture-step"),
+        });
+        simulation.step(&device, &mut step_encoder, current_buffer, next_buffer);
+        queue.submit(Some(step_encoder.finish()));
+        current_buffer = next_buffer;
+    }
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("scene-capture-render"),
+    });
+    renderer.draw(
+        &device,
+        &mut encoder,
+        &output_texture,
+        simulation.charge_view(current_buffer),
+        simulation.circuit_view(),
+    );
+
+    let bytes_per_pixel = 4;
+    let unpadded_bytes_per_row = options.width * bytes_per_pixel;
+    let padded_bytes_per_row =
+        unpadded_bytes_per_row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+    let readback_size = u64::from(padded_bytes_per_row) * u64::from(options.height);
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("scene-capture-readback"),
+        size: readback_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &output_texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded_bytes_per_row),
+                rows_per_image: Some(options.height),
+            },
+        },
+        wgpu::Extent3d {
+            width: options.width,
+            height: options.height,
+            depth_or_array_layers: 1,
+        },
+    );
+
+    queue.submit(Some(encoder.finish()));
+
+    let slice = readback.slice(..);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
+    });
+    let _ = device.poll(wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    });
+    receiver
+        .recv()
+        .map_err(|_| "Failed to receive readback result".to_string())?
+        .map_err(|error| format!("Failed to map readback buffer: {error}"))?;
+
+    let mapped = slice.get_mapped_range();
+    let mut rgba = vec![0u8; (options.width * options.height * bytes_per_pixel) as usize];
+    for row in 0..options.height as usize {
+        let src_start = row * padded_bytes_per_row as usize;
+        let src_end = src_start + unpadded_bytes_per_row as usize;
+        let dst_start = row * unpadded_bytes_per_row as usize;
+        let dst_end = dst_start + unpadded_bytes_per_row as usize;
+        rgba[dst_start..dst_end].copy_from_slice(&mapped[src_start..src_end]);
+    }
+    drop(mapped);
+    readback.unmap();
+
+    write_png_rgba(
+        options.output_path.as_path(),
+        options.width,
+        options.height,
+        &rgba,
+    )
+}
+
+fn write_png_rgba(path: &Path, width: u32, height: u32, rgba: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "Failed to create output directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let file = File::create(path)
+        .map_err(|error| format!("Failed to create {}: {error}", path.display()))?;
+    let writer = BufWriter::new(file);
+    let mut encoder = png::Encoder::new(writer, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut png_writer = encoder
+        .write_header()
+        .map_err(|error| format!("Failed to write PNG header: {error}"))?;
+    png_writer
+        .write_image_data(rgba)
+        .map_err(|error| format!("Failed to write PNG pixels: {error}"))
 }
 
 async fn run() {
@@ -366,12 +652,10 @@ async fn run() {
                                     if !event.repeat && code == KeyCode::ArrowUp {
                                         displayed_layer = (displayed_layer + 1)
                                             .min(simulation::BOARD_LAYERS.saturating_sub(1));
-                                        edited_component.set_buffer_id(
-                                            wire_render::WireBufferId {
-                                                texture_index: current_buffer,
-                                                layer: displayed_layer,
-                                            },
-                                        );
+                                        edited_component.set_buffer_id(wire_render::WireBufferId {
+                                            texture_index: current_buffer,
+                                            layer: displayed_layer,
+                                        });
                                         let hover = cursor_position.and_then(|cursor| {
                                             wires::cursor_to_board_point(
                                                 camera,
@@ -390,12 +674,10 @@ async fn run() {
 
                                     if !event.repeat && code == KeyCode::ArrowDown {
                                         displayed_layer = displayed_layer.saturating_sub(1);
-                                        edited_component.set_buffer_id(
-                                            wire_render::WireBufferId {
-                                                texture_index: current_buffer,
-                                                layer: displayed_layer,
-                                            },
-                                        );
+                                        edited_component.set_buffer_id(wire_render::WireBufferId {
+                                            texture_index: current_buffer,
+                                            layer: displayed_layer,
+                                        });
                                         let hover = cursor_position.and_then(|cursor| {
                                             wires::cursor_to_board_point(
                                                 camera,
@@ -1042,7 +1324,10 @@ mod tests {
                 _ => panic!("expected place-cell action"),
             }
 
-            assert_eq!(simulation.read_cell(&device, &queue, grid_cell, 0), expected_cell);
+            assert_eq!(
+                simulation.read_cell(&device, &queue, grid_cell, 0),
+                expected_cell
+            );
             assert_eq!(
                 read_charge_values(&simulation, &device, &queue, grid_cell, 0),
                 expected_charge_values
@@ -1105,7 +1390,10 @@ mod tests {
             &device,
             &queue,
         ));
-        assert_eq!(simulation.read_cell(&device, &queue, grid_cell, layer), previous_cell);
+        assert_eq!(
+            simulation.read_cell(&device, &queue, grid_cell, layer),
+            previous_cell
+        );
         assert_eq!(
             read_charge_values(&simulation, &device, &queue, grid_cell, layer),
             previous_charge_values.to_vec()

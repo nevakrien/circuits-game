@@ -12,4 +12,5 @@ pollster = "0.4.0"
 egui-wgpu = "0.33.3"
 egui-winit = "0.33.3"
 egui = "0.33.3"
+png = "0.18.1"
 
