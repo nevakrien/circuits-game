@@ -92,13 +92,60 @@ const TOOL_OPTIONS: &[EditorTool] = &EditorTool::ALL;
 pub struct EditorUi {
     expanded: bool,
     selected_tool: EditorTool,
+    tool_preview_textures: [TextureId; EditorTool::COUNT],
+}
+
+pub struct EditorHistory<T> {
+    undo_stack: Vec<T>,
+    redo_stack: Vec<T>,
+}
+
+impl<T> Default for EditorHistory<T> {
+    fn default() -> Self {
+        Self {
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+        }
+    }
+}
+
+impl<T> EditorHistory<T> {
+    pub fn can_undo(&self) -> bool {
+        !self.undo_stack.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo_stack.is_empty()
+    }
+
+    pub fn push(&mut self, action: T) {
+        self.undo_stack.push(action);
+        self.redo_stack.clear();
+    }
+
+    pub fn pop_undo(&mut self) -> Option<T> {
+        self.undo_stack.pop()
+    }
+
+    pub fn push_redo(&mut self, action: T) {
+        self.redo_stack.push(action);
+    }
+
+    pub fn pop_redo(&mut self) -> Option<T> {
+        self.redo_stack.pop()
+    }
+
+    pub fn push_undo(&mut self, action: T) {
+        self.undo_stack.push(action);
+    }
 }
 
 impl EditorUi {
-    pub fn new() -> Self {
+    pub fn new(tool_preview_textures: [TextureId; EditorTool::COUNT]) -> Self {
         Self {
             expanded: false,
             selected_tool: EditorTool::Wire,
+            tool_preview_textures,
         }
     }
 
@@ -110,13 +157,11 @@ impl EditorUi {
         self.selected_tool = EditorTool::Wire;
     }
 
-    pub fn show(
+    pub fn show<T>(
         &mut self,
         ctx: &egui::Context,
         displayed_layer: u32,
-        can_undo: bool,
-        can_redo: bool,
-        tool_preview_textures: &[TextureId; EditorTool::COUNT],
+        history: &EditorHistory<T>,
     ) -> bool {
         let screen_rect = ctx.content_rect();
         let panel_height = PANEL_HEIGHT.min((screen_rect.height() - PANEL_MARGIN * 2.0).max(160.0));
@@ -180,8 +225,8 @@ impl EditorUi {
                         ui.label(
                             RichText::new(format!(
                                 "Undo {}  Redo {}",
-                                if can_undo { "Ctrl+Z" } else { "-" },
-                                if can_redo {
+                                if history.can_undo() { "Ctrl+Z" } else { "-" },
+                                if history.can_redo() {
                                     "Ctrl+Shift+Z / Ctrl+Y"
                                 } else {
                                     "-"
@@ -200,7 +245,7 @@ impl EditorUi {
                                         ui,
                                         *tool,
                                         *tool == self.selected_tool,
-                                        tool_preview_textures[tool.preview_index()],
+                                        self.tool_preview_textures[tool.preview_index()],
                                     );
                                     if response.clicked() {
                                         self.selected_tool = *tool;

@@ -29,26 +29,29 @@ enum EditorAction {
     },
 }
 
-#[derive(Default)]
-struct EditorHistory {
-    undo_stack: Vec<EditorAction>,
-    redo_stack: Vec<EditorAction>,
+type EditorHistory = editor::EditorHistory<EditorAction>;
+
+trait EditorHistoryExt {
+    fn undo(
+        &mut self,
+        simulation: &simulation::Simulation,
+        component: &mut components::ComponentInfo,
+        wire_overlay: &mut wires::WireOverlay,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> bool;
+
+    fn redo(
+        &mut self,
+        simulation: &simulation::Simulation,
+        component: &mut components::ComponentInfo,
+        wire_overlay: &mut wires::WireOverlay,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> bool;
 }
 
-impl EditorHistory {
-    fn can_undo(&self) -> bool {
-        !self.undo_stack.is_empty()
-    }
-
-    fn can_redo(&self) -> bool {
-        !self.redo_stack.is_empty()
-    }
-
-    fn push(&mut self, action: EditorAction) {
-        self.undo_stack.push(action);
-        self.redo_stack.clear();
-    }
-
+impl EditorHistoryExt for EditorHistory {
     fn undo(
         &mut self,
         simulation: &simulation::Simulation,
@@ -57,11 +60,11 @@ impl EditorHistory {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) -> bool {
-        let Some(action) = self.undo_stack.pop() else {
+        let Some(action) = self.pop_undo() else {
             return false;
         };
         apply_inverse_action(&action, simulation, component, wire_overlay, device, queue);
-        self.redo_stack.push(action);
+        self.push_redo(action);
         true
     }
 
@@ -73,11 +76,11 @@ impl EditorHistory {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) -> bool {
-        let Some(action) = self.redo_stack.pop() else {
+        let Some(action) = self.pop_redo() else {
             return false;
         };
         apply_action(&action, simulation, component, wire_overlay, device, queue);
-        self.undo_stack.push(action);
+        self.push_undo(action);
         true
     }
 }
@@ -125,9 +128,11 @@ async fn run() {
         config.format,
         egui_wgpu::RendererOptions::default(),
     );
-    let tool_preview_textures =
-        render::create_editor_tool_previews(&device, &queue, &mut egui_renderer);
-    let mut editor_ui = editor::EditorUi::new();
+    let mut editor_ui = editor::EditorUi::new(render::create_editor_tool_previews(
+        &device,
+        &queue,
+        &mut egui_renderer,
+    ));
     let mut history = EditorHistory::default();
     let mut edited_component = components::ComponentInfo::new(components::ComponentBufferId {
         texture_index: 0,
@@ -151,13 +156,7 @@ async fn run() {
                         let raw_input = egui_state.take_egui_input(&window);
                         let mut reset_camera = false;
                         let full_output = egui_ctx.run(raw_input, |ctx| {
-                            reset_camera = editor_ui.show(
-                                ctx,
-                                displayed_layer,
-                                history.can_undo(),
-                                history.can_redo(),
-                                &tool_preview_textures,
-                            );
+                            reset_camera = editor_ui.show(ctx, displayed_layer, &history);
                         });
                         if editor_ui.selected_tool() != editor::EditorTool::Wire {
                             wire_overlay.cancel_draft(&device, &queue);
