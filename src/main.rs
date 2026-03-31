@@ -559,7 +559,6 @@ async fn run() {
                                             )
                                         };
                                         if changed {
-                                            wire_overlay.restore_draft(&device, &queue, None);
                                             window.request_redraw();
                                         }
                                         return;
@@ -573,7 +572,6 @@ async fn run() {
                                             &device,
                                             &queue,
                                         ) {
-                                            wire_overlay.restore_draft(&device, &queue, None);
                                             window.request_redraw();
                                         }
                                         return;

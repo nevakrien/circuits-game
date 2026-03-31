@@ -116,8 +116,8 @@ pub struct EditorUi {
 }
 
 pub struct EditorHistory<T> {
-    undo_stack: Vec<T>,
-    redo_stack: Vec<T>,
+    actions: Vec<T>,
+    next_index: usize,
 }
 
 #[derive(Clone)]
@@ -128,7 +128,7 @@ pub enum EditorAction {
     },
     CommitWire {
         edge: wire_render::StoredWireEdge,
-        draft: wires::DraftWire,
+        previous_draft: Option<wires::DraftWire>,
     },
     DeleteWire(wire_render::StoredWireEdge),
     PlaceCell {
@@ -155,40 +155,61 @@ pub struct EditorSession {
 impl<T> Default for EditorHistory<T> {
     fn default() -> Self {
         Self {
-            undo_stack: Vec::new(),
-            redo_stack: Vec::new(),
+            actions: Vec::new(),
+            next_index: 0,
         }
     }
 }
 
 impl<T> EditorHistory<T> {
     pub fn can_undo(&self) -> bool {
-        !self.undo_stack.is_empty()
+        self.next_index > 0
     }
 
     pub fn can_redo(&self) -> bool {
-        !self.redo_stack.is_empty()
+        self.next_index < self.actions.len()
     }
 
     pub fn push(&mut self, action: T) {
-        self.undo_stack.push(action);
-        self.redo_stack.clear();
+        self.actions.truncate(self.next_index);
+        self.actions.push(action);
+        self.next_index = self.actions.len();
     }
 
-    pub fn pop_undo(&mut self) -> Option<T> {
-        self.undo_stack.pop()
+    pub fn undo_action(&mut self) -> Option<&T> {
+        if self.next_index == 0 {
+            return None;
+        }
+
+        self.next_index -= 1;
+        self.actions.get(self.next_index)
     }
 
-    pub fn push_redo(&mut self, action: T) {
-        self.redo_stack.push(action);
+    pub fn redo_action(&mut self) -> Option<&T> {
+        if self.next_index >= self.actions.len() {
+            return None;
+        }
+
+        let action = self.actions.get(self.next_index);
+        self.next_index += 1;
+        action
     }
 
-    pub fn pop_redo(&mut self) -> Option<T> {
-        self.redo_stack.pop()
-    }
+    pub fn take_applied_suffix_while<P>(&mut self, mut predicate: P) -> Vec<T>
+    where
+        P: FnMut(&T) -> bool,
+    {
+        let mut start = self.next_index;
+        while start > 0 && predicate(&self.actions[start - 1]) {
+            start -= 1;
+        }
 
-    pub fn push_undo(&mut self, action: T) {
-        self.undo_stack.push(action);
+        if start == self.next_index {
+            return Vec::new();
+        }
+
+        self.next_index = start;
+        self.actions.drain(start..).collect()
     }
 }
 
@@ -231,11 +252,10 @@ impl EditorSession {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) -> bool {
-        let Some(action) = self.history.pop_undo() else {
+        let Some(action) = self.history.undo_action() else {
             return false;
         };
-        apply_inverse_action(&action, simulation, component, wire_overlay, device, queue);
-        self.history.push_redo(action);
+        apply_inverse_action(action, simulation, component, wire_overlay, device, queue);
         true
     }
 
@@ -247,11 +267,10 @@ impl EditorSession {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) -> bool {
-        let Some(action) = self.history.pop_redo() else {
+        let Some(action) = self.history.redo_action() else {
             return false;
         };
-        apply_action(&action, simulation, component, wire_overlay, device, queue);
-        self.history.push_undo(action);
+        apply_action(action, simulation, component, wire_overlay, device, queue);
         true
     }
 
@@ -271,9 +290,22 @@ impl EditorSession {
             return false;
         };
 
+        let previous_draft = self
+            .history
+            .take_applied_suffix_while(|action| matches!(action, EditorAction::UpdateDraft { .. }))
+            .into_iter()
+            .find_map(|action| match action {
+                EditorAction::UpdateDraft { before, .. } => Some(before),
+                _ => None,
+            })
+            .unwrap_or(Some(draft.clone()));
+
         component.add_wire_edge(edge.clone());
         sync_component_wires(wire_overlay, component, device, queue);
-        self.history.push(EditorAction::CommitWire { edge, draft });
+        self.history.push(EditorAction::CommitWire {
+            edge,
+            previous_draft,
+        });
         true
     }
 
@@ -845,10 +877,13 @@ fn apply_inverse_action(
         EditorAction::UpdateDraft { before, .. } => {
             wire_overlay.restore_draft(device, queue, before.as_ref());
         }
-        EditorAction::CommitWire { edge, draft } => {
+        EditorAction::CommitWire {
+            edge,
+            previous_draft,
+        } => {
             component.remove_matching_wire_edge(edge);
             sync_component_wires(wire_overlay, component, device, queue);
-            wire_overlay.restore_draft(device, queue, Some(draft));
+            wire_overlay.restore_draft(device, queue, previous_draft.as_ref());
         }
         EditorAction::DeleteWire(edge) => {
             component.add_wire_edge(edge.clone());
@@ -1176,6 +1211,51 @@ mod tests {
     }
 
     #[test]
+    fn history_uses_single_cursor_and_truncates_redo_branch() {
+        let mut history = EditorHistory::default();
+
+        history.push("first");
+        history.push("second");
+
+        assert_eq!(history.actions, vec!["first", "second"]);
+        assert_eq!(history.next_index, 2);
+        assert!(history.can_undo());
+        assert!(!history.can_redo());
+
+        assert_eq!(history.undo_action(), Some(&"second"));
+        assert_eq!(history.next_index, 1);
+        assert!(history.can_undo());
+        assert!(history.can_redo());
+
+        history.push("replacement");
+
+        assert_eq!(history.actions, vec!["first", "replacement"]);
+        assert_eq!(history.next_index, 2);
+        assert!(history.can_undo());
+        assert!(!history.can_redo());
+        assert_eq!(history.redo_action(), None);
+    }
+
+    #[test]
+    fn history_redo_does_not_duplicate_actions_after_many_cycles() {
+        let mut history = EditorHistory::default();
+
+        history.push("a");
+        history.push("b");
+        history.push("c");
+
+        for _ in 0..8 {
+            assert_eq!(history.undo_action(), Some(&"c"));
+            assert_eq!(history.redo_action(), Some(&"c"));
+        }
+
+        assert_eq!(history.actions, vec!["a", "b", "c"]);
+        assert_eq!(history.next_index, 3);
+        assert!(history.can_undo());
+        assert!(!history.can_redo());
+    }
+
+    #[test]
     fn placing_tools_writes_expected_cell_and_charge_values() {
         let Some((device, queue, simulation, _, _, camera, _)) = create_editor_test_context()
         else {
@@ -1459,6 +1539,64 @@ mod tests {
                 .map(|draft| draft.points.len()),
             Some(2)
         );
+    }
+
+    #[test]
+    fn undoing_a_committed_wire_clears_it_without_reviving_the_draft() {
+        let Some((device, queue, simulation, mut component, mut wire_overlay, camera, mut session)) =
+            create_editor_test_context()
+        else {
+            return;
+        };
+
+        let first = wires::GridCell { x: 2, y: 2 };
+        let second = wires::GridCell { x: 5, y: 2 };
+
+        assert!(session.handle_left_click(
+            &simulation,
+            &mut component,
+            &mut wire_overlay,
+            &device,
+            &queue,
+            camera,
+            cursor_for_cell(first),
+            0,
+            true,
+        ));
+        assert!(session.handle_left_click(
+            &simulation,
+            &mut component,
+            &mut wire_overlay,
+            &device,
+            &queue,
+            camera,
+            cursor_for_cell(second),
+            0,
+            false,
+        ));
+
+        assert!(wire_overlay.current_draft().is_none());
+        assert_eq!(component.wire_edges().count(), 1);
+
+        assert!(session.undo(
+            &simulation,
+            &mut component,
+            &mut wire_overlay,
+            &device,
+            &queue,
+        ));
+        assert_eq!(component.wire_edges().count(), 0);
+        assert!(wire_overlay.current_draft().is_none());
+
+        assert!(session.redo(
+            &simulation,
+            &mut component,
+            &mut wire_overlay,
+            &device,
+            &queue,
+        ));
+        assert_eq!(component.wire_edges().count(), 1);
+        assert!(wire_overlay.current_draft().is_none());
     }
 
     #[test]
