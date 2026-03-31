@@ -20,6 +20,12 @@ const GATE_GLYPH_ATLAS: array<array<u32, 5>, 7> = array<array<u32, 5>, 7>(
     array<u32, 5>(0x63u, 0x14u, 0x08u, 0x14u, 0x63u),
 );
 
+const CELL_BASE_COLOR: vec3<f32> = vec3(0.04, 0.04, 0.05);
+const GATE_INPUT_RADIUS: f32 = 0.085;
+const GATE_INPUT_SINGLE_CENTER: vec2<f32> = vec2(-0.39, 0.0);
+const GATE_INPUT_TOP_CENTER: vec2<f32> = vec2(-0.39, -0.26);
+const GATE_INPUT_BOTTOM_CENTER: vec2<f32> = vec2(-0.39, 0.26);
+
 fn sharp_cut(distance: f32, epsilon: f32) -> f32 {
     if (distance <= -epsilon) {
         return 1.0;
@@ -57,6 +63,29 @@ fn diamond_mask(centered: vec2<f32>, center: vec2<f32>, radius: f32) -> f32 {
     let delta = abs(centered - center);
     let distance = delta.x + delta.y - radius;
     return sharp_cut(distance, 0.006);
+}
+
+fn render_lit_circle(
+    circle: f32,
+    glow: f32,
+    charge_level: f32,
+    uncharged_color: vec3<f32>,
+    charged_color: vec3<f32>,
+    glow_color: vec3<f32>,
+) -> vec3<f32> {
+    let node_color = mix(uncharged_color, charged_color, charge_level * 0.8);
+    var color = mix(CELL_BASE_COLOR, node_color, circle);
+    color += glow_color * (charge_level * glow);
+    return color;
+}
+
+fn gate_input_mask(centered: vec2<f32>, tag: u32) -> f32 {
+    let dual_input_mask = max(
+        circle_mask(centered, GATE_INPUT_TOP_CENTER, GATE_INPUT_RADIUS),
+        circle_mask(centered, GATE_INPUT_BOTTOM_CENTER, GATE_INPUT_RADIUS),
+    );
+    let single_input_mask = circle_mask(centered, GATE_INPUT_SINGLE_CENTER, GATE_INPUT_RADIUS);
+    return select(dual_input_mask, single_input_mask, tag == 3u);
 }
 
 fn glyph_mask(local_uv: vec2<f32>, glyph_ix: u32) -> f32 {
@@ -107,45 +136,28 @@ fn gate_label_mask(local_uv: vec2<f32>, tag: u32) -> f32 {
 
 fn render_noop(local_uv: vec2<f32>, centered: vec2<f32>, charge: u32) -> vec3<f32> {
     _ = local_uv;
-    _ = centered;
-
-    let base = vec3(0.04, 0.04, 0.05);
     let radius = length(centered);
     let circle = sharp_cut(radius - 0.23, 0.01);
     let glow = 1.0 - smoothstep(0.12, 0.38, radius);
     let charge_level = f32(charge) / 255.0;
-    let node_color = mix(base, vec3(0.85, 0.9, 0.95), charge_level * 0.8);
-
-    var color = base * (1.0 - circle) + node_color * circle;
-    color += vec3(0.18, 0.32, 0.42) * (charge_level * glow);
-    return color;
+    return render_lit_circle(circle, glow, charge_level, CELL_BASE_COLOR, vec3(0.85, 0.9, 0.95), vec3(0.18, 0.32, 0.42));
 }
 
 fn render_source(local_uv: vec2<f32>, centered: vec2<f32>, charge: u32) -> vec3<f32> {
     _ = local_uv;
 
-    let base = vec3(0.04, 0.04, 0.05);
     let radius = length(centered);
     let circle = sharp_cut(radius - 0.23, 0.01);
     let glow = 1.0 - smoothstep(0.12, 0.38, radius);
-    let source_color = vec3(0.28, 0.16, 0.10);
     let charge_level = f32(charge) / 255.0;
-    let node_color = mix(source_color, vec3(0.95, 0.82, 0.68), charge_level * 0.8);
-
-    var color = base;
-    color = mix(color, node_color, circle);
-    color += vec3(0.24, 0.18, 0.08) * (charge_level * glow);
-    return color;
+    return render_lit_circle(circle, glow, charge_level, vec3(0.28, 0.16, 0.10), vec3(0.95, 0.82, 0.68), vec3(0.24, 0.18, 0.08));
 }
 
 fn render_wire(coord: vec2<u32>, centered: vec2<f32>, charge: u32, circuit: vec4<u32>) -> vec3<f32> {
-    let base = vec3(0.04, 0.04, 0.05);
     let radius = length(centered);
     let circle = sharp_cut(radius - 0.23, 0.01);
     let glow = 1.0 - smoothstep(0.12, 0.38, radius);
-    let wire_color = vec3(0.18, 0.44, 0.64);
     let charge_level = f32(charge) / 255.0;
-    let node_color = mix(wire_color, vec3(0.88, 0.96, 1.0), charge_level * 0.8);
 
     let src = vec2<f32>(f32(circuit.y & 0xffu), f32(circuit.z & 0xffu));
     var flow = vec2<f32>(coord) - src;
@@ -163,15 +175,12 @@ fn render_wire(coord: vec2<u32>, centered: vec2<f32>, charge: u32, circuit: vec4
     let arrow = max(shaft, max(head_left, head_right)) * circle;
     let arrow_color = mix(vec3(0.5, 0.03, 0.04), vec3(1.0, 0.2, 0.1), 0.35 + charge_level * 0.65);
 
-    var color = base;
-    color = mix(color, node_color, circle);
+    var color = render_lit_circle(circle, glow, charge_level, vec3(0.18, 0.44, 0.64), vec3(0.88, 0.96, 1.0), vec3(0.16, 0.30, 0.42));
     color = mix(color, arrow_color, arrow);
-    color += vec3(0.16, 0.30, 0.42) * (charge_level * glow * circle);
     return color;
 }
 
 fn render_gate(local_uv: vec2<f32>, centered: vec2<f32>, charge: u32, circuit: vec4<u32>) -> vec3<f32> {
-    let base = vec3(0.035, 0.035, 0.045);
     let radius = length(centered);
     let glow = 1.0 - smoothstep(0.12, 0.38, radius);
     let tag = circuit.x & 0xffu;
@@ -181,31 +190,17 @@ fn render_gate(local_uv: vec2<f32>, centered: vec2<f32>, charge: u32, circuit: v
     let wire_blue = vec3(0.18, 0.44, 0.64);
     let body_color = mix(vec3(0.24, 0.28, 0.32), vec3(0.92, 0.96, 1.0), charge_level * 0.42);
     let label = gate_label_mask(local_uv, tag) * body_mask;
-    let input_corner_top = vec2(-0.38, -0.2);
-    let input_corner_bottom = vec2(-0.38, 0.2);
-    let input_single = vec2(-0.38, 0.0);
     let output_center = vec2(0.385, 0.0);
 
-    let input_top = circle_mask(centered, input_corner_top, 0.032);
-    let input_bottom = circle_mask(centered, input_corner_bottom, 0.032);
-    let input_single_c = circle_mask(centered, input_single, 0.032);
-    let input_mask = select(
-        max(input_top, input_bottom),
-        input_single_c,
-        tag == 3u,
-    );
-
-    let output_outer = diamond_mask(centered, output_center, 0.064);
-    let output_inner = diamond_mask(centered, output_center, 0.037);
-    let output_outline = output_outer - output_inner;
+    let output_outer = diamond_mask(centered, output_center, 0.1);
     let gate_border_mask = border_mask - output_outer;
+    let input_mask = gate_input_mask(centered, tag);
 
-    var color = base;
+    var color = vec3(0.035, 0.035, 0.045);
     color = mix(color, body_color, body_mask);
     color = mix(color, wire_blue, gate_border_mask * 0.82);
-    color = mix(color, vec3(1.0, 1.0, 1.0), input_mask);
-    color = mix(color, vec3(0.01, 0.01, 0.015), output_inner);
-    color = mix(color, vec3(1.0, 1.0, 1.0), output_outline);
+    color = mix(color, vec3(0.34, 0.92, 0.42), input_mask);
+    color = mix(color, vec3(1.0, 0.88, 0.22), output_outer);
     color = mix(color, vec3(0.6, 0.07, 0.08), label);
     color += vec3(0.22, 0.28, 0.34) * (charge_level * glow * 0.24);
     return color;
