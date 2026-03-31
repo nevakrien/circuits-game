@@ -5,7 +5,7 @@ use crate::wires::{GridCell, WirePoint};
 const WIRE_DELETE_DISTANCE: f32 = 0.35;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct ComponentBufferId {
+pub struct WireBufferId {
     pub texture_index: u32,
     pub layer: u32,
 }
@@ -63,20 +63,20 @@ impl StoredWireEdge {
     }
 }
 
-pub struct ComponentInfo {
-    pub buffer_id: ComponentBufferId,
+pub struct WireRenderInfo {
+    pub buffer_id: WireBufferId,
     wire_edges: HashMap<WireEdgeKey, Vec<StoredWireEdge>>,
 }
 
-impl ComponentInfo {
-    pub fn new(buffer_id: ComponentBufferId) -> Self {
+impl WireRenderInfo {
+    pub fn new(buffer_id: WireBufferId) -> Self {
         Self {
             buffer_id,
             wire_edges: HashMap::new(),
         }
     }
 
-    pub fn set_buffer_id(&mut self, buffer_id: ComponentBufferId) {
+    pub fn set_buffer_id(&mut self, buffer_id: WireBufferId) {
         self.buffer_id = buffer_id;
     }
 
@@ -182,7 +182,7 @@ mod tests {
 
     #[test]
     fn stores_edges_by_source_and_destination() {
-        let mut component = ComponentInfo::new(ComponentBufferId {
+        let mut component = WireRenderInfo::new(WireBufferId {
             texture_index: 0,
             layer: 1,
         });
@@ -209,7 +209,7 @@ mod tests {
 
     #[test]
     fn removes_edges_in_either_direction() {
-        let mut component = ComponentInfo::new(ComponentBufferId {
+        let mut component = WireRenderInfo::new(WireBufferId {
             texture_index: 0,
             layer: 2,
         });
@@ -238,7 +238,7 @@ mod tests {
 
     #[test]
     fn keeps_duplicate_edges_with_same_endpoints() {
-        let mut component = ComponentInfo::new(ComponentBufferId {
+        let mut component = WireRenderInfo::new(WireBufferId {
             texture_index: 0,
             layer: 2,
         });
@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn removes_exact_matching_duplicate_edge() {
-        let mut component = ComponentInfo::new(ComponentBufferId {
+        let mut component = WireRenderInfo::new(WireBufferId {
             texture_index: 0,
             layer: 2,
         });
@@ -314,7 +314,7 @@ mod tests {
 
     #[test]
     fn removes_wire_when_click_hits_segment_on_same_layer() {
-        let mut component = ComponentInfo::new(ComponentBufferId {
+        let mut component = WireRenderInfo::new(WireBufferId {
             texture_index: 0,
             layer: 1,
         });
@@ -341,7 +341,7 @@ mod tests {
 
     #[test]
     fn keeps_wire_when_click_hits_different_layer() {
-        let mut component = ComponentInfo::new(ComponentBufferId {
+        let mut component = WireRenderInfo::new(WireBufferId {
             texture_index: 0,
             layer: 1,
         });

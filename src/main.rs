@@ -1,4 +1,4 @@
-use circuits_game::{components, editor, render, simulation, windowing, wires};
+use circuits_game::{editor, render, simulation, windowing, wire_render, wires};
 use egui_wgpu::wgpu;
 use egui_winit::winit;
 
@@ -11,8 +11,8 @@ use std::collections::HashSet;
 
 #[derive(Clone)]
 enum EditorAction {
-    AddWire(components::StoredWireEdge),
-    DeleteWire(components::StoredWireEdge),
+    AddWire(wire_render::StoredWireEdge),
+    DeleteWire(wire_render::StoredWireEdge),
     PlaceCell {
         grid_cell: wires::GridCell,
         layer: u32,
@@ -35,7 +35,7 @@ trait EditorHistoryExt {
     fn undo(
         &mut self,
         simulation: &simulation::Simulation,
-        component: &mut components::ComponentInfo,
+        component: &mut wire_render::WireRenderInfo,
         wire_overlay: &mut wires::WireOverlay,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -44,7 +44,7 @@ trait EditorHistoryExt {
     fn redo(
         &mut self,
         simulation: &simulation::Simulation,
-        component: &mut components::ComponentInfo,
+        component: &mut wire_render::WireRenderInfo,
         wire_overlay: &mut wires::WireOverlay,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -55,7 +55,7 @@ impl EditorHistoryExt for EditorHistory {
     fn undo(
         &mut self,
         simulation: &simulation::Simulation,
-        component: &mut components::ComponentInfo,
+        component: &mut wire_render::WireRenderInfo,
         wire_overlay: &mut wires::WireOverlay,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -71,7 +71,7 @@ impl EditorHistoryExt for EditorHistory {
     fn redo(
         &mut self,
         simulation: &simulation::Simulation,
-        component: &mut components::ComponentInfo,
+        component: &mut wire_render::WireRenderInfo,
         wire_overlay: &mut wires::WireOverlay,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -134,7 +134,7 @@ async fn run() {
         &mut egui_renderer,
     ));
     let mut history = EditorHistory::default();
-    let mut edited_component = components::ComponentInfo::new(components::ComponentBufferId {
+    let mut edited_component = wire_render::WireRenderInfo::new(wire_render::WireBufferId {
         texture_index: 0,
         layer: displayed_layer,
     });
@@ -297,7 +297,7 @@ async fn run() {
 
                         if step_requested {
                             current_buffer = next_buffer;
-                            edited_component.set_buffer_id(components::ComponentBufferId {
+                            edited_component.set_buffer_id(wire_render::WireBufferId {
                                 texture_index: current_buffer,
                                 layer: displayed_layer,
                             });
@@ -367,7 +367,7 @@ async fn run() {
                                         displayed_layer = (displayed_layer + 1)
                                             .min(simulation::BOARD_LAYERS.saturating_sub(1));
                                         edited_component.set_buffer_id(
-                                            components::ComponentBufferId {
+                                            wire_render::WireBufferId {
                                                 texture_index: current_buffer,
                                                 layer: displayed_layer,
                                             },
@@ -391,7 +391,7 @@ async fn run() {
                                     if !event.repeat && code == KeyCode::ArrowDown {
                                         displayed_layer = displayed_layer.saturating_sub(1);
                                         edited_component.set_buffer_id(
-                                            components::ComponentBufferId {
+                                            wire_render::WireBufferId {
                                                 texture_index: current_buffer,
                                                 layer: displayed_layer,
                                             },
@@ -575,7 +575,7 @@ async fn run() {
 
 fn sync_component_wires(
     wire_overlay: &mut wires::WireOverlay,
-    component: &components::ComponentInfo,
+    component: &wire_render::WireRenderInfo,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
 ) {
@@ -584,7 +584,7 @@ fn sync_component_wires(
 
 fn finish_wire_attempt(
     wire_overlay: &mut wires::WireOverlay,
-    component: &mut components::ComponentInfo,
+    component: &mut wire_render::WireRenderInfo,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
 ) -> Option<EditorAction> {
@@ -600,7 +600,7 @@ fn finish_wire_attempt(
 
 fn delete_at_cursor(
     simulation: &simulation::Simulation,
-    component: &mut components::ComponentInfo,
+    component: &mut wire_render::WireRenderInfo,
     wire_overlay: &mut wires::WireOverlay,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -780,7 +780,7 @@ fn write_charge_values(
 fn apply_action(
     action: &EditorAction,
     simulation: &simulation::Simulation,
-    component: &mut components::ComponentInfo,
+    component: &mut wire_render::WireRenderInfo,
     wire_overlay: &mut wires::WireOverlay,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -823,7 +823,7 @@ fn apply_action(
 fn apply_inverse_action(
     action: &EditorAction,
     simulation: &simulation::Simulation,
-    component: &mut components::ComponentInfo,
+    component: &mut wire_render::WireRenderInfo,
     wire_overlay: &mut wires::WireOverlay,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -900,13 +900,13 @@ mod tests {
         wgpu::Device,
         wgpu::Queue,
         simulation::Simulation,
-        components::ComponentInfo,
+        wire_render::WireRenderInfo,
         wires::WireOverlay,
         render::CameraState,
     )> {
         let (device, queue) = pollster::block_on(create_headless_device())?;
         let simulation = simulation::Simulation::new(&device, &queue);
-        let component = components::ComponentInfo::new(components::ComponentBufferId {
+        let component = wire_render::WireRenderInfo::new(wire_render::WireBufferId {
             texture_index: 0,
             layer: 0,
         });

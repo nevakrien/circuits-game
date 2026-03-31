@@ -4,8 +4,8 @@ use egui_winit::winit;
 use winit::dpi::PhysicalSize;
 
 use crate::{
-    components::{StoredWireEdge, WireEndpointId},
     render::CameraState,
+    wire_render::{StoredWireEdge, WireEndpointId},
 };
 
 const INITIAL_SEGMENT_CAPACITY: usize = 16;
