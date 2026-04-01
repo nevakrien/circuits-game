@@ -126,6 +126,7 @@ struct HoverPreviewParams {
     cell: [u32; 4],
     circuit: [u32; 4],
     charge: [u32; 4],
+    overlay: [f32; 4],
 }
 
 #[repr(C)]
@@ -138,8 +139,9 @@ struct ToolPreviewParams {
 #[derive(Clone, Copy)]
 pub struct HoverPreviewState {
     pub cell: [u32; 2],
-    pub circuit: [u8; 4],
+    pub circuit: [u32; 4],
     pub charge: u8,
+    pub overlay: [f32; 4],
 }
 
 pub struct HoverPreviewRenderer {
@@ -286,28 +288,28 @@ pub fn create_editor_tool_previews(
 fn tool_preview_state(tool: crate::editor::EditorTool) -> ([u32; 4], u32) {
     let snapshot = match tool {
         crate::editor::EditorTool::Wire => [255, 0, 0, 0],
-        crate::editor::EditorTool::Source => crate::simulation::CellSnapshot::source(0xff).bytes,
-        crate::editor::EditorTool::Noop => crate::simulation::CellSnapshot::noop().bytes,
+        crate::editor::EditorTool::Source => crate::simulation::CellSnapshot::source(0xff).words,
+        crate::editor::EditorTool::Noop => crate::simulation::CellSnapshot::noop().words,
         crate::editor::EditorTool::Not => {
-            crate::simulation::CellSnapshot::gate(crate::simulation::GateKind::Not).bytes
+            crate::simulation::CellSnapshot::gate(crate::simulation::GateKind::Not).words
         }
         crate::editor::EditorTool::And => {
-            crate::simulation::CellSnapshot::gate(crate::simulation::GateKind::And).bytes
+            crate::simulation::CellSnapshot::gate(crate::simulation::GateKind::And).words
         }
         crate::editor::EditorTool::Or => {
-            crate::simulation::CellSnapshot::gate(crate::simulation::GateKind::Or).bytes
+            crate::simulation::CellSnapshot::gate(crate::simulation::GateKind::Or).words
         }
         crate::editor::EditorTool::Xor => {
-            crate::simulation::CellSnapshot::gate(crate::simulation::GateKind::Xor).bytes
+            crate::simulation::CellSnapshot::gate(crate::simulation::GateKind::Xor).words
         }
         crate::editor::EditorTool::Nand => {
-            crate::simulation::CellSnapshot::gate(crate::simulation::GateKind::Nand).bytes
+            crate::simulation::CellSnapshot::gate(crate::simulation::GateKind::Nand).words
         }
         crate::editor::EditorTool::Nor => {
-            crate::simulation::CellSnapshot::gate(crate::simulation::GateKind::Nor).bytes
+            crate::simulation::CellSnapshot::gate(crate::simulation::GateKind::Nor).words
         }
         crate::editor::EditorTool::Xnor => {
-            crate::simulation::CellSnapshot::gate(crate::simulation::GateKind::Xnor).bytes
+            crate::simulation::CellSnapshot::gate(crate::simulation::GateKind::Xnor).words
         }
     };
 
@@ -572,6 +574,7 @@ impl HoverPreviewRenderer {
                 cell: [preview.cell[0], preview.cell[1], 0, 1],
                 circuit: preview.circuit.map(u32::from),
                 charge: [u32::from(preview.charge), 0, 0, 0],
+                overlay: preview.overlay,
             }
         } else {
             HoverPreviewParams {
@@ -585,6 +588,7 @@ impl HoverPreviewRenderer {
                 cell: [0, 0, 0, 0],
                 circuit: [0, 0, 0, 0],
                 charge: [0, 0, 0, 0],
+                overlay: [0.0, 0.0, 0.0, 0.0],
             }
         };
 

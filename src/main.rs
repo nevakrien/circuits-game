@@ -397,6 +397,7 @@ async fn run() {
 
                         let pan_step = 0.01 / camera.zoom;
                         let zoom_step = 1.02;
+                        editor_session.advance_visual_feedback();
 
                         if reset_camera {
                             camera.reset_to_fit();
@@ -422,14 +423,15 @@ async fn run() {
                             camera.zoom_by(1.0 / zoom_step);
                         }
 
-                        renderer.update_view_arena_z(&queue, camera, displayed_arena_z);
+                        let display_camera = editor_session.camera_with_feedback(camera);
+
+                        renderer.update_view_arena_z(&queue, display_camera, displayed_arena_z);
                         hover_preview.update(
                             &queue,
-                            camera,
-                            editor::hover_preview_state_with_visibility(
-                                camera,
+                            display_camera,
+                            editor_session.hover_preview_state(
+                                display_camera,
                                 cursor_position,
-                                editor_session.selected_tool(),
                                 !egui_ctx.is_pointer_over_area(),
                             ),
                         );
@@ -438,7 +440,7 @@ async fn run() {
                             &queue,
                             editor_session.selected_wire_color(),
                         );
-                        wire_overlay.update_camera(&device, &queue, camera);
+                        wire_overlay.update_camera(&device, &queue, display_camera);
 
                         let next_buffer = (current_buffer + 1) % simulation::CHARGE_BUFFER_COUNT;
 
@@ -640,6 +642,7 @@ async fn run() {
                                             == editor::EditorTool::Wire
                                         {
                                             if editor_session.finish_wire_attempt(
+                                                &board,
                                                 &mut edited_component,
                                                 &mut wire_overlay,
                                                 &device,

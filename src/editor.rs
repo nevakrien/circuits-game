@@ -26,6 +26,16 @@ const WIRE_COLOR_OPTIONS: [([f32; 4], &str); 6] = [
     ([0.64, 0.42, 0.88, 1.0], "Purple"),
     ([0.93, 0.48, 0.76, 1.0], "Pink"),
 ];
+const INVALID_CONNECTION_FEEDBACK_FRAMES: u32 = 18;
+const INVALID_CONNECTION_SHAKE_PATTERN: [[f32; 2]; 6] = [
+    [-0.009, 0.006],
+    [0.010, -0.007],
+    [-0.008, -0.004],
+    [0.007, 0.005],
+    [-0.005, 0.003],
+    [0.003, -0.002],
+];
+const INVALID_CONNECTION_OVERLAY: [f32; 4] = [0.92, 0.12, 0.12, 0.72];
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EditorTool {
     Wire,
@@ -127,10 +137,10 @@ pub enum EditorAction {
         after: Option<wires::DraftWire>,
     },
     CommitWire {
-        edge: wire_render::StoredWireEdge,
+        plan: WireCommitPlan,
         previous_draft: Option<wires::DraftWire>,
     },
-    DeleteWire(wire_render::StoredWireEdge),
+    DeleteWire(WireRemovalPlan),
     PlaceCell {
         grid_cell: wires::GridCell,
         arena_z: u32,
@@ -151,6 +161,73 @@ pub struct EditorSession {
     ui: EditorUi,
     history: EditorHistory<EditorAction>,
     previous_tool: EditorTool,
+    invalid_connection_feedback: Option<InvalidConnectionFeedback>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ConnectionCellKind {
+    Source,
+    Noop,
+    UnaryGate,
+    BinaryGate,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EndpointRole {
+    Source,
+    Destination,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DestinationInputSlot {
+    Inline,
+    Upper,
+    Lower,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WireConnectionError {
+    InvalidSource(wires::GridCell),
+    InvalidDestination(wires::GridCell),
+    InvalidDestinationSlot(wires::GridCell),
+}
+
+#[derive(Clone)]
+struct CellEdit {
+    grid_cell: wires::GridCell,
+    arena_z: u32,
+    previous_cell: simulation::CellSnapshot,
+    previous_charge_values: Vec<u8>,
+    new_cell: simulation::CellSnapshot,
+    new_charge_values: Vec<u8>,
+}
+
+#[derive(Clone)]
+pub struct WireRemovalPlan {
+    removed_edges: Vec<wire_render::StoredWireEdge>,
+    cell_edits: Vec<CellEdit>,
+}
+
+#[derive(Clone)]
+pub struct WireCommitPlan {
+    added_edge: wire_render::StoredWireEdge,
+    cell_edits: Vec<CellEdit>,
+    replaced_inputs: Vec<WireRemovalPlan>,
+}
+
+#[derive(Clone, Copy)]
+struct EndpointResolution {
+    grid_cell: wires::GridCell,
+    arena_z: u32,
+    snapshot: simulation::CellSnapshot,
+    effective_kind: ConnectionCellKind,
+}
+
+#[derive(Clone, Copy)]
+struct InvalidConnectionFeedback {
+    grid_cell: wires::GridCell,
+    remaining_frames: u32,
+    shake_step: usize,
 }
 
 impl<T> Default for EditorHistory<T> {
@@ -220,6 +297,7 @@ impl EditorSession {
             ui: EditorUi::new(tool_preview_textures),
             history: EditorHistory::default(),
             previous_tool: EditorTool::Wire,
+            invalid_connection_feedback: None,
         }
     }
 
@@ -233,6 +311,49 @@ impl EditorSession {
 
     pub fn show(&mut self, ctx: &egui::Context, displayed_arena_z: u32) -> bool {
         self.ui.show(ctx, displayed_arena_z, &self.history)
+    }
+
+    pub fn advance_visual_feedback(&mut self) {
+        let Some(mut feedback) = self.invalid_connection_feedback else {
+            return;
+        };
+
+        feedback.remaining_frames = feedback.remaining_frames.saturating_sub(1);
+        feedback.shake_step += 1;
+        if feedback.remaining_frames == 0 {
+            self.invalid_connection_feedback = None;
+        } else {
+            self.invalid_connection_feedback = Some(feedback);
+        }
+    }
+
+    pub fn camera_with_feedback(&self, mut camera: render::CameraState) -> render::CameraState {
+        let Some(feedback) = self.invalid_connection_feedback else {
+            return camera;
+        };
+
+        let [dx, dy] = INVALID_CONNECTION_SHAKE_PATTERN
+            [feedback.shake_step % INVALID_CONNECTION_SHAKE_PATTERN.len()];
+        camera.pan_by([dx, dy]);
+        camera
+    }
+
+    pub fn hover_preview_state(
+        &self,
+        camera: render::CameraState,
+        cursor_position: Option<[f32; 2]>,
+        visible: bool,
+    ) -> Option<render::HoverPreviewState> {
+        if let Some(feedback) = self.invalid_connection_feedback {
+            return Some(render::HoverPreviewState {
+                cell: [feedback.grid_cell.x, feedback.grid_cell.y],
+                circuit: simulation::CellSnapshot::empty().words,
+                charge: 0,
+                overlay: INVALID_CONNECTION_OVERLAY,
+            });
+        }
+
+        hover_preview_state_with_visibility(camera, cursor_position, self.selected_tool(), visible)
     }
 
     pub fn sync_tool_state(
@@ -287,6 +408,7 @@ impl EditorSession {
 
     pub fn finish_wire_attempt(
         &mut self,
+        simulation: &simulation::BoardTextures,
         component: &mut wire_render::WireRenderInfo,
         wire_overlay: &mut wires::WireOverlay,
         device: &wgpu::Device,
@@ -295,10 +417,19 @@ impl EditorSession {
         let Some(draft) = wire_overlay.current_draft() else {
             return false;
         };
-        let Some(edge) = wire_overlay.commit_draft(device, queue, self.ui.selected_wire_color())
-        else {
+
+        let Some(edge) = stored_edge_from_draft(&draft, self.ui.selected_wire_color()) else {
             wire_overlay.restore_draft(device, queue, None);
             return false;
+        };
+
+        let plan = match plan_wire_commit(simulation, component, device, queue, edge) {
+            Ok(plan) => plan,
+            Err(error) => {
+                wire_overlay.restore_draft(device, queue, Some(&draft));
+                self.record_invalid_connection(error);
+                return false;
+            }
         };
 
         let previous_draft = self
@@ -311,10 +442,10 @@ impl EditorSession {
             })
             .unwrap_or(Some(draft.clone()));
 
-        component.add_wire_edge(edge.clone());
-        sync_component_wires(wire_overlay, component, device, queue);
+        apply_wire_commit_plan(&plan, simulation, component, wire_overlay, device, queue);
+        wire_overlay.restore_draft(device, queue, None);
         self.history.push(EditorAction::CommitWire {
-            edge,
+            plan,
             previous_draft,
         });
         true
@@ -364,21 +495,18 @@ impl EditorSession {
 
         match self.selected_tool() {
             EditorTool::Wire => {
-                let Some(point) = wires::cursor_to_board_point(
-                    camera,
-                    cursor,
-                    [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
-                ) else {
-                    return false;
-                };
-
                 let had_draft = wire_overlay.has_draft();
+                let point = if had_draft {
+                    center_point_for_cell(source)
+                } else {
+                    snap_source_draft_point(simulation, device, queue, source, displayed_arena_z)
+                };
                 self.update_draft(wire_overlay, |overlay| {
                     overlay.add_point(device, queue, displayed_arena_z, point, source);
                 });
 
                 if had_draft && !extend_wire {
-                    self.finish_wire_attempt(component, wire_overlay, device, queue)
+                    self.finish_wire_attempt(simulation, component, wire_overlay, device, queue)
                 } else {
                     true
                 }
@@ -460,6 +588,19 @@ impl EditorSession {
         self.history
             .push(EditorAction::UpdateDraft { before, after });
         true
+    }
+
+    fn record_invalid_connection(&mut self, error: WireConnectionError) {
+        let grid_cell = match error {
+            WireConnectionError::InvalidSource(grid_cell)
+            | WireConnectionError::InvalidDestination(grid_cell)
+            | WireConnectionError::InvalidDestinationSlot(grid_cell) => grid_cell,
+        };
+        self.invalid_connection_feedback = Some(InvalidConnectionFeedback {
+            grid_cell,
+            remaining_frames: INVALID_CONNECTION_FEEDBACK_FRAMES,
+            shake_step: 0,
+        });
     }
 }
 
@@ -670,8 +811,30 @@ pub fn hover_preview_state_with_visibility(
 
     Some(render::HoverPreviewState {
         cell: [grid_cell.x, grid_cell.y],
-        circuit: snapshot_for_tool(tool)?.bytes,
+        circuit: snapshot_for_tool(tool)?.words,
         charge: charge_values_for_tool(tool).into_iter().next().unwrap_or(0),
+        overlay: [0.0, 0.0, 0.0, 0.0],
+    })
+}
+
+fn stored_edge_from_draft(
+    draft: &wires::DraftWire,
+    color: [f32; 4],
+) -> Option<wire_render::StoredWireEdge> {
+    if draft.points.len() < 2 {
+        return None;
+    }
+
+    let destination = draft.points.last().copied().map(|point| wires::GridCell {
+        x: point.x.floor() as u32,
+        y: point.y.floor() as u32,
+    })?;
+
+    Some(wire_render::StoredWireEdge {
+        source_id: wire_render::WireEndpointId::from_grid_cell(draft.source, draft.arena_z),
+        destination_id: wire_render::WireEndpointId::from_grid_cell(destination, draft.arena_z),
+        points: draft.points.clone(),
+        color,
     })
 }
 
@@ -707,8 +870,9 @@ fn delete_at_cursor(
     )?;
 
     if let Some(edge) = component.remove_wire_at_point(displayed_arena_z, point) {
-        sync_component_wires(wire_overlay, component, device, queue);
-        Some(EditorAction::DeleteWire(edge))
+        let plan = plan_wire_removal(simulation, component, device, queue, edge);
+        apply_wire_removal_plan(&plan, simulation, component, wire_overlay, device, queue);
+        Some(EditorAction::DeleteWire(plan))
     } else {
         let cell = simulation.read_cell(device, queue, grid_cell, displayed_arena_z);
         let charge_values = (0..simulation::CHARGE_BUFFER_COUNT)
@@ -723,7 +887,7 @@ fn delete_at_cursor(
                 ))
             })
             .collect::<Vec<_>>();
-        if cell.bytes == [0, 0, 0, 0] && charge_values.iter().all(|value| *value == 0) {
+        if cell.kind() == simulation::CellKind::Empty && charge_values.iter().all(|value| *value == 0) {
             return None;
         }
         simulation.clear_cell(queue, grid_cell, displayed_arena_z);
@@ -849,14 +1013,12 @@ fn apply_action(
         EditorAction::UpdateDraft { after, .. } => {
             wire_overlay.restore_draft(device, queue, after.as_ref());
         }
-        EditorAction::CommitWire { edge, .. } => {
-            component.add_wire_edge(edge.clone());
-            sync_component_wires(wire_overlay, component, device, queue);
+        EditorAction::CommitWire { plan, .. } => {
+            apply_wire_commit_plan(plan, simulation, component, wire_overlay, device, queue);
             wire_overlay.restore_draft(device, queue, None);
         }
-        EditorAction::DeleteWire(edge) => {
-            component.remove_matching_wire_edge(edge);
-            sync_component_wires(wire_overlay, component, device, queue);
+        EditorAction::DeleteWire(plan) => {
+            apply_wire_removal_plan(plan, simulation, component, wire_overlay, device, queue);
         }
         EditorAction::PlaceCell {
             grid_cell,
@@ -896,17 +1058,12 @@ fn apply_inverse_action(
         EditorAction::UpdateDraft { before, .. } => {
             wire_overlay.restore_draft(device, queue, before.as_ref());
         }
-        EditorAction::CommitWire {
-            edge,
-            previous_draft,
-        } => {
-            component.remove_matching_wire_edge(edge);
-            sync_component_wires(wire_overlay, component, device, queue);
+        EditorAction::CommitWire { plan, previous_draft } => {
+            undo_wire_commit_plan(plan, simulation, component, wire_overlay, device, queue);
             wire_overlay.restore_draft(device, queue, previous_draft.as_ref());
         }
-        EditorAction::DeleteWire(edge) => {
-            component.add_wire_edge(edge.clone());
-            sync_component_wires(wire_overlay, component, device, queue);
+        EditorAction::DeleteWire(plan) => {
+            undo_wire_removal_plan(plan, simulation, component, wire_overlay, device, queue);
         }
         EditorAction::PlaceCell {
             grid_cell,
@@ -943,6 +1100,594 @@ fn apply_inverse_action(
                 );
             }
         }
+    }
+}
+
+fn plan_wire_commit(
+    simulation: &simulation::BoardTextures,
+    component: &wire_render::WireRenderInfo,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    mut edge: wire_render::StoredWireEdge,
+) -> Result<WireCommitPlan, WireConnectionError> {
+    // The wire editor is now explicit about the logical decision tree:
+    // 1. Resolve the source tile. Empty tiles are promoted to NO-OP so they can emit a signal.
+    // 2. Resolve the destination tile. Empty tiles are promoted to NO-OP so they can accept one.
+    // 3. Resolve which destination input this wire is targeting from the wire endpoint geometry.
+    // 4. If that input is already occupied, remove the previous logical chain upstream through
+    //    disposable NO-OPs before the new wire is attached.
+    let mut cell_edits = Vec::new();
+    let source = resolve_endpoint(
+        simulation,
+        device,
+        queue,
+        edge.source_id.as_grid_cell(),
+        edge.source_id.arena_z,
+        EndpointRole::Source,
+        &mut cell_edits,
+    )?;
+    let destination = resolve_endpoint(
+        simulation,
+        device,
+        queue,
+        edge.destination_id.as_grid_cell(),
+        edge.destination_id.arena_z,
+        EndpointRole::Destination,
+        &mut cell_edits,
+    )?;
+
+    validate_source_endpoint_kind(source.effective_kind, source.grid_cell)?;
+    let destination_slot = destination_input_slot_for_edge(&edge, destination)
+        .ok_or(WireConnectionError::InvalidDestinationSlot(destination.grid_cell))?;
+    snap_edge_endpoints(&mut edge, source, destination, destination_slot);
+
+    let mut replaced_inputs = Vec::new();
+    for conflict in conflicting_edges_for_slot(component, destination, destination_slot) {
+        replaced_inputs.push(plan_wire_removal(
+            simulation,
+            component,
+            device,
+            queue,
+            conflict,
+        ));
+    }
+
+    cell_edits.push(cell_edit_for_destination_input(
+        simulation,
+        device,
+        queue,
+        destination,
+        destination_slot,
+        source.grid_cell,
+    ));
+
+    Ok(WireCommitPlan {
+        added_edge: edge,
+        cell_edits,
+        replaced_inputs,
+    })
+}
+
+fn resolve_endpoint(
+    simulation: &simulation::BoardTextures,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    grid_cell: wires::GridCell,
+    arena_z: u32,
+    role: EndpointRole,
+    cell_edits: &mut Vec<CellEdit>,
+) -> Result<EndpointResolution, WireConnectionError> {
+    let original_snapshot = simulation.read_cell(device, queue, grid_cell, arena_z);
+    let (snapshot, effective_kind) = match classify_connection_cell(original_snapshot) {
+        Some(kind) => (original_snapshot, kind),
+        None if original_snapshot.is_empty() => {
+            let promoted_snapshot = simulation::CellSnapshot::noop();
+            cell_edits.push(cell_edit_for_snapshot_change(
+                simulation,
+                device,
+                queue,
+                grid_cell,
+                arena_z,
+                original_snapshot,
+                promoted_snapshot,
+            ));
+            (promoted_snapshot, ConnectionCellKind::Noop)
+        }
+        None => {
+            return Err(match role {
+                EndpointRole::Source => WireConnectionError::InvalidSource(grid_cell),
+                EndpointRole::Destination => WireConnectionError::InvalidDestination(grid_cell),
+            });
+        }
+    };
+
+    Ok(EndpointResolution {
+        grid_cell,
+        arena_z,
+        snapshot,
+        effective_kind,
+    })
+}
+
+fn classify_connection_cell(snapshot: simulation::CellSnapshot) -> Option<ConnectionCellKind> {
+    match snapshot.kind() {
+        simulation::CellKind::Empty => None,
+        simulation::CellKind::Source => Some(ConnectionCellKind::Source),
+        simulation::CellKind::Noop => Some(ConnectionCellKind::Noop),
+        simulation::CellKind::Not => Some(ConnectionCellKind::UnaryGate),
+        simulation::CellKind::And
+        | simulation::CellKind::Or
+        | simulation::CellKind::Xor
+        | simulation::CellKind::Nand
+        | simulation::CellKind::Nor
+        | simulation::CellKind::Xnor => Some(ConnectionCellKind::BinaryGate),
+    }
+}
+
+fn validate_source_endpoint_kind(
+    source_kind: ConnectionCellKind,
+    _grid_cell: wires::GridCell,
+) -> Result<(), WireConnectionError> {
+    match source_kind {
+        ConnectionCellKind::Source
+        | ConnectionCellKind::Noop
+        | ConnectionCellKind::UnaryGate
+        | ConnectionCellKind::BinaryGate => Ok(()),
+    }
+}
+
+fn destination_input_slot_for_edge(
+    edge: &wire_render::StoredWireEdge,
+    destination: EndpointResolution,
+) -> Option<DestinationInputSlot> {
+    let destination_x = destination.grid_cell.x as f32;
+    let destination_y = destination.grid_cell.y as f32;
+    let end_point = edge.points.last().copied()?;
+    let local_x = (end_point.x - destination_x).clamp(0.0, 0.999);
+    let local_y = (end_point.y - destination_y).clamp(0.0, 0.999);
+
+    match destination.effective_kind {
+        ConnectionCellKind::Noop | ConnectionCellKind::UnaryGate => {
+            // Unary destinations only have one logical input, so any snapped hit on the tile
+            // resolves to that single input.
+            let _ = local_x;
+            Some(DestinationInputSlot::Inline)
+        }
+        ConnectionCellKind::BinaryGate => {
+            if local_y < 0.5 {
+                Some(DestinationInputSlot::Upper)
+            } else {
+                Some(DestinationInputSlot::Lower)
+            }
+        }
+        ConnectionCellKind::Source => None,
+    }
+}
+
+fn conflicting_edges_for_slot(
+    component: &wire_render::WireRenderInfo,
+    destination: EndpointResolution,
+    destination_slot: DestinationInputSlot,
+) -> Vec<wire_render::StoredWireEdge> {
+    component
+        .wire_edges()
+        .filter(|edge| {
+            edge.destination_id == wire_render::WireEndpointId::from_grid_cell(destination.grid_cell, edge.destination_id.arena_z)
+                && destination_input_slot_for_edge(edge, destination)
+                    == Some(destination_slot)
+        })
+        .cloned()
+        .collect()
+}
+
+fn cell_edit_for_destination_input(
+    simulation: &simulation::BoardTextures,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    destination: EndpointResolution,
+    destination_slot: DestinationInputSlot,
+    source_grid_cell: wires::GridCell,
+) -> CellEdit {
+    let new_snapshot = snapshot_with_destination_input(
+        destination.snapshot,
+        destination_slot,
+        Some(source_grid_cell),
+    );
+    cell_edit_for_snapshot_change(
+        simulation,
+        device,
+        queue,
+        destination.grid_cell,
+        destination.arena_z,
+        destination.snapshot,
+        new_snapshot,
+    )
+}
+
+fn cell_edit_for_destination_input_clear(
+    simulation: &simulation::BoardTextures,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    destination: EndpointResolution,
+    destination_slot: DestinationInputSlot,
+    source_grid_cell: wires::GridCell,
+) -> CellEdit {
+    let current_source = destination_input_for_slot(destination.snapshot, destination_slot);
+    let new_snapshot = if current_source == Some(source_grid_cell) {
+        snapshot_with_destination_input(destination.snapshot, destination_slot, None)
+    } else {
+        destination.snapshot
+    };
+    cell_edit_for_snapshot_change(
+        simulation,
+        device,
+        queue,
+        destination.grid_cell,
+        destination.arena_z,
+        destination.snapshot,
+        new_snapshot,
+    )
+}
+
+fn destination_input_for_slot(
+    snapshot: simulation::CellSnapshot,
+    destination_slot: DestinationInputSlot,
+) -> Option<wires::GridCell> {
+    match destination_slot {
+        DestinationInputSlot::Inline | DestinationInputSlot::Upper => snapshot.primary_input(),
+        DestinationInputSlot::Lower => snapshot.secondary_input(),
+    }
+}
+
+fn snapshot_with_destination_input(
+    mut snapshot: simulation::CellSnapshot,
+    destination_slot: DestinationInputSlot,
+    source_grid_cell: Option<wires::GridCell>,
+) -> simulation::CellSnapshot {
+    let packed = source_grid_cell
+        .map(simulation::pack_input_ref)
+        .unwrap_or(simulation::INVALID_INPUT_REF);
+    match destination_slot {
+        DestinationInputSlot::Inline | DestinationInputSlot::Upper => {
+            snapshot.words[1] = packed;
+        }
+        DestinationInputSlot::Lower => {
+            snapshot.words[2] = packed;
+        }
+    }
+    snapshot
+}
+
+fn snap_edge_endpoints(
+    edge: &mut wire_render::StoredWireEdge,
+    source: EndpointResolution,
+    destination: EndpointResolution,
+    destination_slot: DestinationInputSlot,
+) {
+    if let Some(first) = edge.points.first_mut() {
+        *first = output_anchor_for_cell(source.grid_cell, source.effective_kind);
+    }
+    if let Some(last) = edge.points.last_mut() {
+        *last = input_anchor_for_cell(destination.grid_cell, destination.effective_kind, destination_slot);
+    }
+}
+
+fn output_anchor_for_cell(
+    grid_cell: wires::GridCell,
+    cell_kind: ConnectionCellKind,
+) -> wires::WirePoint {
+    let x = grid_cell.x as f32;
+    let y = grid_cell.y as f32;
+    let anchor_x = match cell_kind {
+        ConnectionCellKind::Source => 0.73,
+        ConnectionCellKind::Noop | ConnectionCellKind::UnaryGate | ConnectionCellKind::BinaryGate => 0.885,
+    };
+    wires::WirePoint {
+        x: x + anchor_x,
+        y: y + 0.5,
+    }
+}
+
+fn input_anchor_for_cell(
+    grid_cell: wires::GridCell,
+    cell_kind: ConnectionCellKind,
+    destination_slot: DestinationInputSlot,
+) -> wires::WirePoint {
+    let x = grid_cell.x as f32;
+    let y = grid_cell.y as f32;
+    match (cell_kind, destination_slot) {
+        (ConnectionCellKind::BinaryGate, DestinationInputSlot::Lower) => wires::WirePoint {
+            x: x + 0.11,
+            y: y + 0.76,
+        },
+        _ => wires::WirePoint {
+            x: x + 0.11,
+            y: y + if matches!(destination_slot, DestinationInputSlot::Upper) { 0.24 } else { 0.5 },
+        },
+    }
+}
+
+fn center_point_for_cell(grid_cell: wires::GridCell) -> wires::WirePoint {
+    wires::WirePoint {
+        x: grid_cell.x as f32 + 0.5,
+        y: grid_cell.y as f32 + 0.5,
+    }
+}
+
+fn snap_source_draft_point(
+    simulation: &simulation::BoardTextures,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    grid_cell: wires::GridCell,
+    arena_z: u32,
+) -> wires::WirePoint {
+    let snapshot = simulation.read_cell(device, queue, grid_cell, arena_z);
+    let kind = classify_connection_cell(snapshot).unwrap_or(ConnectionCellKind::Noop);
+    output_anchor_for_cell(grid_cell, kind)
+}
+
+fn plan_wire_removal(
+    simulation: &simulation::BoardTextures,
+    component: &wire_render::WireRenderInfo,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    edge: wire_render::StoredWireEdge,
+) -> WireRemovalPlan {
+    let mut plan = WireRemovalPlan {
+        removed_edges: Vec::new(),
+        cell_edits: Vec::new(),
+    };
+
+    let destination_grid_cell = edge.destination_id.as_grid_cell();
+    let destination_snapshot = simulation.read_cell(device, queue, destination_grid_cell, edge.destination_id.arena_z);
+    if let Some(destination_kind) = classify_connection_cell(destination_snapshot) {
+        let destination = EndpointResolution {
+            grid_cell: destination_grid_cell,
+            arena_z: edge.destination_id.arena_z,
+            snapshot: destination_snapshot,
+            effective_kind: destination_kind,
+        };
+        if let Some(destination_slot) = destination_input_slot_for_edge(&edge, destination) {
+            plan.cell_edits.push(cell_edit_for_destination_input_clear(
+                simulation,
+                device,
+                queue,
+                destination,
+                destination_slot,
+                edge.source_id.as_grid_cell(),
+            ));
+        }
+    }
+
+    remove_wire_chain_one_hop_at_a_time(
+        simulation,
+        component,
+        device,
+        queue,
+        edge,
+        &mut plan,
+    );
+    plan
+}
+
+fn remove_wire_chain_one_hop_at_a_time(
+    simulation: &simulation::BoardTextures,
+    component: &wire_render::WireRenderInfo,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    edge: wire_render::StoredWireEdge,
+    plan: &mut WireRemovalPlan,
+) {
+    if plan.removed_edges.iter().any(|planned| planned == &edge) {
+        return;
+    }
+
+    let Some(removed_edge) = component.wire_edges().find(|candidate| *candidate == &edge).cloned() else {
+        return;
+    };
+
+    plan.removed_edges.push(removed_edge.clone());
+    cleanup_orphaned_noop_source(
+        simulation,
+        component,
+        device,
+        queue,
+        removed_edge.source_id,
+        plan,
+    );
+}
+
+fn cleanup_orphaned_noop_source(
+    simulation: &simulation::BoardTextures,
+    component: &wire_render::WireRenderInfo,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    source_id: wire_render::WireEndpointId,
+    plan: &mut WireRemovalPlan,
+) {
+    let grid_cell = source_id.as_grid_cell();
+    let snapshot = simulation.read_cell(device, queue, grid_cell, source_id.arena_z);
+    if snapshot.kind() != simulation::CellKind::Noop {
+        return;
+    }
+
+    let has_outgoing = component.wire_edges().any(|edge| {
+        edge.source_id == source_id && !plan.removed_edges.iter().any(|planned| planned == edge)
+    });
+    let incoming_edges: Vec<_> = component
+        .wire_edges()
+        .filter(|edge| {
+            edge.destination_id == source_id
+                && !plan.removed_edges.iter().any(|planned| planned == *edge)
+        })
+        .cloned()
+        .collect();
+
+    if has_outgoing || incoming_edges.len() > 1 {
+        return;
+    }
+
+    // We only delete auto-routable pass-through chains. Once a NO-OP still fans out or merges,
+    // we stop walking so shared routing survives.
+    plan.cell_edits.push(cell_edit_for_snapshot_change(
+        simulation,
+        device,
+        queue,
+        grid_cell,
+        source_id.arena_z,
+        snapshot,
+        simulation::CellSnapshot::empty(),
+    ));
+
+    if let Some(upstream_edge) = incoming_edges.into_iter().next() {
+        remove_wire_chain_one_hop_at_a_time(
+            simulation,
+            component,
+            device,
+            queue,
+            upstream_edge,
+            plan,
+        );
+    }
+}
+
+fn cell_edit_for_snapshot_change(
+    simulation: &simulation::BoardTextures,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    grid_cell: wires::GridCell,
+    arena_z: u32,
+    previous_cell: simulation::CellSnapshot,
+    new_cell: simulation::CellSnapshot,
+) -> CellEdit {
+    CellEdit {
+        grid_cell,
+        arena_z,
+        previous_cell,
+        previous_charge_values: read_charge_values_for_cell(simulation, device, queue, grid_cell, arena_z),
+        new_cell,
+        new_charge_values: vec![0x00; simulation::CHARGE_BUFFER_COUNT as usize],
+    }
+}
+
+fn read_charge_values_for_cell(
+    simulation: &simulation::BoardTextures,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    grid_cell: wires::GridCell,
+    arena_z: u32,
+) -> Vec<u8> {
+    (0..simulation::CHARGE_BUFFER_COUNT)
+        .map(|buffer_index| {
+            pollster::block_on(simulation.read_charge_value(
+                device,
+                queue,
+                buffer_index,
+                grid_cell.x,
+                grid_cell.y,
+                arena_z,
+            ))
+        })
+        .collect()
+}
+
+fn apply_wire_commit_plan(
+    plan: &WireCommitPlan,
+    simulation: &simulation::BoardTextures,
+    component: &mut wire_render::WireRenderInfo,
+    wire_overlay: &mut wires::WireOverlay,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) {
+    apply_cell_edits(&plan.cell_edits, simulation, device, queue);
+    for removal in &plan.replaced_inputs {
+        apply_wire_removal_plan(removal, simulation, component, wire_overlay, device, queue);
+    }
+    component.add_wire_edge(plan.added_edge.clone());
+    sync_component_wires(wire_overlay, component, device, queue);
+}
+
+fn undo_wire_commit_plan(
+    plan: &WireCommitPlan,
+    simulation: &simulation::BoardTextures,
+    component: &mut wire_render::WireRenderInfo,
+    wire_overlay: &mut wires::WireOverlay,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) {
+    component.remove_matching_wire_edge(&plan.added_edge);
+    for removal in plan.replaced_inputs.iter().rev() {
+        undo_wire_removal_plan(removal, simulation, component, wire_overlay, device, queue);
+    }
+    revert_cell_edits(&plan.cell_edits, simulation, device, queue);
+    sync_component_wires(wire_overlay, component, device, queue);
+}
+
+fn apply_wire_removal_plan(
+    plan: &WireRemovalPlan,
+    simulation: &simulation::BoardTextures,
+    component: &mut wire_render::WireRenderInfo,
+    wire_overlay: &mut wires::WireOverlay,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) {
+    for edge in &plan.removed_edges {
+        component.remove_matching_wire_edge(edge);
+    }
+    apply_cell_edits(&plan.cell_edits, simulation, device, queue);
+    sync_component_wires(wire_overlay, component, device, queue);
+}
+
+fn undo_wire_removal_plan(
+    plan: &WireRemovalPlan,
+    simulation: &simulation::BoardTextures,
+    component: &mut wire_render::WireRenderInfo,
+    wire_overlay: &mut wires::WireOverlay,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) {
+    revert_cell_edits(&plan.cell_edits, simulation, device, queue);
+    for edge in plan.removed_edges.iter().rev() {
+        component.add_wire_edge(edge.clone());
+    }
+    sync_component_wires(wire_overlay, component, device, queue);
+}
+
+fn apply_cell_edits(
+    edits: &[CellEdit],
+    simulation: &simulation::BoardTextures,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) {
+    for edit in edits {
+        simulation.write_cell(queue, edit.grid_cell, edit.arena_z, edit.new_cell);
+        write_charge_values(
+            simulation,
+            device,
+            queue,
+            edit.grid_cell,
+            edit.arena_z,
+            &edit.new_charge_values,
+        );
+    }
+}
+
+fn revert_cell_edits(
+    edits: &[CellEdit],
+    simulation: &simulation::BoardTextures,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) {
+    for edit in edits.iter().rev() {
+        simulation.write_cell(queue, edit.grid_cell, edit.arena_z, edit.previous_cell);
+        write_charge_values(
+            simulation,
+            device,
+            queue,
+            edit.grid_cell,
+            edit.arena_z,
+            &edit.previous_charge_values,
+        );
     }
 }
 
@@ -1461,8 +2206,8 @@ mod tests {
             return;
         };
 
-        let first = wires::GridCell { x: 2, y: 2 };
-        let second = wires::GridCell { x: 5, y: 2 };
+        let first = wires::GridCell { x: 2, y: 0 };
+        let second = wires::GridCell { x: 3, y: 0 };
 
         assert!(session.handle_left_click(
             &simulation,
@@ -1565,8 +2310,8 @@ mod tests {
             return;
         };
 
-        let first = wires::GridCell { x: 2, y: 2 };
-        let second = wires::GridCell { x: 5, y: 2 };
+        let first = wires::GridCell { x: 2, y: 0 };
+        let second = wires::GridCell { x: 3, y: 0 };
 
         assert!(session.handle_left_click(
             &simulation,
@@ -1645,11 +2390,17 @@ mod tests {
             &device,
             &queue,
             camera,
-            cursor_for_cell(wires::GridCell { x: 4, y: 1 }),
+            cursor_for_cell(wires::GridCell { x: 2, y: 1 }),
             0,
             true,
         ));
-        assert!(session.finish_wire_attempt(&mut component, &mut wire_overlay, &device, &queue));
+        assert!(session.finish_wire_attempt(
+            &simulation,
+            &mut component,
+            &mut wire_overlay,
+            &device,
+            &queue,
+        ));
 
         let wire = component.wire_edges().next().unwrap();
         assert_eq!(wire.color, selected_color);

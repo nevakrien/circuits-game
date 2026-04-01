@@ -37,18 +37,64 @@ pub fn starter_component() -> DemoComponent {
         cells: vec![
             placed_cell(0, 0, CellSnapshot::source(0xff)),
             placed_cell(0, 2, CellSnapshot::source(0x00)),
-            placed_cell(1, 1, CellSnapshot::gate(GateKind::And)),
-            placed_cell(2, 1, CellSnapshot::noop()),
+            placed_cell(
+                1,
+                1,
+                CellSnapshot::gate(GateKind::And)
+                    .with_primary_input(GridCell { x: 0, y: 0 })
+                    .with_secondary_input(GridCell { x: 0, y: 2 }),
+            ),
+            placed_cell(
+                2,
+                1,
+                CellSnapshot::noop().with_primary_input(GridCell { x: 1, y: 1 }),
+            ),
             placed_cell(2, 3, CellSnapshot::source(0xff)),
-            placed_cell(3, 2, CellSnapshot::gate(GateKind::Or)),
-            placed_cell(4, 2, CellSnapshot::noop()),
+            placed_cell(
+                3,
+                2,
+                CellSnapshot::gate(GateKind::Or)
+                    .with_primary_input(GridCell { x: 2, y: 1 })
+                    .with_secondary_input(GridCell { x: 2, y: 3 }),
+            ),
+            placed_cell(
+                4,
+                2,
+                CellSnapshot::noop().with_primary_input(GridCell { x: 3, y: 2 }),
+            ),
             placed_cell(4, 4, CellSnapshot::source(0xff)),
             placed_cell(5, 0, CellSnapshot::source(0xff)),
-            placed_cell(5, 2, CellSnapshot::gate(GateKind::Not)),
-            placed_cell(5, 3, CellSnapshot::gate(GateKind::Nand)),
-            placed_cell(6, 1, CellSnapshot::gate(GateKind::And)),
-            placed_cell(6, 3, CellSnapshot::noop()),
-            placed_cell(7, 2, CellSnapshot::gate(GateKind::Xnor)),
+            placed_cell(
+                5,
+                2,
+                CellSnapshot::gate(GateKind::Not).with_primary_input(GridCell { x: 4, y: 2 }),
+            ),
+            placed_cell(
+                5,
+                3,
+                CellSnapshot::gate(GateKind::Nand)
+                    .with_primary_input(GridCell { x: 4, y: 2 })
+                    .with_secondary_input(GridCell { x: 4, y: 4 }),
+            ),
+            placed_cell(
+                6,
+                1,
+                CellSnapshot::gate(GateKind::And)
+                    .with_primary_input(GridCell { x: 5, y: 0 })
+                    .with_secondary_input(GridCell { x: 5, y: 2 }),
+            ),
+            placed_cell(
+                6,
+                3,
+                CellSnapshot::noop().with_primary_input(GridCell { x: 5, y: 3 }),
+            ),
+            placed_cell(
+                7,
+                2,
+                CellSnapshot::gate(GateKind::Xnor)
+                    .with_primary_input(GridCell { x: 6, y: 1 })
+                    .with_secondary_input(GridCell { x: 6, y: 3 }),
+            ),
         ],
         wires: vec![
             wire(
@@ -159,18 +205,24 @@ mod tests {
         assert_eq!(
             component.cell_at(1, 1, 0),
             CellSnapshot::gate(GateKind::And)
+                .with_primary_input(GridCell { x: 0, y: 0 })
+                .with_secondary_input(GridCell { x: 0, y: 2 })
         );
         assert_eq!(
             component.cell_at(7, 2, 0),
             CellSnapshot::gate(GateKind::Xnor)
+                .with_primary_input(GridCell { x: 6, y: 1 })
+                .with_secondary_input(GridCell { x: 6, y: 3 })
         );
         assert_eq!(
             component.cell_at(5, 2, 0),
-            CellSnapshot::gate(GateKind::Not)
+            CellSnapshot::gate(GateKind::Not).with_primary_input(GridCell { x: 4, y: 2 })
         );
         assert_eq!(
             component.cell_at(6, 1, 0),
             CellSnapshot::gate(GateKind::And)
+                .with_primary_input(GridCell { x: 5, y: 0 })
+                .with_secondary_input(GridCell { x: 5, y: 2 })
         );
         assert_eq!(component.cell_at(7, 2, 1), CellSnapshot::empty());
         assert_eq!(component.wires.len(), 14);

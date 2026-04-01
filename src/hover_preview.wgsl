@@ -4,6 +4,7 @@ struct HoverPreviewParams {
     cell: vec4<u32>,
     circuit: vec4<u32>,
     charge: vec4<u32>,
+    overlay: vec4<f32>,
 }
 
 @group(0) @binding(0)
@@ -57,6 +58,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let color = render_cell_color(hover_params.cell.xy, local_uv, centered, hover_params.charge.x, hover_params.circuit);
 
     let border = select(0.0, 1.0, any(local_uv < vec2(0.035, 0.035)) || any(local_uv > vec2(0.965, 0.965)));
-    let final_color = mix(color, vec3(0.95, 0.98, 1.0), border * 0.28);
-    return vec4(final_color, 0.58);
+    var final_color = mix(color, vec3(0.95, 0.98, 1.0), border * 0.28);
+    final_color = mix(final_color, hover_params.overlay.rgb, hover_params.overlay.a);
+    return vec4(final_color, max(0.58, hover_params.overlay.a));
 }

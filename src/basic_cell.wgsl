@@ -72,10 +72,7 @@ fn update_noop(
 ) -> u32 {
     _ = current_charge;
     _ = circuit;
-    _ = payload;
-
-    let src = vec3u(max(coord.x, 1u) - 1u, coord.y, coord.z);
-    return read_byte(history, min(src, dims - vec3u(1u, 1u, 1u))) & 0xffu;
+    return read_input_charge(dims, coord, payload.x);
 }
 
 fn update_source(
@@ -100,6 +97,23 @@ fn read_bool(coord: vec3<u32>) -> bool {
     return (read_byte(history, coord) & 0xffu) != 0u;
 }
 
+fn decode_same_layer_input(input_ref: u32, coord: vec3<u32>) -> vec3<u32> {
+    return vec3u(input_ref & 0xffffu, (input_ref >> 16u) & 0xffffu, coord.z);
+}
+
+fn read_input_charge(dims: vec3<u32>, coord: vec3<u32>, input_ref: u32) -> u32 {
+    if (input_ref == 0xffffffffu) {
+        return 0u;
+    }
+
+    let src = min(decode_same_layer_input(input_ref, coord), dims - vec3u(1u, 1u, 1u));
+    return read_byte(history, src) & 0xffu;
+}
+
+fn read_input_bool(dims: vec3<u32>, coord: vec3<u32>, input_ref: u32) -> bool {
+    return read_input_charge(dims, coord, input_ref) != 0u;
+}
+
 fn update_not(
     dims: vec3<u32>,
     coord: vec3<u32>,
@@ -109,10 +123,7 @@ fn update_not(
 ) -> u32 {
     _ = current_charge;
     _ = circuit;
-    _ = payload;
-
-    let src = vec3u(max(coord.x, 1u) - 1u, coord.y, coord.z);
-    return charge_bool(!read_bool(min(src, dims - vec3u(1u, 1u, 1u))));
+    return charge_bool(!read_input_bool(dims, coord, payload.x));
 }
 
 fn update_binary_gate(
@@ -123,11 +134,8 @@ fn update_binary_gate(
     payload: vec3<u32>,
 ) -> u32 {
     _ = current_charge;
-    _ = payload;
-
-    let sample_x = max(coord.x, 1u) - 1u;
-    let lhs = read_bool(vec3u(sample_x, max(coord.y, 1u) - 1u, coord.z));
-    let rhs = read_bool(vec3u(sample_x, min(coord.y + 1u, dims.y - 1u), coord.z));
+    let lhs = read_input_bool(dims, coord, payload.x);
+    let rhs = read_input_bool(dims, coord, payload.y);
 
     switch (circuit.x & 0xffu) {
         case 4u: {
@@ -205,7 +213,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
             let current_charge = read_byte(history, coord) & 0xffu;
             let circuit = textureLoad(circuits, vec3<i32>(coord), 0);
-            let payload = circuit.yzw & vec3u(0xffu, 0xffu, 0xffu);
+            let payload = circuit.yzw;
             let next_charge = update_tag(dims, coord, current_charge, circuit, payload);
             store_byte(&next_packed, coord.xy, next_charge & 0xffu);
         }

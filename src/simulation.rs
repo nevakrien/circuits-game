@@ -12,7 +12,9 @@ const CHARGE_GRID_HEIGHT: u32 = GRID_HEIGHT.div_ceil(2);
 const CHARGE_TEXEL_SIZE: u32 = 4;
 
 const CHARGE_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Uint;
-const CIRCUIT_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Uint;
+const CIRCUIT_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Uint;
+const CIRCUIT_WORDS_PER_CELL: u32 = 4;
+pub const INVALID_INPUT_REF: u32 = u32::MAX;
 
 #[repr(u8)]
 #[derive(Clone, Copy)]
@@ -32,17 +34,32 @@ enum CircuitTag {
 #[derive(Clone, Copy)]
 struct CircuitCell {
     tag: CircuitTag,
-    data: [u8; 3],
+    data: [u32; 3],
 }
 
+#[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct CellSnapshot {
-    // One circuit cell is encoded into one RGBA texel.
-    pub bytes: [u8; 4],
+    // One circuit cell is encoded into one RGBA texel of u32 words.
+    pub words: [u32; 4],
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GateKind {
+    Not,
+    And,
+    Or,
+    Xor,
+    Nand,
+    Nor,
+    Xnor,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CellKind {
+    Empty,
+    Source,
+    Noop,
     Not,
     And,
     Or,
@@ -187,10 +204,10 @@ impl BoardTextures {
                 },
                 aspect: wgpu::TextureAspect::All,
             },
-            bytemuck::cast_slice(&[cell.bytes]),
+            bytemuck::cast_slice(&[cell.words]),
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(4),
+                bytes_per_row: Some(CIRCUIT_WORDS_PER_CELL * std::mem::size_of::<u32>() as u32),
                 rows_per_image: Some(1),
             },
             wgpu::Extent3d {
@@ -259,11 +276,12 @@ impl BoardTextures {
         receiver.recv().unwrap().unwrap();
 
         let mapped = slice.get_mapped_range();
-        let bytes = [mapped[0], mapped[1], mapped[2], mapped[3]];
+        let words = bytemuck::cast_slice::<u8, u32>(&mapped[..16]);
+        let words = [words[0], words[1], words[2], words[3]];
         drop(mapped);
         readback.unmap();
 
-        CellSnapshot { bytes }
+        CellSnapshot { words }
     }
 
     pub fn clear_charge_at(
@@ -543,7 +561,8 @@ fn seed_initial_charge(queue: &wgpu::Queue, texture: &wgpu::Texture) {
 }
 
 fn seed_circuits(queue: &wgpu::Queue, texture: &wgpu::Texture) {
-    let mut circuits = vec![[0u8; 4]; (GRID_WIDTH * GRID_HEIGHT * BOARD_LAYERS) as usize];
+    let mut circuits =
+        vec![CellSnapshot::empty().words; (GRID_WIDTH * GRID_HEIGHT * BOARD_LAYERS) as usize];
     let component = demo_scene::starter_component();
 
     for placed_cell in component.cells {
@@ -553,7 +572,7 @@ fn seed_circuits(queue: &wgpu::Queue, texture: &wgpu::Texture) {
             component.arena_z,
         );
         let cell = circuit_cell_from_snapshot(placed_cell.snapshot);
-        circuits[ix] = [cell.tag as u8, cell.data[0], cell.data[1], cell.data[2]];
+        circuits[ix] = [cell.tag as u32, cell.data[0], cell.data[1], cell.data[2]];
     }
 
     queue.write_texture(
@@ -566,7 +585,9 @@ fn seed_circuits(queue: &wgpu::Queue, texture: &wgpu::Texture) {
         bytemuck::cast_slice(&circuits),
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(GRID_WIDTH * 4),
+            bytes_per_row: Some(
+                GRID_WIDTH * CIRCUIT_WORDS_PER_CELL * std::mem::size_of::<u32>() as u32,
+            ),
             rows_per_image: Some(GRID_HEIGHT),
         },
         wgpu::Extent3d {
@@ -581,9 +602,24 @@ fn linear_index(x: u32, y: u32, z: u32) -> usize {
     (z * GRID_WIDTH * GRID_HEIGHT + y * GRID_WIDTH + x) as usize
 }
 
+pub fn pack_input_ref(grid_cell: GridCell) -> u32 {
+    ((grid_cell.y & 0xffff) << 16) | (grid_cell.x & 0xffff)
+}
+
+pub fn unpack_input_ref(input_ref: u32) -> Option<GridCell> {
+    if input_ref == INVALID_INPUT_REF {
+        return None;
+    }
+
+    Some(GridCell {
+        x: input_ref & 0xffff,
+        y: (input_ref >> 16) & 0xffff,
+    })
+}
+
 fn circuit_cell_from_snapshot(snapshot: CellSnapshot) -> CircuitCell {
     CircuitCell {
-        tag: match snapshot.bytes[0] {
+        tag: match snapshot.words[0] {
             0 => CircuitTag::Empty,
             1 => CircuitTag::Source,
             2 => CircuitTag::Noop,
@@ -596,14 +632,14 @@ fn circuit_cell_from_snapshot(snapshot: CellSnapshot) -> CircuitCell {
             9 => CircuitTag::Xnor,
             _ => CircuitTag::Empty,
         },
-        data: [snapshot.bytes[1], snapshot.bytes[2], snapshot.bytes[3]],
+        data: [snapshot.words[1], snapshot.words[2], snapshot.words[3]],
     }
 }
 
 impl CellSnapshot {
     fn from_cell(cell: CircuitCell) -> Self {
         Self {
-            bytes: [cell.tag as u8, cell.data[0], cell.data[1], cell.data[2]],
+            words: [cell.tag as u32, cell.data[0], cell.data[1], cell.data[2]],
         }
     }
 
@@ -619,6 +655,30 @@ impl CellSnapshot {
         Self::from_cell(noop_cell())
     }
 
+    pub fn with_primary_input(self, source: GridCell) -> Self {
+        let mut snapshot = self;
+        snapshot.words[1] = pack_input_ref(source);
+        snapshot
+    }
+
+    pub fn with_secondary_input(self, source: GridCell) -> Self {
+        let mut snapshot = self;
+        snapshot.words[2] = pack_input_ref(source);
+        snapshot
+    }
+
+    pub fn primary_input(self) -> Option<GridCell> {
+        unpack_input_ref(self.words[1])
+    }
+
+    pub fn secondary_input(self) -> Option<GridCell> {
+        unpack_input_ref(self.words[2])
+    }
+
+    pub fn source_value(self) -> u8 {
+        self.words[1] as u8
+    }
+
     pub fn gate(kind: GateKind) -> Self {
         let tag = match kind {
             GateKind::Not => CircuitTag::Not,
@@ -631,33 +691,52 @@ impl CellSnapshot {
         };
         Self::from_cell(gate_cell(tag))
     }
+
+    pub fn kind(self) -> CellKind {
+        match self.words[0] {
+            1 => CellKind::Source,
+            2 => CellKind::Noop,
+            3 => CellKind::Not,
+            4 => CellKind::And,
+            5 => CellKind::Or,
+            6 => CellKind::Xor,
+            7 => CellKind::Nand,
+            8 => CellKind::Nor,
+            9 => CellKind::Xnor,
+            _ => CellKind::Empty,
+        }
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.kind() == CellKind::Empty
+    }
 }
 
 fn empty_cell() -> CircuitCell {
     CircuitCell {
         tag: CircuitTag::Empty,
-        data: [0, 0, 0],
+        data: [INVALID_INPUT_REF, INVALID_INPUT_REF, 0],
     }
 }
 
 fn source_cell(value: u8) -> CircuitCell {
     CircuitCell {
         tag: CircuitTag::Source,
-        data: [value, 0, 0],
+        data: [u32::from(value), INVALID_INPUT_REF, 0],
     }
 }
 
 fn noop_cell() -> CircuitCell {
     CircuitCell {
         tag: CircuitTag::Noop,
-        data: [0, 0, 0],
+        data: [INVALID_INPUT_REF, INVALID_INPUT_REF, 0],
     }
 }
 
 fn gate_cell(tag: CircuitTag) -> CircuitCell {
     CircuitCell {
         tag,
-        data: [0, 0, 0],
+        data: [INVALID_INPUT_REF, INVALID_INPUT_REF, 0],
     }
 }
 
@@ -707,12 +786,18 @@ mod tests {
     ) -> u8 {
         let cell = circuit_cell_from_snapshot(component.cell_at(x, y, z));
 
+        let read_input = |input_ref: u32| {
+            unpack_input_ref(input_ref)
+                .map(|grid_cell| read_packed_charge(texels, grid_cell.x, grid_cell.y, z))
+                .unwrap_or(0)
+        };
+
         match cell.tag {
             CircuitTag::Empty => 0,
-            CircuitTag::Source => cell.data[0],
-            CircuitTag::Noop => read_packed_charge(texels, x.saturating_sub(1), y, z),
+            CircuitTag::Source => cell.data[0] as u8,
+            CircuitTag::Noop => read_input(cell.data[0]),
             CircuitTag::Not => {
-                let input = read_packed_charge(texels, x.saturating_sub(1), y, z);
+                let input = read_input(cell.data[0]);
                 gate_output(cell.tag, 0, input)
             }
             CircuitTag::And
@@ -721,9 +806,8 @@ mod tests {
             | CircuitTag::Nand
             | CircuitTag::Nor
             | CircuitTag::Xnor => {
-                let input_x = x.saturating_sub(1);
-                let lhs = read_packed_charge(texels, input_x, y.saturating_sub(1), z);
-                let rhs = read_packed_charge(texels, input_x, (y + 1).min(GRID_HEIGHT - 1), z);
+                let lhs = read_input(cell.data[0]);
+                let rhs = read_input(cell.data[1]);
                 gate_output(cell.tag, lhs, rhs)
             }
         }
