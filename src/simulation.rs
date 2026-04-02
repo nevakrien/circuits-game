@@ -6,6 +6,7 @@ pub const GRID_WIDTH: u32 = 8;
 pub const GRID_HEIGHT: u32 = 8;
 pub const BOARD_LAYERS: u32 = 8;
 pub const CHARGE_BUFFER_COUNT: u32 = 2;
+pub const OUTPUT_BUFFER_LEN: u32 = GRID_WIDTH * GRID_HEIGHT * BOARD_LAYERS;
 
 const CHARGE_GRID_WIDTH: u32 = GRID_WIDTH.div_ceil(2);
 const CHARGE_GRID_HEIGHT: u32 = GRID_HEIGHT.div_ceil(2);
@@ -29,6 +30,7 @@ enum CircuitTag {
     Nand = 7,
     Nor = 8,
     Xnor = 9,
+    Output = 10,
 }
 
 #[derive(Clone, Copy)]
@@ -67,11 +69,14 @@ pub enum CellKind {
     Nand,
     Nor,
     Xnor,
+    Output,
 }
 
 pub struct BoardTextures {
     charge_buffers: Vec<(wgpu::Texture, wgpu::TextureView)>,
     circuit: (wgpu::Texture, wgpu::TextureView),
+    output_buffer: wgpu::Buffer,
+    output_readback: Option<wgpu::Buffer>,
 }
 
 pub struct Simulation {
@@ -107,6 +112,26 @@ pub fn write_packed_charge(texels: &mut [[u8; 4]], x: u32, y: u32, z: u32, value
 fn charge_readback_bytes_per_row() -> u32 {
     let unpadded = CHARGE_GRID_WIDTH * CHARGE_TEXEL_SIZE;
     unpadded.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+}
+
+fn output_buffer_size() -> u64 {
+    u64::from(OUTPUT_BUFFER_LEN) * std::mem::size_of::<u32>() as u64
+}
+
+pub fn output_slot_index(x: u32, y: u32, z: u32) -> usize {
+    linear_index(x, y, z)
+}
+
+pub fn device_features(adapter: &wgpu::Adapter) -> wgpu::Features {
+    adapter.features() & wgpu::Features::MAPPABLE_PRIMARY_BUFFERS
+}
+
+pub fn device_descriptor(adapter: &wgpu::Adapter) -> wgpu::DeviceDescriptor<'static> {
+    wgpu::DeviceDescriptor {
+        label: Some("circuits-game-device"),
+        required_features: device_features(adapter),
+        ..Default::default()
+    }
 }
 
 impl BoardTextures {
@@ -160,12 +185,40 @@ impl BoardTextures {
             ..Default::default()
         });
 
+        let output_buffer_is_mappable = device
+            .features()
+            .contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS);
+        let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("component-output-buffer"),
+            size: output_buffer_size(),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST
+                | if output_buffer_is_mappable {
+                    wgpu::BufferUsages::MAP_READ
+                } else {
+                    wgpu::BufferUsages::empty()
+                },
+            mapped_at_creation: false,
+        });
+        let output_readback = (!output_buffer_is_mappable).then(|| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("component-output-readback"),
+                size: output_buffer_size(),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        });
+
         seed_circuits(queue, &circuit_texture);
         seed_initial_charge(queue, &charge_buffers[0].0);
+        queue.write_buffer(&output_buffer, 0, bytemuck::cast_slice(&vec![0u32; OUTPUT_BUFFER_LEN as usize]));
 
         Self {
             charge_buffers,
             circuit: (circuit_texture, circuit_view),
+            output_buffer,
+            output_readback,
         }
     }
 
@@ -175,6 +228,10 @@ impl BoardTextures {
 
     pub fn circuit_view(&self) -> &wgpu::TextureView {
         &self.circuit.1
+    }
+
+    pub fn output_buffer(&self) -> &wgpu::Buffer {
+        &self.output_buffer
     }
 
     pub fn clear_cell(&self, queue: &wgpu::Queue, grid_cell: GridCell, arena_z: u32) {
@@ -431,6 +488,53 @@ impl BoardTextures {
         let texels = self.read_charge_buffer(device, queue, buffer_index).await;
         read_packed_charge(&texels, x, y, z)
     }
+
+    pub async fn read_output_buffer(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<u32> {
+        let read_buffer = if let Some(readback) = &self.output_readback {
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("component-output-readback"),
+            });
+            encoder.copy_buffer_to_buffer(
+                &self.output_buffer,
+                0,
+                readback,
+                0,
+                output_buffer_size(),
+            );
+            queue.submit(Some(encoder.finish()));
+            readback
+        } else {
+            &self.output_buffer
+        };
+
+        let slice = read_buffer.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).unwrap();
+        });
+        let _ = device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        receiver.recv().unwrap().unwrap();
+
+        let mapped = slice.get_mapped_range();
+        let values = bytemuck::cast_slice::<u8, u32>(&mapped).to_vec();
+        drop(mapped);
+        read_buffer.unmap();
+        values
+    }
+
+    pub async fn read_output_value(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        x: u32,
+        y: u32,
+        z: u32,
+    ) -> u32 {
+        self.read_output_buffer(device, queue).await[output_slot_index(x, y, z)]
+    }
 }
 
 impl Simulation {
@@ -473,6 +577,16 @@ impl Simulation {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -505,6 +619,8 @@ impl Simulation {
         current_buffer: u32,
         next_buffer: u32,
     ) {
+        encoder.clear_buffer(board.output_buffer(), 0, None);
+
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("simulation-bind-group"),
             layout: &self.bind_group_layout,
@@ -520,6 +636,10 @@ impl Simulation {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::TextureView(board.charge_view(next_buffer)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: board.output_buffer().as_entire_binding(),
                 },
             ],
         });
@@ -630,6 +750,7 @@ fn circuit_cell_from_snapshot(snapshot: CellSnapshot) -> CircuitCell {
             7 => CircuitTag::Nand,
             8 => CircuitTag::Nor,
             9 => CircuitTag::Xnor,
+            10 => CircuitTag::Output,
             _ => CircuitTag::Empty,
         },
         data: [snapshot.words[1], snapshot.words[2], snapshot.words[3]],
@@ -653,6 +774,10 @@ impl CellSnapshot {
 
     pub fn noop() -> Self {
         Self::from_cell(noop_cell())
+    }
+
+    pub fn output() -> Self {
+        Self::from_cell(output_cell())
     }
 
     pub fn with_primary_input(self, source: GridCell) -> Self {
@@ -703,6 +828,7 @@ impl CellSnapshot {
             7 => CellKind::Nand,
             8 => CellKind::Nor,
             9 => CellKind::Xnor,
+            10 => CellKind::Output,
             _ => CellKind::Empty,
         }
     }
@@ -740,6 +866,13 @@ fn gate_cell(tag: CircuitTag) -> CircuitCell {
     }
 }
 
+fn output_cell() -> CircuitCell {
+    CircuitCell {
+        tag: CircuitTag::Output,
+        data: [INVALID_INPUT_REF, INVALID_INPUT_REF, 0],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -752,7 +885,7 @@ mod tests {
             .ok()?;
 
         adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
+            .request_device(&device_descriptor(&adapter))
             .await
             .ok()
     }
@@ -810,6 +943,7 @@ mod tests {
                 let rhs = read_input(cell.data[1]);
                 gate_output(cell.tag, lhs, rhs)
             }
+            CircuitTag::Output => read_input(cell.data[0]),
         }
     }
 
@@ -884,6 +1018,42 @@ mod tests {
         assert_eq!(read_packed_charge(&texels, 1, 0, 0), 0x22);
         assert_eq!(read_packed_charge(&texels, 0, 1, 0), 0x33);
         assert_eq!(read_packed_charge(&texels, 1, 1, 0), 0x44);
+    }
+
+    #[test]
+    fn output_cells_write_to_component_output_buffer() {
+        let Some((device, queue)) = pollster::block_on(create_headless_device()) else {
+            return;
+        };
+
+        let board = BoardTextures::new(&device, &queue);
+        board.write_cell(
+            &queue,
+            GridCell { x: 1, y: 0 },
+            0,
+            CellSnapshot::output().with_primary_input(GridCell { x: 0, y: 0 }),
+        );
+        board.clear_charge_at(&device, &queue, GridCell { x: 1, y: 0 }, 0);
+
+        let simulation = Simulation::new(&device);
+        for (current_buffer, next_buffer) in [(0, 1), (1, 0)] {
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("output-buffer-test-step"),
+            });
+            simulation.step(&device, &mut encoder, &board, current_buffer, next_buffer);
+            queue.submit(Some(encoder.finish()));
+        }
+
+        let output_value =
+            pollster::block_on(board.read_output_value(&device, &queue, 1, 0, 0));
+        assert_eq!(output_value, 0xff);
+
+        let output_values = pollster::block_on(board.read_output_buffer(&device, &queue));
+        assert_eq!(output_values[output_slot_index(1, 0, 0)], 0xff);
+        assert!(output_values
+            .iter()
+            .enumerate()
+            .all(|(ix, value)| ix == output_slot_index(1, 0, 0) || *value == 0));
     }
 
     #[test]

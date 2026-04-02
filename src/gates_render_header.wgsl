@@ -156,7 +156,7 @@ fn render_source(local_uv: vec2<f32>, centered: vec2<f32>, charge: u32) -> vec3<
     return render_lit_circle(circle, glow, charge_level, vec3(0.28, 0.16, 0.10), vec3(0.95, 0.82, 0.68), vec3(0.24, 0.18, 0.08));
 }
 
-fn render_gate(local_uv: vec2<f32>, centered: vec2<f32>, charge: u32, circuit: vec4<u32>) -> vec3<f32> {
+fn render_basic_gate(local_uv: vec2<f32>, centered: vec2<f32>, charge: u32, circuit: vec4<u32>) -> vec3<f32> {
     let radius = length(centered);
     let glow = 1.0 - smoothstep(0.12, 0.38, radius);
     let tag = circuit.x & 0xffu;
@@ -182,6 +182,30 @@ fn render_gate(local_uv: vec2<f32>, centered: vec2<f32>, charge: u32, circuit: v
     return color;
 }
 
+fn render_output(local_uv: vec2<f32>, centered: vec2<f32>, charge: u32) -> vec3<f32> {
+    _ = local_uv;
+
+    let radius = length(centered);
+    let glow = 1.0 - smoothstep(0.12, 0.38, radius);
+    let charge_level = f32(charge) / 255.0;
+    let body_mask = rounded_box_mask(centered, vec2(0.39, 0.27), 0.08);
+    let border_mask = body_mask - rounded_box_mask(centered, vec2(0.35, 0.23), 0.07);
+    let input_mask = circle_mask(centered, GATE_INPUT_SINGLE_CENTER, GATE_INPUT_RADIUS);
+    let monitor_mask = rounded_box_mask(centered - vec2(0.08, 0.0), vec2(0.16, 0.12), 0.04);
+    let bar_mask = rounded_box_mask(centered + vec2(0.18, 0.0), vec2(0.055, 0.19), 0.03);
+    let body_color = mix(vec3(0.20, 0.24, 0.18), vec3(0.82, 0.96, 0.76), charge_level * 0.4);
+
+    var color = vec3(0.035, 0.035, 0.045);
+    color = mix(color, body_color, body_mask);
+    color = mix(color, vec3(0.18, 0.44, 0.64), border_mask * 0.82);
+    color = mix(color, vec3(0.34, 0.92, 0.42), input_mask);
+    color = mix(color, vec3(0.11, 0.13, 0.10), monitor_mask);
+    color = mix(color, vec3(0.99, 0.84, 0.30), monitor_mask * charge_level);
+    color = mix(color, vec3(0.42, 0.92, 0.56), bar_mask * (0.45 + charge_level * 0.55));
+    color += vec3(0.22, 0.30, 0.20) * (charge_level * glow * 0.22);
+    return color;
+}
+
 fn render_cell_color(coord: vec2<u32>, local_uv: vec2<f32>, centered: vec2<f32>, charge: u32, circuit: vec4<u32>) -> vec3<f32> {
     _ = coord;
     switch (circuit.x & 0xffu) {
@@ -189,7 +213,10 @@ fn render_cell_color(coord: vec2<u32>, local_uv: vec2<f32>, centered: vec2<f32>,
             return render_source(local_uv, centered, charge);
         }
         case 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u: {
-            return render_gate(local_uv, centered, charge, circuit);
+            return render_basic_gate(local_uv, centered, charge, circuit);
+        }
+        case 10u: {
+            return render_output(local_uv, centered, charge);
         }
         default: {
             return render_empty(local_uv, centered, charge);

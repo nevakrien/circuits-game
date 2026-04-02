@@ -311,6 +311,7 @@ fn tool_preview_state(tool: crate::editor::EditorTool) -> ([u32; 4], u32) {
         crate::editor::EditorTool::Xnor => {
             crate::simulation::CellSnapshot::gate(crate::simulation::GateKind::Xnor).words
         }
+        crate::editor::EditorTool::Output => crate::simulation::CellSnapshot::output().words,
     };
 
     (
@@ -643,7 +644,7 @@ mod tests {
             .ok()?;
 
         adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
+            .request_device(&crate::simulation::device_descriptor(&adapter))
             .await
             .ok()
     }

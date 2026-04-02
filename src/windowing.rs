@@ -36,7 +36,7 @@ pub async fn prepare_window() -> WindowState {
         .unwrap();
 
     let (device, queue) = adapter
-        .request_device(&wgpu::DeviceDescriptor::default())
+        .request_device(&crate::simulation::device_descriptor(&adapter))
         .await
         .unwrap();
 

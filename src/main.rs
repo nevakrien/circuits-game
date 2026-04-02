@@ -150,7 +150,7 @@ async fn render_scene_to_png(options: &RenderSceneOptions) -> Result<(), String>
         .await
         .map_err(|error| format!("Unable to create adapter: {error}"))?;
     let (device, queue) = adapter
-        .request_device(&wgpu::DeviceDescriptor::default())
+        .request_device(&simulation::device_descriptor(&adapter))
         .await
         .map_err(|error| format!("Unable to create device: {error}"))?;
 

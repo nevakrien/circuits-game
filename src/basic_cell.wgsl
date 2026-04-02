@@ -7,6 +7,9 @@ var circuits: texture_3d<u32>;
 @group(0) @binding(2)
 var out_tex: texture_storage_3d<rgba8uint, write>;
 
+@group(0) @binding(3)
+var<storage, read_write> component_outputs: array<u32>;
+
 fn byte_channel(coord: vec2<u32>) -> u32 {
     return (coord.y & 1u) * 2u + (coord.x & 1u);
 }
@@ -114,6 +117,14 @@ fn read_input_bool(dims: vec3<u32>, coord: vec3<u32>, input_ref: u32) -> bool {
     return read_input_charge(dims, coord, input_ref) != 0u;
 }
 
+fn output_index(dims: vec3<u32>, coord: vec3<u32>) -> u32 {
+    return coord.z * dims.x * dims.y + coord.y * dims.x + coord.x;
+}
+
+fn write_output(dims: vec3<u32>, coord: vec3<u32>, value: u32) {
+    component_outputs[output_index(dims, coord)] = value & 0xffu;
+}
+
 fn update_not(
     dims: vec3<u32>,
     coord: vec3<u32>,
@@ -162,6 +173,20 @@ fn update_binary_gate(
     }
 }
 
+fn update_output(
+    dims: vec3<u32>,
+    coord: vec3<u32>,
+    current_charge: u32,
+    circuit: vec4<u32>,
+    payload: vec3<u32>,
+) -> u32 {
+    _ = current_charge;
+    _ = circuit;
+    let next_charge = read_input_charge(dims, coord, payload.x);
+    write_output(dims, coord, next_charge);
+    return next_charge;
+}
+
 fn update_tag(
     dims: vec3<u32>,
     coord: vec3<u32>,
@@ -184,6 +209,9 @@ fn update_tag(
         }
         case 4u, 5u, 6u, 7u, 8u, 9u: {
             return update_binary_gate(dims, coord, current_charge, circuit, payload);
+        }
+        case 10u: {
+            return update_output(dims, coord, current_charge, circuit, payload);
         }
         default: {
             return current_charge;

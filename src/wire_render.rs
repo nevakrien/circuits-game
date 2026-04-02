@@ -111,20 +111,7 @@ impl WireRenderInfo {
         arena_z: u32,
         point: WirePoint,
     ) -> Option<StoredWireEdge> {
-        let (key, index) = self
-            .wire_edges
-            .iter()
-            .filter(|(_, edges)| {
-                edges
-                    .first()
-                    .is_some_and(|edge| edge.source_id.arena_z == arena_z)
-            })
-            .find_map(|(key, edges)| {
-                edges
-                    .iter()
-                    .position(|edge| wire_contains_point(&edge.points, point, WIRE_DELETE_DISTANCE))
-                    .map(|index| (*key, index))
-            })?;
+        let (key, index) = self.wire_at_point_index(arena_z, point)?;
 
         let edges = self.wire_edges.get_mut(&key)?;
         let removed = edges.remove(index);
@@ -136,6 +123,27 @@ impl WireRenderInfo {
 
     pub fn wire_edges(&self) -> impl Iterator<Item = &StoredWireEdge> {
         self.wire_edges.values().flatten()
+    }
+
+    pub fn wire_at_point(&self, arena_z: u32, point: WirePoint) -> Option<StoredWireEdge> {
+        let (key, index) = self.wire_at_point_index(arena_z, point)?;
+        self.wire_edges.get(&key)?.get(index).cloned()
+    }
+
+    fn wire_at_point_index(&self, arena_z: u32, point: WirePoint) -> Option<(WireEdgeKey, usize)> {
+        self.wire_edges
+            .iter()
+            .filter(|(_, edges)| {
+                edges
+                    .first()
+                    .is_some_and(|edge| edge.source_id.arena_z == arena_z)
+            })
+            .find_map(|(key, edges)| {
+                edges
+                    .iter()
+                    .position(|edge| wire_contains_point(&edge.points, point, WIRE_DELETE_DISTANCE))
+                    .map(|index| (*key, index))
+            })
     }
 }
 

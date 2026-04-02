@@ -710,9 +710,10 @@ mod tests {
         let adapter =
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
                 .expect("adapter");
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-                .expect("device");
+        let (device, queue) = pollster::block_on(
+            adapter.request_device(&crate::simulation::device_descriptor(&adapter)),
+        )
+        .expect("device");
         let mut overlay = WireOverlay::new(
             &device,
             &queue,
@@ -748,9 +749,10 @@ mod tests {
         let adapter =
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
                 .expect("adapter");
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-                .expect("device");
+        let (device, queue) = pollster::block_on(
+            adapter.request_device(&crate::simulation::device_descriptor(&adapter)),
+        )
+        .expect("device");
         let mut overlay = WireOverlay::new(
             &device,
             &queue,
