@@ -154,6 +154,74 @@ fn parse_u32_flag(flag: &str, value: &str) -> Result<u32, String> {
         .map_err(|_| format!("Invalid value for {flag}: {value}"))
 }
 
+fn schematic_base_directory() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn default_schematic_path() -> PathBuf {
+    schematic_base_directory().join(format!(
+        "default.{}",
+        level_context::SCHEMATIC_FILE_EXTENSION
+    ))
+}
+
+fn dialogs_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
+fn ensure_schematic_extension(path: PathBuf) -> PathBuf {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some(extension) if extension == level_context::SCHEMATIC_FILE_EXTENSION => path,
+        _ => path.with_extension(level_context::SCHEMATIC_FILE_EXTENSION),
+    }
+}
+
+fn choose_schematic_save_path() -> Option<PathBuf> {
+    if dialogs_available() {
+        let file = rfd::FileDialog::new()
+            .set_directory(schematic_base_directory())
+            .add_filter(
+                "Circuit schematic",
+                &[level_context::SCHEMATIC_FILE_EXTENSION],
+            )
+            .set_file_name(&format!(
+                "default.{}",
+                level_context::SCHEMATIC_FILE_EXTENSION
+            ))
+            .save_file()?;
+        return Some(ensure_schematic_extension(file));
+    }
+
+    Some(default_schematic_path())
+}
+
+fn choose_schematic_load_path() -> Option<PathBuf> {
+    if dialogs_available() {
+        return rfd::FileDialog::new()
+            .set_directory(schematic_base_directory())
+            .add_filter(
+                "Circuit schematic",
+                &[level_context::SCHEMATIC_FILE_EXTENSION],
+            )
+            .pick_file();
+    }
+
+    let fallback = default_schematic_path();
+    fallback.exists().then_some(fallback)
+}
+
 async fn render_scene_to_png(options: &RenderSceneOptions) -> Result<(), String> {
     let windowing::GpuState { device, queue, .. } = windowing::prepare_gpu(None).await?;
 
@@ -356,7 +424,7 @@ async fn run() {
         &mut egui_renderer,
     ));
     let mut level_context = level_context::LevelContext::with_starter_root();
-    let root_component_id = level_context.root_component_id();
+    let mut root_component_id = level_context.root_component_id();
     let mut edited_component = level_context
         .upload_component_to_board(root_component_id, &edit_board, &device, &queue)
         .expect("starter context should upload to board");
@@ -483,6 +551,90 @@ async fn run() {
                                         }
                                         Err(error) => {
                                             eprintln!("Failed to restore edit mode board: {error}");
+                                        }
+                                    }
+                                }
+                            }
+                            Some(editor::EditorPanelAction::SaveSchematic) => {
+                                if matches!(app_mode, AppMode::Edit) {
+                                    if let Err(error) = level_context.refresh_component_from_board(
+                                        root_component_id,
+                                        &edit_board,
+                                        &edited_component,
+                                        &device,
+                                        &queue,
+                                    ) {
+                                        eprintln!(
+                                            "Failed to refresh plan before saving schematic: {error}"
+                                        );
+                                        return;
+                                    }
+                                }
+
+                                if let Some(path) = choose_schematic_save_path() {
+                                    if let Some(parent) = path.parent() {
+                                        if let Err(error) = std::fs::create_dir_all(parent) {
+                                            eprintln!(
+                                                "Failed to create schematic directory {}: {error}",
+                                                parent.display()
+                                            );
+                                            return;
+                                        }
+                                    }
+
+                                    if let Err(error) = level_context.save_to_path(&path) {
+                                        eprintln!(
+                                            "Failed to save schematic to {}: {error}",
+                                            path.display()
+                                        );
+                                    }
+                                }
+                            }
+                            Some(editor::EditorPanelAction::LoadSchematic) => {
+                                if let Some(path) = choose_schematic_load_path() {
+                                    match level_context::LevelContext::load_from_path(&path) {
+                                        Ok(loaded_context) => {
+                                            level_context = loaded_context;
+                                            root_component_id = level_context.root_component_id();
+                                            match level_context.upload_component_to_board(
+                                                root_component_id,
+                                                &edit_board,
+                                                &device,
+                                                &queue,
+                                            ) {
+                                                Ok(wires) => {
+                                                    edited_component = wires;
+                                                    editor_session.reset_for_loaded_schematic(
+                                                        &mut wire_overlay,
+                                                        &device,
+                                                        &queue,
+                                                    );
+                                                    wire_overlay.replace_wires(
+                                                        &device,
+                                                        &queue,
+                                                        edited_component
+                                                            .wire_edges()
+                                                            .cloned()
+                                                            .collect(),
+                                                    );
+                                                    wire_overlay.set_visible_arena_z(
+                                                        &device, &queue, 0,
+                                                    );
+                                                    displayed_arena_z = 0;
+                                                    app_mode = AppMode::Edit;
+                                                }
+                                                Err(error) => {
+                                                    eprintln!(
+                                                        "Loaded schematic but failed to upload root component: {error}"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Err(error) => {
+                                            eprintln!(
+                                                "Failed to load schematic from {}: {error}",
+                                                path.display()
+                                            );
                                         }
                                     }
                                 }
@@ -764,6 +916,52 @@ async fn run() {
                                     if !event.repeat && code == KeyCode::Space {
                                         if let AppMode::Run { step_requested, .. } = &mut app_mode {
                                             *step_requested = true;
+                                        } else if matches!(app_mode, AppMode::Edit) {
+                                            if let Err(error) =
+                                                level_context.refresh_component_from_board(
+                                                    root_component_id,
+                                                    &edit_board,
+                                                    &edited_component,
+                                                    &device,
+                                                    &queue,
+                                                )
+                                            {
+                                                eprintln!(
+                                                    "Failed to refresh plan from edit board: {error}"
+                                                );
+                                            } else {
+                                                match circuit_runtime::CircuitRuntime::build_and_link(
+                                                    &level_context,
+                                                    root_component_id,
+                                                    &device,
+                                                    &queue,
+                                                ) {
+                                                    Ok(runtime) => {
+                                                        wire_overlay.replace_wires(
+                                                            &device,
+                                                            &queue,
+                                                            runtime
+                                                                .root
+                                                                .wires
+                                                                .wire_edges()
+                                                                .cloned()
+                                                                .collect(),
+                                                        );
+                                                        wire_overlay.set_visible_arena_z(
+                                                            &device, &queue, 0,
+                                                        );
+                                                        displayed_arena_z = 0;
+                                                        app_mode = AppMode::Run {
+                                                            runtime,
+                                                            current_buffer: 0,
+                                                            step_requested: false,
+                                                        };
+                                                    }
+                                                    Err(error) => {
+                                                        eprintln!("Failed to build runtime: {error}");
+                                                    }
+                                                }
+                                            }
                                         }
                                         window.request_redraw();
                                     }

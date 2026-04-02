@@ -13,6 +13,9 @@ const RESET_BUTTON_WIDTH: f32 = 64.0;
 const RESET_BUTTON_HEIGHT: f32 = 24.0;
 const MODE_BUTTON_WIDTH: f32 = 84.0;
 const MODE_BUTTON_HEIGHT: f32 = 24.0;
+const FILE_BUTTON_WIDTH: f32 = 84.0;
+const FILE_BUTTON_HEIGHT: f32 = 24.0;
+const TOP_BUTTON_SPACING: f32 = 6.0;
 const PANEL_WIDTH: f32 = 260.0;
 const PANEL_HEIGHT: f32 = 420.0;
 const PANEL_MARGIN: f32 = 12.0;
@@ -187,6 +190,8 @@ pub enum EditorPanelAction {
     StartRunning,
     RestartRunning,
     BackToEdit,
+    SaveSchematic,
+    LoadSchematic,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -340,6 +345,20 @@ impl EditorSession {
 
     pub fn selected_wire_color(&self) -> [f32; 4] {
         self.ui.selected_wire_color()
+    }
+
+    pub fn reset_for_loaded_schematic(
+        &mut self,
+        wire_overlay: &mut wires::WireOverlay,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) {
+        self.history = EditorHistory::default();
+        self.invalid_connection_feedback = None;
+        self.update_draft(wire_overlay, |overlay| {
+            overlay.restore_draft(device, queue, None);
+        });
+        self.previous_tool = self.selected_tool();
     }
 
     pub fn show(
@@ -667,8 +686,8 @@ impl EditorUi {
     pub fn show<T>(
         &mut self,
         ctx: &egui::Context,
-        displayed_arena_z: u32,
-        history: &EditorHistory<T>,
+        _displayed_arena_z: u32,
+        _history: &EditorHistory<T>,
         mode: EditorMode,
     ) -> EditorFrameOutput {
         let screen_rect = ctx.content_rect();
@@ -677,13 +696,13 @@ impl EditorUi {
             screen_rect.left() + PANEL_MARGIN,
             screen_rect.top() + PANEL_MARGIN,
         );
-        let reset_origin = Pos2::new(
-            screen_rect.right() - PANEL_MARGIN - RESET_BUTTON_WIDTH,
+        let top_button_row_width = RESET_BUTTON_WIDTH
+            + MODE_BUTTON_WIDTH
+            + FILE_BUTTON_WIDTH * 2.0
+            + TOP_BUTTON_SPACING * 3.0;
+        let top_button_origin = Pos2::new(
+            screen_rect.right() - PANEL_MARGIN - top_button_row_width,
             screen_rect.top() + PANEL_MARGIN,
-        );
-        let mode_button_origin = Pos2::new(
-            reset_origin.x + RESET_BUTTON_WIDTH - MODE_BUTTON_WIDTH,
-            reset_origin.y + RESET_BUTTON_HEIGHT + 6.0,
         );
         let tag_rect = Rect::from_min_size(origin, Vec2::new(TAG_WIDTH, TAG_HEIGHT));
         let mut reset_requested = false;
@@ -725,51 +744,6 @@ impl EditorUi {
 
                     frame.show(ui, |ui| {
                         ui.set_width(PANEL_INNER_WIDTH);
-                        ui.horizontal(|ui| {
-                            ui.heading("Editor");
-                            ui.label(
-                                RichText::new(format!("Arena Z {}", displayed_arena_z))
-                                    .small()
-                                    .color(Color32::from_rgb(170, 184, 198)),
-                            );
-                        });
-                        ui.label(
-                            RichText::new(format!("Active: {}", self.selected_tool.title()))
-                                .small()
-                                .strong()
-                                .color(Color32::from_rgb(214, 224, 235)),
-                        );
-                        ui.label(
-                            RichText::new(format!(
-                                "Undo {}  Redo {}",
-                                if history.can_undo() { "Ctrl+Z" } else { "-" },
-                                if history.can_redo() {
-                                    "Ctrl+Shift+Z / Ctrl+Y"
-                                } else {
-                                    "-"
-                                },
-                            ))
-                            .small()
-                            .color(Color32::from_rgb(160, 174, 190)),
-                        );
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| match mode {
-                            EditorMode::Edit => {
-                                if ui.button("Start Running").clicked() {
-                                    action = Some(EditorPanelAction::StartRunning);
-                                }
-                            }
-                            EditorMode::Run => {
-                                if ui.button("Restart Running").clicked() {
-                                    action = Some(EditorPanelAction::RestartRunning);
-                                }
-                                if ui.button("Back to Edit").clicked() {
-                                    action = Some(EditorPanelAction::BackToEdit);
-                                }
-                            }
-                        });
-                        ui.add_space(8.0);
-
                         ScrollArea::vertical()
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
@@ -834,36 +808,51 @@ impl EditorUi {
             }
         }
 
-        egui::Area::new(Id::new("editor_reset_view_button"))
+        egui::Area::new(Id::new("editor_top_buttons"))
             .order(Order::Foreground)
-            .fixed_pos(reset_origin)
+            .fixed_pos(top_button_origin)
             .show(ctx, |ui| {
-                let button = egui::Button::new(RichText::new("Reset").size(12.0))
-                    .min_size(Vec2::new(RESET_BUTTON_WIDTH, RESET_BUTTON_HEIGHT))
-                    .fill(Color32::from_rgba_unmultiplied(12, 16, 22, 220))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(58, 72, 90)))
-                    .corner_radius(CornerRadius::same(8));
-                if ui.add(button).clicked() {
-                    reset_requested = true;
-                }
-            });
+                ui.horizontal(|ui| {
+                    let reset_button = egui::Button::new(RichText::new("Reset").size(12.0))
+                        .min_size(Vec2::new(RESET_BUTTON_WIDTH, RESET_BUTTON_HEIGHT))
+                        .fill(Color32::from_rgba_unmultiplied(12, 16, 22, 220))
+                        .stroke(Stroke::new(1.0, Color32::from_rgb(58, 72, 90)))
+                        .corner_radius(CornerRadius::same(8));
+                    if ui.add(reset_button).clicked() {
+                        reset_requested = true;
+                    }
 
-        egui::Area::new(Id::new("editor_mode_button"))
-            .order(Order::Foreground)
-            .fixed_pos(mode_button_origin)
-            .show(ctx, |ui| {
-                let (label, next_action) = match mode {
-                    EditorMode::Edit => ("Run", EditorPanelAction::StartRunning),
-                    EditorMode::Run => ("Edit", EditorPanelAction::BackToEdit),
-                };
-                let button = egui::Button::new(RichText::new(label).size(12.0))
-                    .min_size(Vec2::new(MODE_BUTTON_WIDTH, MODE_BUTTON_HEIGHT))
-                    .fill(Color32::from_rgba_unmultiplied(28, 72, 44, 236))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(120, 182, 136)))
-                    .corner_radius(CornerRadius::same(8));
-                if ui.add(button).clicked() && action.is_none() {
-                    action = Some(next_action);
-                }
+                    let (label, next_action) = match mode {
+                        EditorMode::Edit => ("Run", EditorPanelAction::StartRunning),
+                        EditorMode::Run => ("Edit", EditorPanelAction::BackToEdit),
+                    };
+                    let mode_button = egui::Button::new(RichText::new(label).size(12.0))
+                        .min_size(Vec2::new(MODE_BUTTON_WIDTH, MODE_BUTTON_HEIGHT))
+                        .fill(Color32::from_rgba_unmultiplied(28, 72, 44, 236))
+                        .stroke(Stroke::new(1.0, Color32::from_rgb(120, 182, 136)))
+                        .corner_radius(CornerRadius::same(8));
+                    if ui.add(mode_button).clicked() && action.is_none() {
+                        action = Some(next_action);
+                    }
+
+                    let save_button = egui::Button::new(RichText::new("Save").size(12.0))
+                        .min_size(Vec2::new(FILE_BUTTON_WIDTH, FILE_BUTTON_HEIGHT))
+                        .fill(Color32::from_rgba_unmultiplied(12, 16, 22, 220))
+                        .stroke(Stroke::new(1.0, Color32::from_rgb(58, 72, 90)))
+                        .corner_radius(CornerRadius::same(8));
+                    if ui.add(save_button).clicked() && action.is_none() {
+                        action = Some(EditorPanelAction::SaveSchematic);
+                    }
+
+                    let load_button = egui::Button::new(RichText::new("Load").size(12.0))
+                        .min_size(Vec2::new(FILE_BUTTON_WIDTH, FILE_BUTTON_HEIGHT))
+                        .fill(Color32::from_rgba_unmultiplied(12, 16, 22, 220))
+                        .stroke(Stroke::new(1.0, Color32::from_rgb(58, 72, 90)))
+                        .corner_radius(CornerRadius::same(8));
+                    if ui.add(load_button).clicked() && action.is_none() {
+                        action = Some(EditorPanelAction::LoadSchematic);
+                    }
+                });
             });
 
         EditorFrameOutput {
