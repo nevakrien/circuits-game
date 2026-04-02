@@ -1,5 +1,6 @@
 use circuits_game::{
-    circuit_runtime, editor, level_context, render, simulation, windowing, wires,
+    circuit_runtime, component_plan, editor, level_context, render, simulation, windowing,
+    wire_render, wires,
 };
 use egui_wgpu::wgpu;
 use egui_winit::winit;
@@ -222,6 +223,108 @@ fn choose_schematic_load_path() -> Option<PathBuf> {
     fallback.exists().then_some(fallback)
 }
 
+fn sync_wire_overlay(
+    wire_overlay: &mut wires::WireOverlay,
+    wire_render_info: &wire_render::WireRenderInfo,
+    visible_arena_z: u32,
+    displayed_arena_z: &mut u32,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) {
+    wire_overlay.replace_wires(
+        device,
+        queue,
+        wire_render_info.wire_edges().cloned().collect(),
+    );
+    wire_overlay.set_visible_arena_z(device, queue, visible_arena_z);
+    *displayed_arena_z = visible_arena_z;
+}
+
+fn build_run_mode(
+    level_context: &level_context::LevelContext,
+    root_component_id: component_plan::ComponentId,
+    wire_overlay: &mut wires::WireOverlay,
+    displayed_arena_z: &mut u32,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    error_prefix: &str,
+) -> Result<AppMode, String> {
+    let runtime = circuit_runtime::CircuitRuntime::build_and_link(
+        level_context,
+        root_component_id,
+        device,
+        queue,
+    )
+    .map_err(|error| format!("{error_prefix}: {error}"))?;
+    sync_wire_overlay(
+        wire_overlay,
+        &runtime.root.wires,
+        0,
+        displayed_arena_z,
+        device,
+        queue,
+    );
+    Ok(AppMode::Run {
+        runtime,
+        current_buffer: 0,
+        step_requested: false,
+    })
+}
+
+fn start_run_mode_from_edit(
+    level_context: &mut level_context::LevelContext,
+    root_component_id: component_plan::ComponentId,
+    edit_board: &simulation::BoardTextures,
+    edited_component: &wire_render::WireRenderInfo,
+    wire_overlay: &mut wires::WireOverlay,
+    displayed_arena_z: &mut u32,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> Result<AppMode, String> {
+    level_context
+        .refresh_component_from_board(
+            root_component_id,
+            edit_board,
+            edited_component,
+            device,
+            queue,
+        )
+        .map_err(|error| format!("Failed to refresh plan from edit board: {error}"))?;
+    build_run_mode(
+        level_context,
+        root_component_id,
+        wire_overlay,
+        displayed_arena_z,
+        device,
+        queue,
+        "Failed to build runtime",
+    )
+}
+
+fn restore_edit_component(
+    level_context: &level_context::LevelContext,
+    root_component_id: component_plan::ComponentId,
+    edit_board: &simulation::BoardTextures,
+    edited_component: &mut wire_render::WireRenderInfo,
+    wire_overlay: &mut wires::WireOverlay,
+    displayed_arena_z: &mut u32,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> Result<(), String> {
+    *edited_component = level_context
+        .upload_component_to_board(root_component_id, edit_board, device, queue)
+        .map_err(|error| format!("Failed to restore edit mode board: {error}"))?;
+    sync_wire_overlay(
+        wire_overlay,
+        edited_component,
+        0,
+        displayed_arena_z,
+        device,
+        queue,
+    );
+    Ok(())
+}
+
 async fn render_scene_to_png(options: &RenderSceneOptions) -> Result<(), String> {
     let windowing::GpuState { device, queue, .. } = windowing::prepare_gpu(None).await?;
 
@@ -428,12 +531,14 @@ async fn run() {
     let mut edited_component = level_context
         .upload_component_to_board(root_component_id, &edit_board, &device, &queue)
         .expect("starter context should upload to board");
-    wire_overlay.replace_wires(
+    sync_wire_overlay(
+        &mut wire_overlay,
+        &edited_component,
+        0,
+        &mut displayed_arena_z,
         &device,
         &queue,
-        edited_component.wire_edges().cloned().collect(),
     );
-    wire_overlay.set_visible_arena_z(&device, &queue, 0);
 
     let mut app_mode = AppMode::Edit;
     let mut pressed_keys = HashSet::new();
@@ -469,88 +574,61 @@ async fn run() {
 
                         match panel_output.action {
                             Some(editor::EditorPanelAction::StartRunning) => {
-                                if let Err(error) = level_context.refresh_component_from_board(
+                                match start_run_mode_from_edit(
+                                    &mut level_context,
                                     root_component_id,
                                     &edit_board,
                                     &edited_component,
+                                    &mut wire_overlay,
+                                    &mut displayed_arena_z,
                                     &device,
                                     &queue,
                                 ) {
-                                    eprintln!("Failed to refresh plan from edit board: {error}");
-                                } else {
-                                    match circuit_runtime::CircuitRuntime::build_and_link(
-                                        &level_context,
-                                        root_component_id,
-                                        &device,
-                                        &queue,
-                                    ) {
-                                        Ok(runtime) => {
-                                            wire_overlay.replace_wires(
-                                                &device,
-                                                &queue,
-                                                runtime.root.wires.wire_edges().cloned().collect(),
-                                            );
-                                            wire_overlay.set_visible_arena_z(&device, &queue, 0);
-                                            displayed_arena_z = 0;
-                                            app_mode = AppMode::Run {
-                                                runtime,
-                                                current_buffer: 0,
-                                                step_requested: false,
-                                            };
-                                        }
-                                        Err(error) => {
-                                            eprintln!("Failed to build runtime: {error}");
-                                        }
+                                    Ok(next_mode) => {
+                                        app_mode = next_mode;
+                                    }
+                                    Err(error) => {
+                                        eprintln!("{error}");
                                     }
                                 }
                             }
                             Some(editor::EditorPanelAction::RestartRunning) => {
                                 if let AppMode::Run { .. } = app_mode {
-                                    match circuit_runtime::CircuitRuntime::build_and_link(
+                                    match build_run_mode(
                                         &level_context,
                                         root_component_id,
+                                        &mut wire_overlay,
+                                        &mut displayed_arena_z,
                                         &device,
                                         &queue,
+                                        "Failed to rebuild runtime",
                                     ) {
-                                        Ok(runtime) => {
-                                            wire_overlay.replace_wires(
-                                                &device,
-                                                &queue,
-                                                runtime.root.wires.wire_edges().cloned().collect(),
-                                            );
-                                            app_mode = AppMode::Run {
-                                                runtime,
-                                                current_buffer: 0,
-                                                step_requested: false,
-                                            };
+                                        Ok(next_mode) => {
+                                            app_mode = next_mode;
                                         }
                                         Err(error) => {
-                                            eprintln!("Failed to rebuild runtime: {error}");
+                                            eprintln!("{error}");
                                         }
                                     }
                                 }
                             }
                             Some(editor::EditorPanelAction::BackToEdit) => {
                                 if let AppMode::Run { .. } = app_mode {
-                                    match level_context.upload_component_to_board(
+                                    match restore_edit_component(
+                                        &level_context,
                                         root_component_id,
                                         &edit_board,
+                                        &mut edited_component,
+                                        &mut wire_overlay,
+                                        &mut displayed_arena_z,
                                         &device,
                                         &queue,
                                     ) {
-                                        Ok(wires) => {
-                                            edited_component = wires;
-                                            wire_overlay.replace_wires(
-                                                &device,
-                                                &queue,
-                                                edited_component.wire_edges().cloned().collect(),
-                                            );
-                                            wire_overlay.set_visible_arena_z(&device, &queue, 0);
-                                            displayed_arena_z = 0;
+                                        Ok(()) => {
                                             app_mode = AppMode::Edit;
                                         }
                                         Err(error) => {
-                                            eprintln!("Failed to restore edit mode board: {error}");
+                                            eprintln!("{error}");
                                         }
                                     }
                                 }
@@ -596,31 +674,22 @@ async fn run() {
                                         Ok(loaded_context) => {
                                             level_context = loaded_context;
                                             root_component_id = level_context.root_component_id();
-                                            match level_context.upload_component_to_board(
+                                            editor_session.reset_for_loaded_schematic(
+                                                &mut wire_overlay,
+                                                &device,
+                                                &queue,
+                                            );
+                                            match restore_edit_component(
+                                                &level_context,
                                                 root_component_id,
                                                 &edit_board,
+                                                &mut edited_component,
+                                                &mut wire_overlay,
+                                                &mut displayed_arena_z,
                                                 &device,
                                                 &queue,
                                             ) {
-                                                Ok(wires) => {
-                                                    edited_component = wires;
-                                                    editor_session.reset_for_loaded_schematic(
-                                                        &mut wire_overlay,
-                                                        &device,
-                                                        &queue,
-                                                    );
-                                                    wire_overlay.replace_wires(
-                                                        &device,
-                                                        &queue,
-                                                        edited_component
-                                                            .wire_edges()
-                                                            .cloned()
-                                                            .collect(),
-                                                    );
-                                                    wire_overlay.set_visible_arena_z(
-                                                        &device, &queue, 0,
-                                                    );
-                                                    displayed_arena_z = 0;
+                                                Ok(()) => {
                                                     app_mode = AppMode::Edit;
                                                 }
                                                 Err(error) => {
@@ -917,49 +986,21 @@ async fn run() {
                                         if let AppMode::Run { step_requested, .. } = &mut app_mode {
                                             *step_requested = true;
                                         } else if matches!(app_mode, AppMode::Edit) {
-                                            if let Err(error) =
-                                                level_context.refresh_component_from_board(
-                                                    root_component_id,
-                                                    &edit_board,
-                                                    &edited_component,
-                                                    &device,
-                                                    &queue,
-                                                )
-                                            {
-                                                eprintln!(
-                                                    "Failed to refresh plan from edit board: {error}"
-                                                );
-                                            } else {
-                                                match circuit_runtime::CircuitRuntime::build_and_link(
-                                                    &level_context,
-                                                    root_component_id,
-                                                    &device,
-                                                    &queue,
-                                                ) {
-                                                    Ok(runtime) => {
-                                                        wire_overlay.replace_wires(
-                                                            &device,
-                                                            &queue,
-                                                            runtime
-                                                                .root
-                                                                .wires
-                                                                .wire_edges()
-                                                                .cloned()
-                                                                .collect(),
-                                                        );
-                                                        wire_overlay.set_visible_arena_z(
-                                                            &device, &queue, 0,
-                                                        );
-                                                        displayed_arena_z = 0;
-                                                        app_mode = AppMode::Run {
-                                                            runtime,
-                                                            current_buffer: 0,
-                                                            step_requested: false,
-                                                        };
-                                                    }
-                                                    Err(error) => {
-                                                        eprintln!("Failed to build runtime: {error}");
-                                                    }
+                                            match start_run_mode_from_edit(
+                                                &mut level_context,
+                                                root_component_id,
+                                                &edit_board,
+                                                &edited_component,
+                                                &mut wire_overlay,
+                                                &mut displayed_arena_z,
+                                                &device,
+                                                &queue,
+                                            ) {
+                                                Ok(next_mode) => {
+                                                    app_mode = next_mode;
+                                                }
+                                                Err(error) => {
+                                                    eprintln!("{error}");
                                                 }
                                             }
                                         }
