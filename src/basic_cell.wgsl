@@ -1,17 +1,20 @@
 @group(0) @binding(0)
+//packed 4xu8
 var history: texture_storage_3d<rgba8uint, read>;
 
 @group(0) @binding(1)
+//has RGBA giving us tag+3 data parts
 var circuits: texture_3d<u32>;
 
 @group(0) @binding(2)
+//packed 4xu8
 var out_tex: texture_storage_3d<rgba8uint, write>;
 
 @group(0) @binding(3)
-var<storage, read> component_inputs: array<u32>;
+var<storage, read> input_buffer: array<u32>;
 
 @group(0) @binding(4)
-var<storage, read_write> component_outputs: array<u32>;
+var<storage, read_write> output_buffer: array<u32>;
 
 fn byte_channel(coord: vec2<u32>) -> u32 {
     return (coord.y & 1u) * 2u + (coord.x & 1u);
@@ -125,11 +128,11 @@ fn output_index(dims: vec3<u32>, coord: vec3<u32>) -> u32 {
 }
 
 fn write_output(dims: vec3<u32>, coord: vec3<u32>, value: u32) {
-    component_outputs[output_index(dims, coord)] = value & 0xffu;
+    output_buffer[output_index(dims, coord)] = value & 0xffu;
 }
 
-fn read_component_input(dims: vec3<u32>, coord: vec3<u32>) -> u32 {
-    return component_inputs[output_index(dims, coord)] & 0xffu;
+fn read_input_buffer(dims: vec3<u32>, coord: vec3<u32>) -> u32 {
+    return input_buffer[output_index(dims, coord)] & 0xffu;
 }
 
 fn update_not(
@@ -204,7 +207,7 @@ fn update_input(
     _ = current_charge;
     _ = circuit;
     _ = payload;
-    return read_component_input(dims, coord);
+    return read_input_buffer(dims, coord);
 }
 
 fn update_tag(

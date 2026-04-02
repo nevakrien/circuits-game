@@ -6,6 +6,14 @@ pub const GRID_WIDTH: u32 = 8;
 pub const GRID_HEIGHT: u32 = 8;
 pub const BOARD_LAYERS: u32 = 8;
 pub const CHARGE_BUFFER_COUNT: u32 = 2;
+// Input/output state stays in host-shareable `u32` storage buffers.
+//
+// One board slot maps to one 32-bit lane:
+//   index = z * (GRID_WIDTH * GRID_HEIGHT) + y * GRID_WIDTH + x
+//
+// Today we store charge-like values (0x00/0xff) in the low byte and mask writes/reads
+// with `& 0xff` in both CPU and WGSL paths. Keeping full-width `u32` lanes gives us
+// room to widen semantics later without changing buffer indexing/plumbing.
 pub const OUTPUT_BUFFER_LEN: u32 = GRID_WIDTH * GRID_HEIGHT * BOARD_LAYERS;
 pub const INPUT_BUFFER_LEN: u32 = OUTPUT_BUFFER_LEN;
 
@@ -198,13 +206,13 @@ impl BoardTextures {
         });
 
         let input_write_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("component-input-write-buffer"),
+            label: Some("input-buffer-write"),
             size: input_buffer_size(),
             usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let input_read_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("component-input-read-buffer"),
+            label: Some("input-buffer-read"),
             size: input_buffer_size(),
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
@@ -213,7 +221,7 @@ impl BoardTextures {
         });
 
         let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("component-output-buffer"),
+            label: Some("output-buffer"),
             size: output_buffer_size(),
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
@@ -587,14 +595,14 @@ impl BoardTextures {
         let byte_offset = (start * std::mem::size_of::<u32>()) as u64;
         let byte_len = (len * std::mem::size_of::<u32>()) as u64;
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("component-input-range-readback"),
+            label: Some("input-buffer-range-readback"),
             size: byte_len,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("component-input-range-readback"),
+            label: Some("input-buffer-range-readback"),
         });
         encoder.copy_buffer_to_buffer(&self.input_read_buffer, byte_offset, &readback, 0, byte_len);
         queue.submit(Some(encoder.finish()));
@@ -657,13 +665,13 @@ impl BoardTextures {
         let byte_len = (len * std::mem::size_of::<u32>()) as u64;
 
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("component-output-range-readback"),
+            label: Some("output-buffer-range-readback"),
             size: byte_len,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("component-output-range-readback"),
+            label: Some("output-buffer-range-readback"),
         });
         encoder.copy_buffer_to_buffer(&self.output_buffer, byte_offset, &readback, 0, byte_len);
         queue.submit(Some(encoder.finish()));
@@ -1210,7 +1218,7 @@ mod tests {
     }
 
     #[test]
-    fn output_cells_write_to_component_output_buffer() {
+    fn output_cells_write_to_output_buffer() {
         let Some(gpu) = crate::test_gpu::shared_test_gpu() else {
             return;
         };
@@ -1250,7 +1258,7 @@ mod tests {
     }
 
     #[test]
-    fn input_cells_read_from_component_input_buffer() {
+    fn input_cells_read_from_input_buffer() {
         let Some(gpu) = crate::test_gpu::shared_test_gpu() else {
             return;
         };
