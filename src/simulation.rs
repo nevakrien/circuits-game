@@ -99,6 +99,14 @@ pub struct Simulation {
 // Charge is packed 2x2 cells per RGBA texel, so one `[u8; 4]` stores four cell charges.
 pub type PackedChargeTexels = Vec<[u8; 4]>;
 
+pub fn board_cell_count() -> usize {
+    (GRID_WIDTH * GRID_HEIGHT * BOARD_LAYERS) as usize
+}
+
+pub fn packed_charge_texel_count() -> usize {
+    (CHARGE_GRID_WIDTH * CHARGE_GRID_HEIGHT * BOARD_LAYERS) as usize
+}
+
 pub fn packed_charge_texel_coord(x: u32, y: u32, z: u32) -> (u32, u32, u32) {
     (x / 2, y / 2, z)
 }
@@ -315,6 +323,73 @@ impl BoardTextures {
             &self.input_write_buffer,
             (start * std::mem::size_of::<u32>()) as u64,
             bytemuck::cast_slice(&packed),
+        );
+    }
+
+    pub fn write_all_circuit_cells(&self, queue: &wgpu::Queue, cells: &[[u32; 4]]) {
+        assert_eq!(
+            cells.len(),
+            board_cell_count(),
+            "circuit cell payload size mismatch"
+        );
+
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.circuit.0,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(cells),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(
+                    GRID_WIDTH * CIRCUIT_WORDS_PER_CELL * std::mem::size_of::<u32>() as u32,
+                ),
+                rows_per_image: Some(GRID_HEIGHT),
+            },
+            wgpu::Extent3d {
+                width: GRID_WIDTH,
+                height: GRID_HEIGHT,
+                depth_or_array_layers: BOARD_LAYERS,
+            },
+        );
+    }
+
+    pub fn write_all_charge_texels(
+        &self,
+        queue: &wgpu::Queue,
+        buffer_index: u32,
+        texels: &[[u8; 4]],
+    ) {
+        assert!(
+            buffer_index < CHARGE_BUFFER_COUNT,
+            "charge buffer index out of bounds"
+        );
+        assert_eq!(
+            texels.len(),
+            packed_charge_texel_count(),
+            "charge texel payload size mismatch"
+        );
+
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.charge_buffers[buffer_index as usize].0,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(texels),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(CHARGE_GRID_WIDTH * CHARGE_TEXEL_SIZE),
+                rows_per_image: Some(CHARGE_GRID_HEIGHT),
+            },
+            wgpu::Extent3d {
+                width: CHARGE_GRID_WIDTH,
+                height: CHARGE_GRID_HEIGHT,
+                depth_or_array_layers: BOARD_LAYERS,
+            },
         );
     }
 

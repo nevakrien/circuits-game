@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::wires::{GridCell, WirePoint};
 
 const WIRE_DELETE_DISTANCE: f32 = 0.35;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub struct WireEndpointId {
     pub x: u32,
     pub y: u32,
@@ -43,7 +45,7 @@ impl WireEdgeKey {
     }
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct StoredWireEdge {
     pub source_id: WireEndpointId,
     pub destination_id: WireEndpointId,

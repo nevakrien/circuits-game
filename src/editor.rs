@@ -11,6 +11,8 @@ const TAG_WIDTH: f32 = 54.0;
 const TAG_HEIGHT: f32 = 24.0;
 const RESET_BUTTON_WIDTH: f32 = 64.0;
 const RESET_BUTTON_HEIGHT: f32 = 24.0;
+const MODE_BUTTON_WIDTH: f32 = 84.0;
+const MODE_BUTTON_HEIGHT: f32 = 24.0;
 const PANEL_WIDTH: f32 = 260.0;
 const PANEL_HEIGHT: f32 = 420.0;
 const PANEL_MARGIN: f32 = 12.0;
@@ -175,6 +177,25 @@ pub struct EditorSession {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EditorMode {
+    Edit,
+    Run,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EditorPanelAction {
+    StartRunning,
+    RestartRunning,
+    BackToEdit,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct EditorFrameOutput {
+    pub reset_camera: bool,
+    pub action: Option<EditorPanelAction>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ConnectionCellKind {
     Source,
     Input,
@@ -321,8 +342,13 @@ impl EditorSession {
         self.ui.selected_wire_color()
     }
 
-    pub fn show(&mut self, ctx: &egui::Context, displayed_arena_z: u32) -> bool {
-        self.ui.show(ctx, displayed_arena_z, &self.history)
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        displayed_arena_z: u32,
+        mode: EditorMode,
+    ) -> EditorFrameOutput {
+        self.ui.show(ctx, displayed_arena_z, &self.history, mode)
     }
 
     pub fn advance_visual_feedback(&mut self) {
@@ -643,7 +669,8 @@ impl EditorUi {
         ctx: &egui::Context,
         displayed_arena_z: u32,
         history: &EditorHistory<T>,
-    ) -> bool {
+        mode: EditorMode,
+    ) -> EditorFrameOutput {
         let screen_rect = ctx.content_rect();
         let panel_height = PANEL_HEIGHT.min((screen_rect.height() - PANEL_MARGIN * 2.0).max(160.0));
         let origin = Pos2::new(
@@ -654,8 +681,13 @@ impl EditorUi {
             screen_rect.right() - PANEL_MARGIN - RESET_BUTTON_WIDTH,
             screen_rect.top() + PANEL_MARGIN,
         );
+        let mode_button_origin = Pos2::new(
+            reset_origin.x + RESET_BUTTON_WIDTH - MODE_BUTTON_WIDTH,
+            reset_origin.y + RESET_BUTTON_HEIGHT + 6.0,
+        );
         let tag_rect = Rect::from_min_size(origin, Vec2::new(TAG_WIDTH, TAG_HEIGHT));
         let mut reset_requested = false;
+        let mut action = None;
 
         let expanded_rect = Rect::from_min_size(
             origin,
@@ -720,6 +752,22 @@ impl EditorUi {
                             .small()
                             .color(Color32::from_rgb(160, 174, 190)),
                         );
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| match mode {
+                            EditorMode::Edit => {
+                                if ui.button("Start Running").clicked() {
+                                    action = Some(EditorPanelAction::StartRunning);
+                                }
+                            }
+                            EditorMode::Run => {
+                                if ui.button("Restart Running").clicked() {
+                                    action = Some(EditorPanelAction::RestartRunning);
+                                }
+                                if ui.button("Back to Edit").clicked() {
+                                    action = Some(EditorPanelAction::BackToEdit);
+                                }
+                            }
+                        });
                         ui.add_space(8.0);
 
                         ScrollArea::vertical()
@@ -800,7 +848,28 @@ impl EditorUi {
                 }
             });
 
-        reset_requested
+        egui::Area::new(Id::new("editor_mode_button"))
+            .order(Order::Foreground)
+            .fixed_pos(mode_button_origin)
+            .show(ctx, |ui| {
+                let (label, next_action) = match mode {
+                    EditorMode::Edit => ("Run", EditorPanelAction::StartRunning),
+                    EditorMode::Run => ("Edit", EditorPanelAction::BackToEdit),
+                };
+                let button = egui::Button::new(RichText::new(label).size(12.0))
+                    .min_size(Vec2::new(MODE_BUTTON_WIDTH, MODE_BUTTON_HEIGHT))
+                    .fill(Color32::from_rgba_unmultiplied(28, 72, 44, 236))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(120, 182, 136)))
+                    .corner_radius(CornerRadius::same(8));
+                if ui.add(button).clicked() && action.is_none() {
+                    action = Some(next_action);
+                }
+            });
+
+        EditorFrameOutput {
+            reset_camera: reset_requested,
+            action,
+        }
     }
 }
 

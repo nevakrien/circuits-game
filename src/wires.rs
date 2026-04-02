@@ -1,6 +1,7 @@
 use bytemuck::{Pod, Zeroable};
 use egui_wgpu::wgpu;
 use egui_winit::winit;
+use serde::{Deserialize, Serialize};
 use winit::dpi::PhysicalSize;
 
 use crate::{
@@ -31,13 +32,13 @@ struct WireSegmentInstance {
     color: [f32; 4],
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct GridCell {
     pub x: u32,
     pub y: u32,
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 pub struct WirePoint {
     pub x: f32,
     pub y: f32,

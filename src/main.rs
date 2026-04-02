@@ -1,4 +1,6 @@
-use circuits_game::{demo_scene, editor, render, simulation, windowing, wire_render, wires};
+use circuits_game::{
+    circuit_runtime, editor, level_context, render, simulation, windowing, wires,
+};
 use egui_wgpu::wgpu;
 use egui_winit::winit;
 
@@ -31,6 +33,15 @@ struct RenderSceneOptions {
     height: u32,
     arena_z: u32,
     steps: u32,
+}
+
+enum AppMode {
+    Edit,
+    Run {
+        runtime: circuit_runtime::CircuitRuntime,
+        current_buffer: u32,
+        step_requested: bool,
+    },
 }
 
 fn main() {
@@ -313,8 +324,7 @@ async fn run() {
     } = windowing::prepare_window().await;
     let mut config = windowing::configure_surface(&surface, &adapter, &device, window.inner_size());
 
-    let board = simulation::BoardTextures::new(&device, &queue);
-    let simulation = simulation::Simulation::new(&device);
+    let edit_board = simulation::BoardTextures::new(&device, &queue);
     let renderer = render::Renderer::new(&device, &queue, config.format, window.inner_size());
     let hover_preview = render::HoverPreviewRenderer::new(&device, &queue, config.format);
     let mut camera = render::CameraState::new(window.inner_size());
@@ -345,25 +355,27 @@ async fn run() {
         &queue,
         &mut egui_renderer,
     ));
-    let demo_component = demo_scene::starter_component();
-    let mut edited_component = wire_render::WireRenderInfo::new();
-    for wire in demo_component.wires {
-        edited_component.add_wire_edge(wire);
-    }
+    let mut level_context = level_context::LevelContext::with_starter_root();
+    let root_component_id = level_context.root_component_id();
+    let mut edited_component = level_context
+        .upload_component_to_board(root_component_id, &edit_board, &device, &queue)
+        .expect("starter context should upload to board");
     wire_overlay.replace_wires(
         &device,
         &queue,
         edited_component.wire_edges().cloned().collect(),
     );
-    wire_overlay.set_visible_arena_z(&device, &queue, displayed_arena_z);
+    wire_overlay.set_visible_arena_z(&device, &queue, 0);
 
-    let mut current_buffer = 0;
-    let mut step_requested = false;
+    let mut app_mode = AppMode::Edit;
     let mut pressed_keys = HashSet::new();
     let mut cursor_position = None;
 
+    window.request_redraw();
+
     event_loop
         .run(|event, target| match event {
+            Event::Resumed => window.request_redraw(),
             Event::AboutToWait => window.request_redraw(),
 
             Event::WindowEvent { event, .. } => {
@@ -372,11 +384,112 @@ async fn run() {
                 match event {
                     WindowEvent::RedrawRequested => {
                         let raw_input = egui_state.take_egui_input(&window);
-                        let mut reset_camera = false;
+                        let editor_mode = match app_mode {
+                            AppMode::Edit => editor::EditorMode::Edit,
+                            AppMode::Run { .. } => editor::EditorMode::Run,
+                        };
+                        let mut panel_output = editor::EditorFrameOutput {
+                            reset_camera: false,
+                            action: None,
+                        };
                         let full_output = egui_ctx.run(raw_input, |ctx| {
-                            reset_camera = editor_session.show(ctx, displayed_arena_z);
+                            panel_output = editor_session.show(ctx, displayed_arena_z, editor_mode);
                         });
-                        editor_session.sync_tool_state(&mut wire_overlay, &device, &queue);
+                        if matches!(app_mode, AppMode::Edit) {
+                            editor_session.sync_tool_state(&mut wire_overlay, &device, &queue);
+                        }
+
+                        match panel_output.action {
+                            Some(editor::EditorPanelAction::StartRunning) => {
+                                if let Err(error) = level_context.refresh_component_from_board(
+                                    root_component_id,
+                                    &edit_board,
+                                    &edited_component,
+                                    &device,
+                                    &queue,
+                                ) {
+                                    eprintln!("Failed to refresh plan from edit board: {error}");
+                                } else {
+                                    match circuit_runtime::CircuitRuntime::build_and_link(
+                                        &level_context,
+                                        root_component_id,
+                                        &device,
+                                        &queue,
+                                    ) {
+                                        Ok(runtime) => {
+                                            wire_overlay.replace_wires(
+                                                &device,
+                                                &queue,
+                                                runtime.root.wires.wire_edges().cloned().collect(),
+                                            );
+                                            wire_overlay.set_visible_arena_z(&device, &queue, 0);
+                                            displayed_arena_z = 0;
+                                            app_mode = AppMode::Run {
+                                                runtime,
+                                                current_buffer: 0,
+                                                step_requested: false,
+                                            };
+                                        }
+                                        Err(error) => {
+                                            eprintln!("Failed to build runtime: {error}");
+                                        }
+                                    }
+                                }
+                            }
+                            Some(editor::EditorPanelAction::RestartRunning) => {
+                                if let AppMode::Run { .. } = app_mode {
+                                    match circuit_runtime::CircuitRuntime::build_and_link(
+                                        &level_context,
+                                        root_component_id,
+                                        &device,
+                                        &queue,
+                                    ) {
+                                        Ok(runtime) => {
+                                            wire_overlay.replace_wires(
+                                                &device,
+                                                &queue,
+                                                runtime.root.wires.wire_edges().cloned().collect(),
+                                            );
+                                            app_mode = AppMode::Run {
+                                                runtime,
+                                                current_buffer: 0,
+                                                step_requested: false,
+                                            };
+                                        }
+                                        Err(error) => {
+                                            eprintln!("Failed to rebuild runtime: {error}");
+                                        }
+                                    }
+                                }
+                            }
+                            Some(editor::EditorPanelAction::BackToEdit) => {
+                                if let AppMode::Run { .. } = app_mode {
+                                    match level_context.upload_component_to_board(
+                                        root_component_id,
+                                        &edit_board,
+                                        &device,
+                                        &queue,
+                                    ) {
+                                        Ok(wires) => {
+                                            edited_component = wires;
+                                            wire_overlay.replace_wires(
+                                                &device,
+                                                &queue,
+                                                edited_component.wire_edges().cloned().collect(),
+                                            );
+                                            wire_overlay.set_visible_arena_z(&device, &queue, 0);
+                                            displayed_arena_z = 0;
+                                            app_mode = AppMode::Edit;
+                                        }
+                                        Err(error) => {
+                                            eprintln!("Failed to restore edit mode board: {error}");
+                                        }
+                                    }
+                                }
+                            }
+                            None => {}
+                        }
+
                         egui_state.handle_platform_output(&window, full_output.platform_output);
                         let paint_jobs =
                             egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
@@ -393,7 +506,7 @@ async fn run() {
                         let zoom_step = 1.02;
                         editor_session.advance_visual_feedback();
 
-                        if reset_camera {
+                        if panel_output.reset_camera {
                             camera.reset_to_fit();
                         }
 
@@ -417,17 +530,25 @@ async fn run() {
                             camera.zoom_by(1.0 / zoom_step);
                         }
 
-                        let display_camera = editor_session.camera_with_feedback(camera);
+                        let display_camera = if matches!(app_mode, AppMode::Edit) {
+                            editor_session.camera_with_feedback(camera)
+                        } else {
+                            camera
+                        };
 
                         renderer.update_view_arena_z(&queue, display_camera, displayed_arena_z);
                         hover_preview.update(
                             &queue,
                             display_camera,
-                            editor_session.hover_preview_state(
-                                display_camera,
-                                cursor_position,
-                                !egui_ctx.is_pointer_over_area(),
-                            ),
+                            if matches!(app_mode, AppMode::Edit) {
+                                editor_session.hover_preview_state(
+                                    display_camera,
+                                    cursor_position,
+                                    !egui_ctx.is_pointer_over_area(),
+                                )
+                            } else {
+                                None
+                            },
                         );
                         wire_overlay.set_draft_color(
                             &device,
@@ -436,7 +557,28 @@ async fn run() {
                         );
                         wire_overlay.update_camera(&device, &queue, display_camera);
 
-                        let next_buffer = (current_buffer + 1) % simulation::CHARGE_BUFFER_COUNT;
+                        let mut maybe_next_buffer = None;
+                        let display_frame;
+
+                        match &app_mode {
+                            AppMode::Edit => {
+                                display_frame = 0;
+                            }
+                            AppMode::Run {
+                                current_buffer,
+                                step_requested,
+                                ..
+                            } => {
+                                let next_buffer =
+                                    (current_buffer + 1) % simulation::CHARGE_BUFFER_COUNT;
+                                maybe_next_buffer = Some(next_buffer);
+                                display_frame = if *step_requested {
+                                    next_buffer
+                                } else {
+                                    *current_buffer
+                                };
+                            }
+                        }
 
                         let frame = match surface.get_current_texture() {
                             Ok(frame) => frame,
@@ -450,23 +592,26 @@ async fn run() {
                             Err(wgpu::SurfaceError::Other) => return,
                         };
 
-                        let display_frame = if step_requested {
-                            next_buffer
-                        } else {
-                            current_buffer
-                        };
-
                         let mut encoder = device
                             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
-                        if step_requested {
-                            simulation.step(
-                                &device,
-                                &mut encoder,
-                                &board,
-                                current_buffer,
-                                next_buffer,
-                            );
+                        if let AppMode::Run {
+                            runtime,
+                            current_buffer,
+                            step_requested,
+                        } = &app_mode
+                        {
+                            if *step_requested {
+                                let next_buffer =
+                                    maybe_next_buffer.expect("run mode should have next buffer");
+                                runtime.simulation.step(
+                                    &device,
+                                    &mut encoder,
+                                    &runtime.root.board,
+                                    *current_buffer,
+                                    next_buffer,
+                                );
+                            }
                         }
 
                         egui_renderer.update_buffers(
@@ -477,21 +622,46 @@ async fn run() {
                             &screen_descriptor,
                         );
 
-                        renderer.draw(
-                            &device,
-                            &mut encoder,
-                            &frame.texture,
-                            board.charge_view(display_frame),
-                            board.circuit_view(),
-                        );
+                        match &app_mode {
+                            AppMode::Edit => {
+                                renderer.draw(
+                                    &device,
+                                    &mut encoder,
+                                    &frame.texture,
+                                    edit_board.charge_view(0),
+                                    edit_board.circuit_view(),
+                                );
 
-                        wire_overlay.draw(
-                            &device,
-                            &mut encoder,
-                            &frame.texture,
-                            board.charge_view(current_buffer),
-                            board.charge_view(display_frame),
-                        );
+                                wire_overlay.draw(
+                                    &device,
+                                    &mut encoder,
+                                    &frame.texture,
+                                    edit_board.charge_view(0),
+                                    edit_board.charge_view(display_frame),
+                                );
+                            }
+                            AppMode::Run {
+                                runtime,
+                                current_buffer,
+                                ..
+                            } => {
+                                renderer.draw(
+                                    &device,
+                                    &mut encoder,
+                                    &frame.texture,
+                                    runtime.root.board.charge_view(display_frame),
+                                    runtime.root.board.circuit_view(),
+                                );
+
+                                wire_overlay.draw(
+                                    &device,
+                                    &mut encoder,
+                                    &frame.texture,
+                                    runtime.root.board.charge_view(*current_buffer),
+                                    runtime.root.board.charge_view(display_frame),
+                                );
+                            }
+                        }
 
                         hover_preview.draw(&device, &mut encoder, &frame.texture);
 
@@ -524,9 +694,17 @@ async fn run() {
                         queue.submit(Some(encoder.finish()));
                         frame.present();
 
-                        if step_requested {
-                            current_buffer = next_buffer;
-                            step_requested = false;
+                        if let AppMode::Run {
+                            current_buffer,
+                            step_requested,
+                            ..
+                        } = &mut app_mode
+                        {
+                            if *step_requested {
+                                *current_buffer =
+                                    maybe_next_buffer.expect("run mode should have next buffer");
+                                *step_requested = false;
+                            }
                         }
                     }
                     WindowEvent::KeyboardInput { event, .. } => {
@@ -544,91 +722,108 @@ async fn run() {
                                     let shift_down = pressed_keys.contains(&KeyCode::ShiftLeft)
                                         || pressed_keys.contains(&KeyCode::ShiftRight);
 
-                                    if !event.repeat && control_down && code == KeyCode::KeyZ {
-                                        let changed = if shift_down {
-                                            editor_session.redo(
-                                                &board,
-                                                &mut edited_component,
-                                                &mut wire_overlay,
-                                                &device,
-                                                &queue,
-                                            )
-                                        } else {
-                                            editor_session.undo(
-                                                &board,
-                                                &mut edited_component,
-                                                &mut wire_overlay,
-                                                &device,
-                                                &queue,
-                                            )
-                                        };
-                                        if changed {
-                                            window.request_redraw();
+                                    if matches!(app_mode, AppMode::Edit) {
+                                        if !event.repeat && control_down && code == KeyCode::KeyZ {
+                                            let changed = if shift_down {
+                                                editor_session.redo(
+                                                    &edit_board,
+                                                    &mut edited_component,
+                                                    &mut wire_overlay,
+                                                    &device,
+                                                    &queue,
+                                                )
+                                            } else {
+                                                editor_session.undo(
+                                                    &edit_board,
+                                                    &mut edited_component,
+                                                    &mut wire_overlay,
+                                                    &device,
+                                                    &queue,
+                                                )
+                                            };
+                                            if changed {
+                                                window.request_redraw();
+                                            }
+                                            return;
                                         }
-                                        return;
-                                    }
 
-                                    if !event.repeat && control_down && code == KeyCode::KeyY {
-                                        if editor_session.redo(
-                                            &board,
-                                            &mut edited_component,
-                                            &mut wire_overlay,
-                                            &device,
-                                            &queue,
-                                        ) {
-                                            window.request_redraw();
+                                        if !event.repeat && control_down && code == KeyCode::KeyY {
+                                            if editor_session.redo(
+                                                &edit_board,
+                                                &mut edited_component,
+                                                &mut wire_overlay,
+                                                &device,
+                                                &queue,
+                                            ) {
+                                                window.request_redraw();
+                                            }
+                                            return;
                                         }
-                                        return;
                                     }
 
                                     if !event.repeat && code == KeyCode::Space {
-                                        step_requested = true;
+                                        if let AppMode::Run { step_requested, .. } = &mut app_mode {
+                                            *step_requested = true;
+                                        }
                                         window.request_redraw();
                                     }
 
                                     if !event.repeat && code == KeyCode::ArrowUp {
-                                        displayed_arena_z = (displayed_arena_z + 1)
-                                            .min(simulation::BOARD_LAYERS.saturating_sub(1));
-                                        wire_overlay.set_visible_arena_z(
-                                            &device,
-                                            &queue,
-                                            displayed_arena_z,
-                                        );
-                                        let hover = cursor_position.and_then(|cursor| {
-                                            wires::cursor_to_board_point(
-                                                camera,
-                                                cursor,
-                                                [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
-                                            )
-                                        });
-                                        wire_overlay.update_hover(&device, &queue, hover);
-                                        window.request_redraw();
+                                        if matches!(app_mode, AppMode::Run { .. }) {
+                                            displayed_arena_z = (displayed_arena_z + 1)
+                                                .min(simulation::BOARD_LAYERS.saturating_sub(1));
+                                            wire_overlay.set_visible_arena_z(
+                                                &device,
+                                                &queue,
+                                                displayed_arena_z,
+                                            );
+                                            let hover = cursor_position.and_then(|cursor| {
+                                                wires::cursor_to_board_point(
+                                                    camera,
+                                                    cursor,
+                                                    [
+                                                        simulation::GRID_WIDTH,
+                                                        simulation::GRID_HEIGHT,
+                                                    ],
+                                                )
+                                            });
+                                            wire_overlay.update_hover(&device, &queue, hover);
+                                            window.request_redraw();
+                                        }
                                     }
 
                                     if !event.repeat && code == KeyCode::ArrowDown {
-                                        displayed_arena_z = displayed_arena_z.saturating_sub(1);
-                                        wire_overlay.set_visible_arena_z(
-                                            &device,
-                                            &queue,
-                                            displayed_arena_z,
-                                        );
-                                        let hover = cursor_position.and_then(|cursor| {
-                                            wires::cursor_to_board_point(
-                                                camera,
-                                                cursor,
-                                                [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
-                                            )
-                                        });
-                                        wire_overlay.update_hover(&device, &queue, hover);
-                                        window.request_redraw();
+                                        if matches!(app_mode, AppMode::Run { .. }) {
+                                            displayed_arena_z = displayed_arena_z.saturating_sub(1);
+                                            wire_overlay.set_visible_arena_z(
+                                                &device,
+                                                &queue,
+                                                displayed_arena_z,
+                                            );
+                                            let hover = cursor_position.and_then(|cursor| {
+                                                wires::cursor_to_board_point(
+                                                    camera,
+                                                    cursor,
+                                                    [
+                                                        simulation::GRID_WIDTH,
+                                                        simulation::GRID_HEIGHT,
+                                                    ],
+                                                )
+                                            });
+                                            wire_overlay.update_hover(&device, &queue, hover);
+                                            window.request_redraw();
+                                        }
                                     }
 
-                                    if !event.repeat && code == KeyCode::Enter {
+                                    if !event.repeat
+                                        && code == KeyCode::Enter
+                                        && matches!(app_mode, AppMode::Edit)
+                                    {
                                         if editor_session.selected_tool()
                                             == editor::EditorTool::Wire
                                         {
                                             if editor_session.finish_wire_attempt(
-                                                &board,
+                                                &edit_board,
                                                 &mut edited_component,
                                                 &mut wire_overlay,
                                                 &device,
@@ -638,7 +833,10 @@ async fn run() {
                                         }
                                     }
 
-                                    if !event.repeat && code == KeyCode::Escape {
+                                    if !event.repeat
+                                        && code == KeyCode::Escape
+                                        && matches!(app_mode, AppMode::Edit)
+                                    {
                                         editor_session.cancel_wire_draft(
                                             &mut wire_overlay,
                                             &device,
@@ -647,7 +845,10 @@ async fn run() {
                                         window.request_redraw();
                                     }
 
-                                    if !event.repeat && code == KeyCode::Backspace {
+                                    if !event.repeat
+                                        && code == KeyCode::Backspace
+                                        && matches!(app_mode, AppMode::Edit)
+                                    {
                                         if editor_session.selected_tool()
                                             == editor::EditorTool::Wire
                                         {
@@ -692,10 +893,13 @@ async fn run() {
                         }
 
                         if let Some(cursor) = cursor_position {
+                            if !matches!(app_mode, AppMode::Edit) {
+                                return;
+                            }
                             let extend_wire = pressed_keys.contains(&KeyCode::ShiftLeft)
                                 || pressed_keys.contains(&KeyCode::ShiftRight);
                             if editor_session.handle_left_click(
-                                &board,
+                                &edit_board,
                                 &mut edited_component,
                                 &mut wire_overlay,
                                 &device,
@@ -719,10 +923,15 @@ async fn run() {
                             return;
                         }
 
+                        if !matches!(app_mode, AppMode::Edit) {
+                            window.request_redraw();
+                            return;
+                        }
+
                         let extend_wire = pressed_keys.contains(&KeyCode::ShiftLeft)
                             || pressed_keys.contains(&KeyCode::ShiftRight);
                         if editor_session.handle_right_click(
-                            &board,
+                            &edit_board,
                             &mut edited_component,
                             &mut wire_overlay,
                             &device,

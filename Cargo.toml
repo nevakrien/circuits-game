@@ -13,4 +13,5 @@ egui-wgpu = "0.33.3"
 egui-winit = "0.33.3"
 egui = "0.33.3"
 png = "0.18.1"
-
+serde = { version = "1.0.228", features = ["derive"] }
+bincode = "1.3.3"
