@@ -22,7 +22,9 @@ pub struct WindowState {
     pub gpu: GpuState,
 }
 
-pub async fn prepare_gpu(compatible_surface: Option<&wgpu::Surface<'_>>) -> Result<GpuState, String> {
+pub async fn prepare_gpu(
+    compatible_surface: Option<&wgpu::Surface<'_>>,
+) -> Result<GpuState, String> {
     prepare_gpu_with_instance(wgpu::Instance::default(), compatible_surface).await
 }
 

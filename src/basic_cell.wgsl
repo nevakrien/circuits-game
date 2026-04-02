@@ -8,6 +8,9 @@ var circuits: texture_3d<u32>;
 var out_tex: texture_storage_3d<rgba8uint, write>;
 
 @group(0) @binding(3)
+var<storage, read> component_inputs: array<u32>;
+
+@group(0) @binding(4)
 var<storage, read_write> component_outputs: array<u32>;
 
 fn byte_channel(coord: vec2<u32>) -> u32 {
@@ -125,6 +128,10 @@ fn write_output(dims: vec3<u32>, coord: vec3<u32>, value: u32) {
     component_outputs[output_index(dims, coord)] = value & 0xffu;
 }
 
+fn read_component_input(dims: vec3<u32>, coord: vec3<u32>) -> u32 {
+    return component_inputs[output_index(dims, coord)] & 0xffu;
+}
+
 fn update_not(
     dims: vec3<u32>,
     coord: vec3<u32>,
@@ -187,6 +194,19 @@ fn update_output(
     return next_charge;
 }
 
+fn update_input(
+    dims: vec3<u32>,
+    coord: vec3<u32>,
+    current_charge: u32,
+    circuit: vec4<u32>,
+    payload: vec3<u32>,
+) -> u32 {
+    _ = current_charge;
+    _ = circuit;
+    _ = payload;
+    return read_component_input(dims, coord);
+}
+
 fn update_tag(
     dims: vec3<u32>,
     coord: vec3<u32>,
@@ -212,6 +232,9 @@ fn update_tag(
         }
         case 10u: {
             return update_output(dims, coord, current_charge, circuit, payload);
+        }
+        case 11u: {
+            return update_input(dims, coord, current_charge, circuit, payload);
         }
         default: {
             return current_charge;

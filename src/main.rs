@@ -601,11 +601,7 @@ async fn run() {
                                                 [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
                                             )
                                         });
-                                        wire_overlay.update_hover(
-                                            &device,
-                                            &queue,
-                                            hover,
-                                        );
+                                        wire_overlay.update_hover(&device, &queue, hover);
                                         window.request_redraw();
                                     }
 
@@ -623,11 +619,7 @@ async fn run() {
                                                 [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
                                             )
                                         });
-                                        wire_overlay.update_hover(
-                                            &device,
-                                            &queue,
-                                            hover,
-                                        );
+                                        wire_overlay.update_hover(&device, &queue, hover);
                                         window.request_redraw();
                                     }
 

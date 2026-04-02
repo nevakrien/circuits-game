@@ -289,6 +289,7 @@ fn tool_preview_state(tool: crate::editor::EditorTool) -> ([u32; 4], u32) {
     let snapshot = match tool {
         crate::editor::EditorTool::Wire => [255, 0, 0, 0],
         crate::editor::EditorTool::Source => crate::simulation::CellSnapshot::source(0xff).words,
+        crate::editor::EditorTool::Input => crate::simulation::CellSnapshot::input().words,
         crate::editor::EditorTool::Noop => crate::simulation::CellSnapshot::noop().words,
         crate::editor::EditorTool::Not => {
             crate::simulation::CellSnapshot::gate(crate::simulation::GateKind::Not).words

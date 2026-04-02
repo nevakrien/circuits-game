@@ -1,7 +1,7 @@
 use crate::{
     simulation::{CellSnapshot, GateKind},
     wire_render::{StoredWireEdge, WireEndpointId},
-    wires::{GridCell, WirePoint, DEFAULT_WIRE_COLOR},
+    wires::{DEFAULT_WIRE_COLOR, GridCell, WirePoint},
 };
 
 pub struct DemoComponent {
@@ -226,9 +226,11 @@ mod tests {
         );
         assert_eq!(component.cell_at(7, 2, 1), CellSnapshot::empty());
         assert_eq!(component.wires.len(), 14);
-        assert!(component
-            .wires
-            .iter()
-            .all(|wire| wire.source_id.arena_z == 0));
+        assert!(
+            component
+                .wires
+                .iter()
+                .all(|wire| wire.source_id.arena_z == 0)
+        );
     }
 }

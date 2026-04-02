@@ -40,6 +40,7 @@ const INVALID_CONNECTION_OVERLAY: [f32; 4] = [0.92, 0.12, 0.12, 0.72];
 pub enum EditorTool {
     Wire,
     Source,
+    Input,
     Noop,
     Not,
     And,
@@ -52,9 +53,11 @@ pub enum EditorTool {
 }
 
 impl EditorTool {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Wire,
         Self::Source,
+        Self::Input,
+        Self::Output,
         Self::Noop,
         Self::Not,
         Self::And,
@@ -63,7 +66,6 @@ impl EditorTool {
         Self::Nand,
         Self::Nor,
         Self::Xnor,
-        Self::Output,
     ];
 
     pub const COUNT: usize = Self::ALL.len();
@@ -76,15 +78,16 @@ impl EditorTool {
         match self {
             Self::Wire => 0,
             Self::Source => 1,
-            Self::Noop => 2,
-            Self::Not => 3,
-            Self::And => 4,
-            Self::Or => 5,
-            Self::Xor => 6,
-            Self::Nand => 7,
-            Self::Nor => 8,
-            Self::Xnor => 9,
-            Self::Output => 10,
+            Self::Input => 2,
+            Self::Output => 3,
+            Self::Noop => 4,
+            Self::Not => 5,
+            Self::And => 6,
+            Self::Or => 7,
+            Self::Xor => 8,
+            Self::Nand => 9,
+            Self::Nor => 10,
+            Self::Xnor => 11,
         }
     }
 
@@ -92,6 +95,7 @@ impl EditorTool {
         match self {
             Self::Wire => "Wire",
             Self::Source => "Source",
+            Self::Input => "Input",
             Self::Noop => "NO-OP",
             Self::Not => "NOT",
             Self::And => "AND",
@@ -108,6 +112,7 @@ impl EditorTool {
         match self {
             Self::Wire => "Connect components",
             Self::Source => "Constant",
+            Self::Input => "Component input",
             Self::Noop => "Pass-through",
             Self::Not => "Not Gate",
             Self::And => "And Gate",
@@ -172,6 +177,7 @@ pub struct EditorSession {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ConnectionCellKind {
     Source,
+    Input,
     Noop,
     UnaryGate,
     BinaryGate,
@@ -969,6 +975,7 @@ fn snapshot_for_tool(tool: EditorTool) -> Option<simulation::CellSnapshot> {
     match tool {
         EditorTool::Wire => None,
         EditorTool::Source => Some(simulation::CellSnapshot::source(0xff)),
+        EditorTool::Input => Some(simulation::CellSnapshot::input()),
         EditorTool::Noop => Some(simulation::CellSnapshot::noop()),
         EditorTool::Not => Some(simulation::CellSnapshot::gate(simulation::GateKind::Not)),
         EditorTool::And => Some(simulation::CellSnapshot::gate(simulation::GateKind::And)),
@@ -1222,6 +1229,7 @@ fn classify_connection_cell(snapshot: simulation::CellSnapshot) -> Option<Connec
     match snapshot.kind() {
         simulation::CellKind::Empty => None,
         simulation::CellKind::Source => Some(ConnectionCellKind::Source),
+        simulation::CellKind::Input => Some(ConnectionCellKind::Input),
         simulation::CellKind::Noop => Some(ConnectionCellKind::Noop),
         simulation::CellKind::Not => Some(ConnectionCellKind::UnaryGate),
         simulation::CellKind::And
@@ -1240,6 +1248,7 @@ fn validate_source_endpoint_kind(
 ) -> Result<(), WireConnectionError> {
     match source_kind {
         ConnectionCellKind::Source
+        | ConnectionCellKind::Input
         | ConnectionCellKind::Noop
         | ConnectionCellKind::UnaryGate
         | ConnectionCellKind::BinaryGate => Ok(()),
@@ -1258,7 +1267,10 @@ fn destination_input_slot_for_edge(
     let local_y = (end_point.y - destination_y).clamp(0.0, 0.999);
 
     match destination.effective_kind {
-        ConnectionCellKind::Noop | ConnectionCellKind::UnaryGate | ConnectionCellKind::Output => {
+        ConnectionCellKind::Noop
+        | ConnectionCellKind::Input
+        | ConnectionCellKind::UnaryGate
+        | ConnectionCellKind::Output => {
             // Unary destinations only have one logical input, so any snapped hit on the tile
             // resolves to that single input.
             let _ = local_x;
@@ -1398,6 +1410,7 @@ fn output_anchor_for_cell(
     let y = grid_cell.y as f32;
     let anchor_x = match cell_kind {
         ConnectionCellKind::Source => 0.73,
+        ConnectionCellKind::Input => 0.885,
         ConnectionCellKind::Noop
         | ConnectionCellKind::UnaryGate
         | ConnectionCellKind::BinaryGate
