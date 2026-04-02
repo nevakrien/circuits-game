@@ -1,5 +1,5 @@
 @group(0) @binding(0)
-var history: texture_3d<u32>;
+var history: texture_storage_3d<rgba8uint, read>;
 
 @group(0) @binding(1)
 var circuits: texture_3d<u32>;
@@ -11,9 +11,9 @@ fn byte_channel(coord: vec2<u32>) -> u32 {
     return (coord.y & 1u) * 2u + (coord.x & 1u);
 }
 
-fn read_byte(tex: texture_3d<u32>, coord: vec3<u32>) -> u32 {
+fn read_byte(tex: texture_storage_3d<rgba8uint, read>, coord: vec3<u32>) -> u32 {
     let packed_coord = vec3<i32>(i32(coord.x >> 1u), i32(coord.y >> 1u), i32(coord.z));
-    let packed = textureLoad(tex, packed_coord, 0);
+    let packed = textureLoad(tex, packed_coord);
 
     switch (byte_channel(coord.xy)) {
         case 0u: {
