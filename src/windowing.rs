@@ -23,7 +23,13 @@ pub struct WindowState {
 }
 
 pub async fn prepare_gpu(compatible_surface: Option<&wgpu::Surface<'_>>) -> Result<GpuState, String> {
-    let instance = wgpu::Instance::default();
+    prepare_gpu_with_instance(wgpu::Instance::default(), compatible_surface).await
+}
+
+pub async fn prepare_gpu_with_instance(
+    instance: wgpu::Instance,
+    compatible_surface: Option<&wgpu::Surface<'_>>,
+) -> Result<GpuState, String> {
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             compatible_surface,
@@ -60,9 +66,11 @@ pub async fn prepare_window() -> WindowState {
             .create_window(WindowAttributes::default())
             .unwrap(),
     );
-    let bootstrap_instance = wgpu::Instance::default();
-    let surface = create_surface(&bootstrap_instance, &window).unwrap();
-    let gpu = prepare_gpu(Some(&surface)).await.unwrap();
+    let instance = wgpu::Instance::default();
+    let surface = create_surface(&instance, &window).unwrap();
+    let gpu = prepare_gpu_with_instance(instance, Some(&surface))
+        .await
+        .unwrap();
 
     WindowState {
         event_loop,

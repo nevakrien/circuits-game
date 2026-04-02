@@ -636,22 +636,15 @@ impl HoverPreviewRenderer {
 mod tests {
     use super::*;
 
-    async fn create_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-        crate::windowing::prepare_gpu(None)
-            .await
-            .ok()
-            .map(|gpu| (gpu.device, gpu.queue))
-    }
-
     #[test]
     fn renderer_initializes_with_headless_device() {
-        let Some((device, queue)) = pollster::block_on(create_headless_device()) else {
+        let Some(gpu) = crate::test_gpu::shared_test_gpu() else {
             return;
         };
 
         let _renderer = Renderer::new(
-            &device,
-            &queue,
+            &gpu.device,
+            &gpu.queue,
             wgpu::TextureFormat::Bgra8UnormSrgb,
             PhysicalSize::new(128, 128),
         );

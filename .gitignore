@@ -44,3 +44,4 @@
 # Added by cargo
 
 /target
+/data

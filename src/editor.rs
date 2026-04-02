@@ -893,7 +893,9 @@ fn delete_at_cursor(
                 ))
             })
             .collect::<Vec<_>>();
-        if cell.kind() == simulation::CellKind::Empty && charge_values.iter().all(|value| *value == 0) {
+        if cell.kind() == simulation::CellKind::Empty
+            && charge_values.iter().all(|value| *value == 0)
+        {
             return None;
         }
         simulation.clear_cell(queue, grid_cell, displayed_arena_z);
@@ -1065,7 +1067,10 @@ fn apply_inverse_action(
         EditorAction::UpdateDraft { before, .. } => {
             wire_overlay.restore_draft(device, queue, before.as_ref());
         }
-        EditorAction::CommitWire { plan, previous_draft } => {
+        EditorAction::CommitWire {
+            plan,
+            previous_draft,
+        } => {
             undo_wire_commit_plan(plan, simulation, component, wire_overlay, device, queue);
             wire_overlay.restore_draft(device, queue, previous_draft.as_ref());
         }
@@ -1144,18 +1149,15 @@ fn plan_wire_commit(
     )?;
 
     validate_source_endpoint_kind(source.effective_kind, source.grid_cell)?;
-    let destination_slot = destination_input_slot_for_edge(&edge, destination)
-        .ok_or(WireConnectionError::InvalidDestinationSlot(destination.grid_cell))?;
+    let destination_slot = destination_input_slot_for_edge(&edge, destination).ok_or(
+        WireConnectionError::InvalidDestinationSlot(destination.grid_cell),
+    )?;
     snap_edge_endpoints(&mut edge, source, destination, destination_slot);
 
     let mut replaced_inputs = Vec::new();
     for conflict in conflicting_edges_for_slot(component, destination, destination_slot) {
         replaced_inputs.push(plan_wire_removal(
-            simulation,
-            component,
-            device,
-            queue,
-            conflict,
+            simulation, component, device, queue, conflict,
         ));
     }
 
@@ -1281,9 +1283,12 @@ fn conflicting_edges_for_slot(
     component
         .wire_edges()
         .filter(|edge| {
-            edge.destination_id == wire_render::WireEndpointId::from_grid_cell(destination.grid_cell, edge.destination_id.arena_z)
-                && destination_input_slot_for_edge(edge, destination)
-                    == Some(destination_slot)
+            edge.destination_id
+                == wire_render::WireEndpointId::from_grid_cell(
+                    destination.grid_cell,
+                    edge.destination_id.arena_z,
+                )
+                && destination_input_slot_for_edge(edge, destination) == Some(destination_slot)
         })
         .cloned()
         .collect()
@@ -1377,7 +1382,11 @@ fn snap_edge_endpoints(
         *first = output_anchor_for_cell(source.grid_cell, source.effective_kind);
     }
     if let Some(last) = edge.points.last_mut() {
-        *last = input_anchor_for_cell(destination.grid_cell, destination.effective_kind, destination_slot);
+        *last = input_anchor_for_cell(
+            destination.grid_cell,
+            destination.effective_kind,
+            destination_slot,
+        );
     }
 }
 
@@ -1414,7 +1423,11 @@ fn input_anchor_for_cell(
         },
         _ => wires::WirePoint {
             x: x + 0.11,
-            y: y + if matches!(destination_slot, DestinationInputSlot::Upper) { 0.24 } else { 0.5 },
+            y: y + if matches!(destination_slot, DestinationInputSlot::Upper) {
+                0.24
+            } else {
+                0.5
+            },
         },
     }
 }
@@ -1451,7 +1464,12 @@ fn plan_wire_removal(
     };
 
     let destination_grid_cell = edge.destination_id.as_grid_cell();
-    let destination_snapshot = simulation.read_cell(device, queue, destination_grid_cell, edge.destination_id.arena_z);
+    let destination_snapshot = simulation.read_cell(
+        device,
+        queue,
+        destination_grid_cell,
+        edge.destination_id.arena_z,
+    );
     if let Some(destination_kind) = classify_connection_cell(destination_snapshot) {
         let destination = EndpointResolution {
             grid_cell: destination_grid_cell,
@@ -1471,14 +1489,7 @@ fn plan_wire_removal(
         }
     }
 
-    remove_wire_chain_one_hop_at_a_time(
-        simulation,
-        component,
-        device,
-        queue,
-        edge,
-        &mut plan,
-    );
+    remove_wire_chain_one_hop_at_a_time(simulation, component, device, queue, edge, &mut plan);
     plan
 }
 
@@ -1494,7 +1505,11 @@ fn remove_wire_chain_one_hop_at_a_time(
         return;
     }
 
-    let Some(removed_edge) = component.wire_edges().find(|candidate| *candidate == &edge).cloned() else {
+    let Some(removed_edge) = component
+        .wire_edges()
+        .find(|candidate| *candidate == &edge)
+        .cloned()
+    else {
         return;
     };
 
@@ -1576,7 +1591,9 @@ fn cell_edit_for_snapshot_change(
         grid_cell,
         arena_z,
         previous_cell,
-        previous_charge_values: read_charge_values_for_cell(simulation, device, queue, grid_cell, arena_z),
+        previous_charge_values: read_charge_values_for_cell(
+            simulation, device, queue, grid_cell, arena_z,
+        ),
         new_cell,
         new_charge_values: vec![0x00; simulation::CHARGE_BUFFER_COUNT as usize],
     }
@@ -1908,28 +1925,23 @@ mod tests {
 
     const TEST_SURFACE_SIZE: PhysicalSize<u32> = PhysicalSize::new(1600, 900);
 
-    async fn create_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-        crate::windowing::prepare_gpu(None)
-            .await
-            .ok()
-            .map(|gpu| (gpu.device, gpu.queue))
-    }
-
     fn create_editor_test_context() -> Option<(
-        wgpu::Device,
-        wgpu::Queue,
+        &'static wgpu::Device,
+        &'static wgpu::Queue,
         simulation::BoardTextures,
         wire_render::WireRenderInfo,
         wires::WireOverlay,
         render::CameraState,
         EditorSession,
     )> {
-        let (device, queue) = pollster::block_on(create_headless_device())?;
-        let simulation = simulation::BoardTextures::new(&device, &queue);
+        let gpu = crate::test_gpu::shared_test_gpu()?;
+        let device = &gpu.device;
+        let queue = &gpu.queue;
+        let simulation = simulation::BoardTextures::new(device, queue);
         let component = wire_render::WireRenderInfo::new();
         let wire_overlay = wires::WireOverlay::new(
-            &device,
-            &queue,
+            device,
+            queue,
             wgpu::TextureFormat::Bgra8UnormSrgb,
             TEST_SURFACE_SIZE,
             [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
@@ -2414,8 +2426,15 @@ mod tests {
 
     #[test]
     fn replacing_a_wire_input_keeps_logic_and_wire_in_sync_across_undo_redo() {
-        let Some((device, queue, simulation, mut component, mut wire_overlay, _camera, mut session)) =
-            create_editor_test_context()
+        let Some((
+            device,
+            queue,
+            simulation,
+            mut component,
+            mut wire_overlay,
+            _camera,
+            mut session,
+        )) = create_editor_test_context()
         else {
             return;
         };
@@ -2498,10 +2517,18 @@ mod tests {
         });
 
         assert_eq!(component.wire_edges().count(), 1);
-        assert_eq!(component.wire_edges().next().unwrap().source_id.x, source_b.x);
-        assert_eq!(component.wire_edges().next().unwrap().source_id.y, source_b.y);
         assert_eq!(
-            simulation.read_cell(&device, &queue, destination, 0).primary_input(),
+            component.wire_edges().next().unwrap().source_id.x,
+            source_b.x
+        );
+        assert_eq!(
+            component.wire_edges().next().unwrap().source_id.y,
+            source_b.y
+        );
+        assert_eq!(
+            simulation
+                .read_cell(&device, &queue, destination, 0)
+                .primary_input(),
             Some(source_b)
         );
 
@@ -2513,10 +2540,18 @@ mod tests {
             &queue,
         ));
         assert_eq!(component.wire_edges().count(), 1);
-        assert_eq!(component.wire_edges().next().unwrap().source_id.x, source_a.x);
-        assert_eq!(component.wire_edges().next().unwrap().source_id.y, source_a.y);
         assert_eq!(
-            simulation.read_cell(&device, &queue, destination, 0).primary_input(),
+            component.wire_edges().next().unwrap().source_id.x,
+            source_a.x
+        );
+        assert_eq!(
+            component.wire_edges().next().unwrap().source_id.y,
+            source_a.y
+        );
+        assert_eq!(
+            simulation
+                .read_cell(&device, &queue, destination, 0)
+                .primary_input(),
             Some(source_a)
         );
 
@@ -2528,10 +2563,18 @@ mod tests {
             &queue,
         ));
         assert_eq!(component.wire_edges().count(), 1);
-        assert_eq!(component.wire_edges().next().unwrap().source_id.x, source_b.x);
-        assert_eq!(component.wire_edges().next().unwrap().source_id.y, source_b.y);
         assert_eq!(
-            simulation.read_cell(&device, &queue, destination, 0).primary_input(),
+            component.wire_edges().next().unwrap().source_id.x,
+            source_b.x
+        );
+        assert_eq!(
+            component.wire_edges().next().unwrap().source_id.y,
+            source_b.y
+        );
+        assert_eq!(
+            simulation
+                .read_cell(&device, &queue, destination, 0)
+                .primary_input(),
             Some(source_b)
         );
     }
@@ -2585,7 +2628,9 @@ mod tests {
 
         assert_eq!(component.wire_edges().count(), 1);
         assert_eq!(
-            simulation.read_cell(&device, &queue, destination, 0).primary_input(),
+            simulation
+                .read_cell(&device, &queue, destination, 0)
+                .primary_input(),
             Some(source)
         );
 
@@ -2604,7 +2649,9 @@ mod tests {
 
         assert_eq!(component.wire_edges().count(), 0);
         assert_eq!(
-            simulation.read_cell(&device, &queue, destination, 0).primary_input(),
+            simulation
+                .read_cell(&device, &queue, destination, 0)
+                .primary_input(),
             None
         );
 
@@ -2617,7 +2664,9 @@ mod tests {
         ));
         assert_eq!(component.wire_edges().count(), 1);
         assert_eq!(
-            simulation.read_cell(&device, &queue, destination, 0).primary_input(),
+            simulation
+                .read_cell(&device, &queue, destination, 0)
+                .primary_input(),
             Some(source)
         );
     }

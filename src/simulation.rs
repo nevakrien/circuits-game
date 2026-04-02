@@ -877,13 +877,6 @@ fn output_cell() -> CircuitCell {
 mod tests {
     use super::*;
 
-    async fn create_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-        crate::windowing::prepare_gpu(None)
-            .await
-            .ok()
-            .map(|gpu| (gpu.device, gpu.queue))
-    }
-
     fn bool_to_charge(value: bool) -> u8 {
         if value { 0xff } else { 0x00 }
     }
@@ -1016,33 +1009,35 @@ mod tests {
 
     #[test]
     fn output_cells_write_to_component_output_buffer() {
-        let Some((device, queue)) = pollster::block_on(create_headless_device()) else {
+        let Some(gpu) = crate::test_gpu::shared_test_gpu() else {
             return;
         };
 
-        let board = BoardTextures::new(&device, &queue);
+        let device = &gpu.device;
+        let queue = &gpu.queue;
+
+        let board = BoardTextures::new(device, queue);
         board.write_cell(
-            &queue,
+            queue,
             GridCell { x: 1, y: 0 },
             0,
             CellSnapshot::output().with_primary_input(GridCell { x: 0, y: 0 }),
         );
-        board.clear_charge_at(&device, &queue, GridCell { x: 1, y: 0 }, 0);
+        board.clear_charge_at(device, queue, GridCell { x: 1, y: 0 }, 0);
 
-        let simulation = Simulation::new(&device);
+        let simulation = Simulation::new(device);
         for (current_buffer, next_buffer) in [(0, 1), (1, 0)] {
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("output-buffer-test-step"),
             });
-            simulation.step(&device, &mut encoder, &board, current_buffer, next_buffer);
+            simulation.step(device, &mut encoder, &board, current_buffer, next_buffer);
             queue.submit(Some(encoder.finish()));
         }
 
-        let output_value =
-            pollster::block_on(board.read_output_value(&device, &queue, 1, 0, 0));
+        let output_value = pollster::block_on(board.read_output_value(device, queue, 1, 0, 0));
         assert_eq!(output_value, 0xff);
 
-        let output_values = pollster::block_on(board.read_output_buffer(&device, &queue));
+        let output_values = pollster::block_on(board.read_output_buffer(device, queue));
         assert_eq!(output_values[output_slot_index(1, 0, 0)], 0xff);
         assert!(output_values
             .iter()
@@ -1052,12 +1047,15 @@ mod tests {
 
     #[test]
     fn simulation_step_can_be_read_back_without_window() {
-        let Some((device, queue)) = pollster::block_on(create_headless_device()) else {
+        let Some(gpu) = crate::test_gpu::shared_test_gpu() else {
             return;
         };
 
-        let board = BoardTextures::new(&device, &queue);
-        let simulation = Simulation::new(&device);
+        let device = &gpu.device;
+        let queue = &gpu.queue;
+
+        let board = BoardTextures::new(device, queue);
+        let simulation = Simulation::new(device);
         let mut current_buffer = 0;
 
         for step in 1..=GRID_HEIGHT {
@@ -1065,14 +1063,14 @@ mod tests {
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("simulation-test-step"),
             });
-            simulation.step(&device, &mut encoder, &board, current_buffer, next_buffer);
+            simulation.step(device, &mut encoder, &board, current_buffer, next_buffer);
             queue.submit(Some(encoder.finish()));
 
-            let texels = pollster::block_on(board.read_charge_buffer(&device, &queue, next_buffer));
+            let texels = pollster::block_on(board.read_charge_buffer(device, queue, next_buffer));
             let expected = expected_charge_texels_after_steps(step);
 
             assert_eq!(
-                pollster::block_on(board.read_charge_value(&device, &queue, next_buffer, 0, 0, 0)),
+                pollster::block_on(board.read_charge_value(device, queue, next_buffer, 0, 0, 0)),
                 read_packed_charge(&expected, 0, 0, 0)
             );
 
