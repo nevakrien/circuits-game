@@ -1,41 +1,57 @@
 # Component Model Notes
 
-## Direction
+## Current State
 
-The long-term model is **not** "the editor activates a layer".
+The editor now works with an explicit plan/runtime split.
 
-- The thing being edited is a **component plan**.
-- A plan can have child component plans and multiple instances.
-- Runtime state lives on **component instances**, not on an abstract layer concept.
-- The packed 3D textures are an execution/storage detail for batching many component instances in one pass.
+- `ComponentPlan` in `src/component_plan.rs` is the editable and serializable board definition.
+- `LevelContext` in `src/level_context.rs` owns all component plans for one schematic, tracks the root component, and handles validation plus save/load.
+- `CircuitRuntime` in `src/circuit_runtime.rs` builds GPU runtime state from a validated `LevelContext`.
 
-## Current Terminology Rule
+## Terminology
 
-When code refers to the `z` coordinate inside the packed textures, call it something like:
+Use these terms consistently in code and docs:
 
-- `arena_z`
-- `component_z`
-- `arena_index`
+- **component plan**: editable board definition
+- **level context**: collection of plans plus root-component metadata
+- **circuit runtime**: GPU-backed runnable state built from plans
+- **arena_z**: packed texture slice index used by rendering/simulation internals
 
-Do **not** call that a `layer` in new UI or new editor-facing APIs. `Layer` is too overloaded and suggests the user is selecting an editing layer, which is the wrong model.
+Avoid using `layer` for user-facing editing concepts. In the current codebase, `arena_z` is still a valid low-level rendering/simulation term, but it should not replace the higher-level plan/runtime model.
 
-## Editing Model
+## Editing and Run Flow
 
-- Editing targets a **component plan**.
-- In the current mental model, the edited component is effectively the root plan.
-- Child components only appear as **instances of existing plans**; they are not the thing the user is directly editing in the same sense.
-- That means there is a strong argument that active editing happens at `arena_z = 0` for the edited plan, while non-zero packed `z` ranges are runtime placement details for instances.
+`src/main.rs` currently has two app modes:
 
-## GPU / CPU Direction
+- `Edit`: the board shown in the editor is backed by the root `ComponentPlan`
+- `Run`: the app builds a fresh `CircuitRuntime` from the current `LevelContext` and simulates that runtime
 
-- Gate/circuit data and charge data should eventually be packed into batched 3D textures.
-- Each component instance should own an allocated range in those textures.
-- Simulation should advance across the packed batch in one forward pass rather than one kernel per 2D slice.
-- Rendering should use views into the packed textures for the relevant component instance.
-- Automatic simulation stepping is still expected to be CPU-driven at the orchestration level.
+The transition works like this:
 
-## Refactor Guidance
+1. Edit mode uploads the root plan into board textures for interactive editing.
+2. `Start Running` or `Restart Running` validates the context and builds a new runtime.
+3. `Back to Edit` copies the edited board state back into the root plan.
 
-- Safe short-term work: rename misleading `layer` names that actually mean packed texture `z` or arena placement.
-- Do not introduce more editor concepts that imply the user is selecting or editing a layer.
-- The bigger follow-up refactor is to replace remaining fake-layer assumptions with explicit component-plan/component-instance terminology.
+This keeps editable plan data separate from live simulation state.
+
+## Schematic Files
+
+Schematics are saved through `LevelContext` as binary `bincode` data.
+
+- file extension: `.circuit_schematic`
+- save/load entrypoints: `LevelContext::save_to_path` and `LevelContext::load_from_path`
+- validation rejects missing roots, missing dependencies, direct self-cycles, and dependency cycles
+
+## Current Limits
+
+The data model already includes placeholders for nested component work, but nested runtime behavior is not implemented yet.
+
+- `ComponentPlan` stores `child_mentions`
+- `CircuitRuntime::build_and_link` still has TODOs for child runtime construction and parent/child IO linking
+- the current editor experience is centered on the root component plan
+
+## Guidance For Future Changes
+
+- Prefer documenting user-visible behavior in terms of plans, schematics, and runtimes.
+- Reserve `arena_z` for low-level packed-texture behavior.
+- If nested components become runnable, update this file to describe the actual execution/linking model instead of adding another forward-looking plan doc.
