@@ -1909,16 +1909,10 @@ mod tests {
     const TEST_SURFACE_SIZE: PhysicalSize<u32> = PhysicalSize::new(1600, 900);
 
     async fn create_headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-        let instance = wgpu::Instance::default();
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions::default())
-            .await
-            .ok()?;
-
-        adapter
-            .request_device(&simulation::device_descriptor(&adapter))
+        crate::windowing::prepare_gpu(None)
             .await
             .ok()
+            .map(|gpu| (gpu.device, gpu.queue))
     }
 
     fn create_editor_test_context() -> Option<(

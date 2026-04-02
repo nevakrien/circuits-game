@@ -8,13 +8,48 @@ use winit::{
     window::{Window, WindowAttributes},
 };
 
-pub struct WindowState {
-    pub event_loop: EventLoop<()>,
-    pub window: Arc<Window>,
+pub struct GpuState {
     pub instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
+}
+
+pub struct WindowState {
+    pub event_loop: EventLoop<()>,
+    pub window: Arc<Window>,
+    pub surface: wgpu::Surface<'static>,
+    pub gpu: GpuState,
+}
+
+pub async fn prepare_gpu(compatible_surface: Option<&wgpu::Surface<'_>>) -> Result<GpuState, String> {
+    let instance = wgpu::Instance::default();
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            compatible_surface,
+            ..Default::default()
+        })
+        .await
+        .map_err(|error| format!("Unable to create adapter: {error}"))?;
+
+    let (device, queue) = adapter
+        .request_device(&crate::simulation::device_descriptor(&adapter))
+        .await
+        .map_err(|error| format!("Unable to create device: {error}"))?;
+
+    Ok(GpuState {
+        instance,
+        adapter,
+        device,
+        queue,
+    })
+}
+
+pub fn create_surface(
+    instance: &wgpu::Instance,
+    window: &Arc<Window>,
+) -> Result<wgpu::Surface<'static>, wgpu::CreateSurfaceError> {
+    instance.create_surface(window.clone())
 }
 
 #[allow(deprecated)]
@@ -25,28 +60,15 @@ pub async fn prepare_window() -> WindowState {
             .create_window(WindowAttributes::default())
             .unwrap(),
     );
-
-    let instance = wgpu::Instance::default();
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            compatible_surface: None,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-
-    let (device, queue) = adapter
-        .request_device(&crate::simulation::device_descriptor(&adapter))
-        .await
-        .unwrap();
+    let bootstrap_instance = wgpu::Instance::default();
+    let surface = create_surface(&bootstrap_instance, &window).unwrap();
+    let gpu = prepare_gpu(Some(&surface)).await.unwrap();
 
     WindowState {
         event_loop,
         window,
-        instance,
-        adapter,
-        device,
-        queue,
+        surface,
+        gpu,
     }
 }
 
@@ -70,6 +92,14 @@ pub fn configure_surface(
 
     surface.configure(device, &config);
     config
+}
+
+pub fn reconfigure_surface(
+    surface: &wgpu::Surface<'_>,
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+) {
+    surface.configure(device, config);
 }
 
 pub fn resize_surface(

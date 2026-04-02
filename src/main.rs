@@ -144,15 +144,7 @@ fn parse_u32_flag(flag: &str, value: &str) -> Result<u32, String> {
 }
 
 async fn render_scene_to_png(options: &RenderSceneOptions) -> Result<(), String> {
-    let instance = wgpu::Instance::default();
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions::default())
-        .await
-        .map_err(|error| format!("Unable to create adapter: {error}"))?;
-    let (device, queue) = adapter
-        .request_device(&simulation::device_descriptor(&adapter))
-        .await
-        .map_err(|error| format!("Unable to create device: {error}"))?;
+    let windowing::GpuState { device, queue, .. } = windowing::prepare_gpu(None).await?;
 
     let surface_size = winit::dpi::PhysicalSize::new(options.width, options.height);
     let output_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -310,13 +302,15 @@ async fn run() {
     let windowing::WindowState {
         event_loop,
         window,
-        instance,
-        adapter,
-        device,
-        queue,
+        surface,
+        gpu:
+            windowing::GpuState {
+                adapter,
+                device,
+                queue,
+                ..
+            },
     } = windowing::prepare_window().await;
-
-    let surface = instance.create_surface(window.clone()).unwrap();
     let mut config = windowing::configure_surface(&surface, &adapter, &device, window.inner_size());
 
     let board = simulation::BoardTextures::new(&device, &queue);
@@ -447,7 +441,7 @@ async fn run() {
                         let frame = match surface.get_current_texture() {
                             Ok(frame) => frame,
                             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
-                                surface.configure(&device, &config);
+                                windowing::reconfigure_surface(&surface, &device, &config);
                                 return;
                             }
                             Err(wgpu::SurfaceError::Timeout | wgpu::SurfaceError::OutOfMemory) => {

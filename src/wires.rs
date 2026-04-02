@@ -706,14 +706,8 @@ mod tests {
 
     #[test]
     fn hover_updates_do_not_retag_active_draft() {
-        let instance = wgpu::Instance::default();
-        let adapter =
-            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
-                .expect("adapter");
-        let (device, queue) = pollster::block_on(
-            adapter.request_device(&crate::simulation::device_descriptor(&adapter)),
-        )
-        .expect("device");
+        let crate::windowing::GpuState { device, queue, .. } =
+            pollster::block_on(crate::windowing::prepare_gpu(None)).expect("device");
         let mut overlay = WireOverlay::new(
             &device,
             &queue,
@@ -745,14 +739,8 @@ mod tests {
 
     #[test]
     fn build_segments_only_includes_visible_arena_z() {
-        let instance = wgpu::Instance::default();
-        let adapter =
-            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
-                .expect("adapter");
-        let (device, queue) = pollster::block_on(
-            adapter.request_device(&crate::simulation::device_descriptor(&adapter)),
-        )
-        .expect("device");
+        let crate::windowing::GpuState { device, queue, .. } =
+            pollster::block_on(crate::windowing::prepare_gpu(None)).expect("device");
         let mut overlay = WireOverlay::new(
             &device,
             &queue,
