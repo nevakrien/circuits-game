@@ -1,5 +1,5 @@
 use circuits_game::{
-    circuit_runtime, component_plan, editor, level_context, render, simulation, windowing,
+    child_components, circuit_runtime, component_plan, editor, level_context, render, simulation, windowing,
     wire_render, wires,
 };
 use egui_wgpu::wgpu;
@@ -303,7 +303,7 @@ fn start_run_mode_from_edit(
 
 fn restore_edit_component(
     level_context: &level_context::LevelContext,
-    root_component_id: component_plan::ComponentId,
+    component_id: component_plan::ComponentId,
     edit_board: &simulation::BoardTextures,
     edited_component: &mut wire_render::WireRenderInfo,
     wire_overlay: &mut wires::WireOverlay,
@@ -312,7 +312,7 @@ fn restore_edit_component(
     queue: &wgpu::Queue,
 ) -> Result<(), String> {
     *edited_component = level_context
-        .upload_component_to_board(root_component_id, edit_board, device, queue)
+        .upload_component_to_board(component_id, edit_board, device, queue)
         .map_err(|error| format!("Failed to restore edit mode board: {error}"))?;
     sync_wire_overlay(
         wire_overlay,
@@ -323,6 +323,252 @@ fn restore_edit_component(
         queue,
     );
     Ok(())
+}
+
+fn switch_edited_component(
+    level_context: &mut level_context::LevelContext,
+    current_component_id: component_plan::ComponentId,
+    next_component_id: component_plan::ComponentId,
+    edit_board: &simulation::BoardTextures,
+    edited_component: &mut wire_render::WireRenderInfo,
+    editor_session: &mut editor::EditorSession,
+    wire_overlay: &mut wires::WireOverlay,
+    displayed_arena_z: &mut u32,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> Result<(), String> {
+    level_context
+        .refresh_component_from_board(
+            current_component_id,
+            edit_board,
+            edited_component,
+            device,
+            queue,
+        )
+        .map_err(|error| format!("Failed to save current component before switch: {error}"))?;
+    restore_edit_component(
+        level_context,
+        next_component_id,
+        edit_board,
+        edited_component,
+        wire_overlay,
+        displayed_arena_z,
+        device,
+        queue,
+    )?;
+    editor_session.reset_for_loaded_schematic(wire_overlay, device, queue);
+    Ok(())
+}
+
+fn editor_component_entries(
+    level_context: &level_context::LevelContext,
+) -> Vec<editor::EditorComponentListEntry> {
+    let mut entries: Vec<_> = level_context
+        .components()
+        .map(|component| editor::EditorComponentListEntry {
+            id: component.id,
+            name: component.name.clone(),
+            outside_shape: component.outside_shape.as_array(),
+        })
+        .collect();
+    entries.sort_by_key(|entry| entry.id.0);
+    entries
+}
+
+fn editor_child_overlays(
+    level_context: &level_context::LevelContext,
+    component_id: component_plan::ComponentId,
+) -> Vec<editor::EditorChildInstanceOverlay> {
+    let Some(component) = level_context.component(component_id) else {
+        return Vec::new();
+    };
+
+    component
+        .child_instances
+        .iter()
+        .filter_map(|instance| {
+            let child = level_context.component(instance.component_id)?;
+            Some(editor::EditorChildInstanceOverlay {
+                component_id: instance.component_id,
+                name: child.name.clone(),
+                origin: instance.origin,
+                size: child.outside_shape.as_array(),
+            })
+        })
+        .collect()
+}
+
+fn place_child_instance_at_cursor(
+    level_context: &mut level_context::LevelContext,
+    current_component_id: component_plan::ComponentId,
+    child_component_id: component_plan::ComponentId,
+    edit_board: &simulation::BoardTextures,
+    edited_component: &mut wire_render::WireRenderInfo,
+    editor_session: &mut editor::EditorSession,
+    wire_overlay: &mut wires::WireOverlay,
+    displayed_arena_z: &mut u32,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    camera: render::CameraState,
+    cursor: [f32; 2],
+) -> Result<bool, String> {
+    let Some(origin_cell) = wires::snap_cursor_to_cell(
+        camera,
+        cursor,
+        [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
+    ) else {
+        return Ok(false);
+    };
+
+    let child_shape = level_context
+        .component(child_component_id)
+        .map(|component| component.outside_shape.as_array())
+        .ok_or_else(|| format!("Missing child component {:?}", child_component_id))?;
+    if origin_cell.x + child_shape[0] > simulation::GRID_WIDTH
+        || origin_cell.y + child_shape[1] > simulation::GRID_HEIGHT
+    {
+        return Ok(false);
+    }
+
+    for y in 0..child_shape[1] {
+        for x in 0..child_shape[0] {
+            let cell = wires::GridCell {
+                x: origin_cell.x + x,
+                y: origin_cell.y + y,
+            };
+            if edit_board.read_cell(device, queue, cell, 0) != simulation::CellSnapshot::empty() {
+                return Ok(false);
+            }
+        }
+    }
+
+    let plan = level_context
+        .component_mut(current_component_id)
+        .ok_or_else(|| format!("Missing edited component {:?}", current_component_id))?;
+    if plan.child_instances.iter().any(|instance| {
+        instance.component_id == child_component_id
+            && instance.origin == [origin_cell.x, origin_cell.y]
+    }) {
+        return Ok(false);
+    }
+    plan.child_instances.push(child_components::ChildInstancePlan {
+        component_id: child_component_id,
+        origin: [origin_cell.x, origin_cell.y],
+    });
+    plan.sync_child_links();
+
+    restore_edit_component(
+        level_context,
+        current_component_id,
+        edit_board,
+        edited_component,
+        wire_overlay,
+        displayed_arena_z,
+        device,
+        queue,
+    )?;
+    editor_session.reset_for_loaded_schematic(wire_overlay, device, queue);
+    Ok(true)
+}
+
+fn delete_child_instance_at_cursor(
+    level_context: &mut level_context::LevelContext,
+    current_component_id: component_plan::ComponentId,
+    edit_board: &simulation::BoardTextures,
+    edited_component: &mut wire_render::WireRenderInfo,
+    editor_session: &mut editor::EditorSession,
+    wire_overlay: &mut wires::WireOverlay,
+    displayed_arena_z: &mut u32,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    camera: render::CameraState,
+    cursor_position: Option<[f32; 2]>,
+) -> Result<bool, String> {
+    let Some(cursor) = cursor_position else {
+        return Ok(false);
+    };
+    let Some(cell) = wires::snap_cursor_to_cell(
+        camera,
+        cursor,
+        [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
+    ) else {
+        return Ok(false);
+    };
+
+    let removal_index = {
+        let Some(plan) = level_context.component(current_component_id) else {
+            return Ok(false);
+        };
+        plan.child_instances.iter().position(|instance| {
+            let Some(child) = level_context.component(instance.component_id) else {
+                return false;
+            };
+            let x_range = instance.origin[0]..instance.origin[0] + child.outside_shape.width;
+            let y_range = instance.origin[1]..instance.origin[1] + child.outside_shape.height;
+            x_range.contains(&cell.x) && y_range.contains(&cell.y)
+        })
+    };
+
+    let Some(removal_index) = removal_index else {
+        return Ok(false);
+    };
+
+    let plan = level_context
+        .component_mut(current_component_id)
+        .ok_or_else(|| format!("Missing edited component {:?}", current_component_id))?;
+    plan.child_instances.remove(removal_index);
+    plan.sync_child_links();
+
+    restore_edit_component(
+        level_context,
+        current_component_id,
+        edit_board,
+        edited_component,
+        wire_overlay,
+        displayed_arena_z,
+        device,
+        queue,
+    )?;
+    editor_session.reset_for_loaded_schematic(wire_overlay, device, queue);
+    Ok(true)
+}
+
+fn cursor_hits_child_instance(
+    level_context: &level_context::LevelContext,
+    component_id: component_plan::ComponentId,
+    camera: render::CameraState,
+    cursor_position: Option<[f32; 2]>,
+) -> bool {
+    let Some(cursor) = cursor_position else {
+        return false;
+    };
+    let Some(cell) = wires::snap_cursor_to_cell(
+        camera,
+        cursor,
+        [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
+    ) else {
+        return false;
+    };
+    let Some(component) = level_context.component(component_id) else {
+        return false;
+    };
+    component.child_instances.iter().any(|instance| {
+        let Some(child) = level_context.component(instance.component_id) else {
+            return false;
+        };
+        let x_range = instance.origin[0]..instance.origin[0] + child.outside_shape.width;
+        let y_range = instance.origin[1]..instance.origin[1] + child.outside_shape.height;
+        x_range.contains(&cell.x) && y_range.contains(&cell.y)
+    })
+}
+
+fn blocks_builtin_left_click_over_child_instance(
+    selection: editor::EditorPlacementSelection,
+) -> bool {
+    matches!(
+        selection,
+        editor::EditorPlacementSelection::BuiltIn(tool) if tool != editor::EditorTool::Wire
+    )
 }
 
 async fn render_scene_to_png(options: &RenderSceneOptions) -> Result<(), String> {
@@ -528,8 +774,9 @@ async fn run() {
     ));
     let mut level_context = level_context::LevelContext::with_starter_root();
     let mut root_component_id = level_context.root_component_id();
+    let mut edited_component_id = root_component_id;
     let mut edited_component = level_context
-        .upload_component_to_board(root_component_id, &edit_board, &device, &queue)
+        .upload_component_to_board(edited_component_id, &edit_board, &device, &queue)
         .expect("starter context should upload to board");
     sync_wire_overlay(
         &mut wire_overlay,
@@ -565,8 +812,24 @@ async fn run() {
                             reset_camera: false,
                             action: None,
                         };
+                        let component_entries = editor_component_entries(&level_context);
+                        let child_overlays = editor_child_overlays(&level_context, edited_component_id);
+                        let edited_component_name = level_context
+                            .component(edited_component_id)
+                            .map(|component| component.name.clone())
+                            .unwrap_or_else(|| format!("Component {}", edited_component_id.0));
                         let full_output = egui_ctx.run(raw_input, |ctx| {
-                            panel_output = editor_session.show(ctx, displayed_arena_z, editor_mode);
+                            panel_output = editor_session.show(
+                                ctx,
+                                camera,
+                                cursor_position,
+                                displayed_arena_z,
+                                editor_mode,
+                                edited_component_id,
+                                &edited_component_name,
+                                &component_entries,
+                                &child_overlays,
+                            );
                         });
                         if matches!(app_mode, AppMode::Edit) {
                             editor_session.sync_tool_state(&mut wire_overlay, &device, &queue);
@@ -576,7 +839,7 @@ async fn run() {
                             Some(editor::EditorPanelAction::StartRunning) => {
                                 match start_run_mode_from_edit(
                                     &mut level_context,
-                                    root_component_id,
+                                    edited_component_id,
                                     &edit_board,
                                     &edited_component,
                                     &mut wire_overlay,
@@ -616,7 +879,7 @@ async fn run() {
                                 if let AppMode::Run { .. } = app_mode {
                                     match restore_edit_component(
                                         &level_context,
-                                        root_component_id,
+                                        edited_component_id,
                                         &edit_board,
                                         &mut edited_component,
                                         &mut wire_overlay,
@@ -636,7 +899,7 @@ async fn run() {
                             Some(editor::EditorPanelAction::SaveSchematic) => {
                                 if matches!(app_mode, AppMode::Edit) {
                                     if let Err(error) = level_context.refresh_component_from_board(
-                                        root_component_id,
+                                        edited_component_id,
                                         &edit_board,
                                         &edited_component,
                                         &device,
@@ -674,6 +937,7 @@ async fn run() {
                                         Ok(loaded_context) => {
                                             level_context = loaded_context;
                                             root_component_id = level_context.root_component_id();
+                                            edited_component_id = root_component_id;
                                             editor_session.reset_for_loaded_schematic(
                                                 &mut wire_overlay,
                                                 &device,
@@ -681,7 +945,7 @@ async fn run() {
                                             );
                                             match restore_edit_component(
                                                 &level_context,
-                                                root_component_id,
+                                                edited_component_id,
                                                 &edit_board,
                                                 &mut edited_component,
                                                 &mut wire_overlay,
@@ -705,6 +969,50 @@ async fn run() {
                                                 path.display()
                                             );
                                         }
+                                    }
+                                }
+                            }
+                            Some(editor::EditorPanelAction::CreateComponent) => {
+                                let new_component_id = level_context.create_component(
+                                    format!("Component {}", level_context.components().count() + 1),
+                                    [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
+                                );
+                                match switch_edited_component(
+                                    &mut level_context,
+                                    edited_component_id,
+                                    new_component_id,
+                                    &edit_board,
+                                    &mut edited_component,
+                                    &mut editor_session,
+                                    &mut wire_overlay,
+                                    &mut displayed_arena_z,
+                                    &device,
+                                    &queue,
+                                ) {
+                                    Ok(()) => {
+                                        edited_component_id = new_component_id;
+                                    }
+                                    Err(error) => eprintln!("{error}"),
+                                }
+                            }
+                            Some(editor::EditorPanelAction::EditComponent(next_component_id)) => {
+                                if next_component_id != edited_component_id {
+                                    match switch_edited_component(
+                                        &mut level_context,
+                                        edited_component_id,
+                                        next_component_id,
+                                        &edit_board,
+                                        &mut edited_component,
+                                        &mut editor_session,
+                                        &mut wire_overlay,
+                                        &mut displayed_arena_z,
+                                        &device,
+                                        &queue,
+                                    ) {
+                                        Ok(()) => {
+                                            edited_component_id = next_component_id;
+                                        }
+                                        Err(error) => eprintln!("{error}"),
                                     }
                                 }
                             }
@@ -823,14 +1131,12 @@ async fn run() {
                         } = &app_mode
                         {
                             if *step_requested {
-                                let next_buffer =
-                                    maybe_next_buffer.expect("run mode should have next buffer");
-                                runtime.simulation.step(
+                                runtime.step(
                                     &device,
-                                    &mut encoder,
-                                    &runtime.root.board,
+                                    &queue,
                                     *current_buffer,
-                                    next_buffer,
+                                    maybe_next_buffer
+                                        .expect("run mode should have next buffer"),
                                 );
                             }
                         }
@@ -988,7 +1294,7 @@ async fn run() {
                                         } else if matches!(app_mode, AppMode::Edit) {
                                             match start_run_mode_from_edit(
                                                 &mut level_context,
-                                                root_component_id,
+                                                edited_component_id,
                                                 &edit_board,
                                                 &edited_component,
                                                 &mut wire_overlay,
@@ -1058,8 +1364,10 @@ async fn run() {
                                         && code == KeyCode::Enter
                                         && matches!(app_mode, AppMode::Edit)
                                     {
-                                        if editor_session.selected_tool()
-                                            == editor::EditorTool::Wire
+                                        if editor_session.selected_placement()
+                                            == editor::EditorPlacementSelection::BuiltIn(
+                                                editor::EditorTool::Wire,
+                                            )
                                         {
                                             if editor_session.finish_wire_attempt(
                                                 &edit_board,
@@ -1088,8 +1396,10 @@ async fn run() {
                                         && code == KeyCode::Backspace
                                         && matches!(app_mode, AppMode::Edit)
                                     {
-                                        if editor_session.selected_tool()
-                                            == editor::EditorTool::Wire
+                                        if editor_session.selected_placement()
+                                            == editor::EditorPlacementSelection::BuiltIn(
+                                                editor::EditorTool::Wire,
+                                            )
                                         {
                                             editor_session.pop_wire_point(
                                                 &mut wire_overlay,
@@ -1137,17 +1447,55 @@ async fn run() {
                             }
                             let extend_wire = pressed_keys.contains(&KeyCode::ShiftLeft)
                                 || pressed_keys.contains(&KeyCode::ShiftRight);
-                            if editor_session.handle_left_click(
-                                &edit_board,
-                                &mut edited_component,
-                                &mut wire_overlay,
-                                &device,
-                                &queue,
-                                camera,
-                                cursor,
-                                displayed_arena_z,
-                                extend_wire,
-                            ) {
+                            let changed = match editor_session.selected_placement() {
+                                editor::EditorPlacementSelection::ChildComponent(child_component_id) => {
+                                    match place_child_instance_at_cursor(
+                                        &mut level_context,
+                                        edited_component_id,
+                                        child_component_id,
+                                        &edit_board,
+                                        &mut edited_component,
+                                        &mut editor_session,
+                                        &mut wire_overlay,
+                                        &mut displayed_arena_z,
+                                        &device,
+                                        &queue,
+                                        camera,
+                                        cursor,
+                                    ) {
+                                        Ok(changed) => changed,
+                                        Err(error) => {
+                                            eprintln!("{error}");
+                                            false
+                                        }
+                                    }
+                                }
+                                editor::EditorPlacementSelection::BuiltIn(_) => {
+                                    if blocks_builtin_left_click_over_child_instance(
+                                        editor_session.selected_placement(),
+                                    ) && cursor_hits_child_instance(
+                                        &level_context,
+                                        edited_component_id,
+                                        camera,
+                                        Some(cursor),
+                                    ) {
+                                        false
+                                    } else {
+                                        editor_session.handle_left_click(
+                                            &edit_board,
+                                            &mut edited_component,
+                                            &mut wire_overlay,
+                                            &device,
+                                            &queue,
+                                            camera,
+                                            cursor,
+                                            displayed_arena_z,
+                                            extend_wire,
+                                        )
+                                    }
+                                }
+                            };
+                            if changed {
                                 window.request_redraw();
                             }
                         }
@@ -1169,17 +1517,38 @@ async fn run() {
 
                         let extend_wire = pressed_keys.contains(&KeyCode::ShiftLeft)
                             || pressed_keys.contains(&KeyCode::ShiftRight);
-                        if editor_session.handle_right_click(
+                        let deleted_child = match delete_child_instance_at_cursor(
+                            &mut level_context,
+                            edited_component_id,
                             &edit_board,
                             &mut edited_component,
+                            &mut editor_session,
                             &mut wire_overlay,
+                            &mut displayed_arena_z,
                             &device,
                             &queue,
                             camera,
                             cursor_position,
-                            displayed_arena_z,
-                            extend_wire,
                         ) {
+                            Ok(changed) => changed,
+                            Err(error) => {
+                                eprintln!("{error}");
+                                false
+                            }
+                        };
+                        if deleted_child
+                            || editor_session.handle_right_click(
+                                &edit_board,
+                                &mut edited_component,
+                                &mut wire_overlay,
+                                &device,
+                                &queue,
+                                camera,
+                                cursor_position,
+                                displayed_arena_z,
+                                extend_wire,
+                            )
+                        {
                             window.request_redraw();
                         }
                     }
@@ -1199,4 +1568,29 @@ async fn run() {
             _ => {}
         })
         .unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_tool_clicks_are_not_blocked_over_child_instances() {
+        assert!(!blocks_builtin_left_click_over_child_instance(
+            editor::EditorPlacementSelection::BuiltIn(editor::EditorTool::Wire)
+        ));
+    }
+
+    #[test]
+    fn non_wire_builtin_clicks_are_blocked_over_child_instances() {
+        assert!(blocks_builtin_left_click_over_child_instance(
+            editor::EditorPlacementSelection::BuiltIn(editor::EditorTool::Source)
+        ));
+        assert!(blocks_builtin_left_click_over_child_instance(
+            editor::EditorPlacementSelection::BuiltIn(editor::EditorTool::And)
+        ));
+        assert!(!blocks_builtin_left_click_over_child_instance(
+            editor::EditorPlacementSelection::ChildComponent(component_plan::ComponentId(1))
+        ));
+    }
 }

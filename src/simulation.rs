@@ -25,6 +25,7 @@ const CHARGE_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Uin
 const CIRCUIT_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Uint;
 const CIRCUIT_WORDS_PER_CELL: u32 = 4;
 pub const INVALID_INPUT_REF: u32 = u32::MAX;
+pub const INVALID_CHILD_BUFFER_OFFSET: u32 = u32::MAX;
 
 #[repr(u8)]
 #[derive(Clone, Copy)]
@@ -41,6 +42,11 @@ enum CircuitTag {
     Xnor = 9,
     Output = 10,
     Input = 11,
+    ChildWrite = 12,
+    ChildRead = 13,
+    ChildReadWrite = 14,
+    ChildWrite1 = 15,
+    ChildNoop = 16,
 }
 
 #[derive(Clone, Copy)]
@@ -81,6 +87,11 @@ pub enum CellKind {
     Xnor,
     Output,
     Input,
+    ChildWrite,
+    ChildRead,
+    ChildReadWrite,
+    ChildWrite1,
+    ChildNoop,
 }
 
 pub struct BoardTextures {
@@ -89,6 +100,8 @@ pub struct BoardTextures {
     input_write_buffer: wgpu::Buffer,
     input_read_buffer: wgpu::Buffer,
     output_buffer: wgpu::Buffer,
+    input_len: u32,
+    output_len: u32,
 }
 
 pub struct Simulation {
@@ -134,12 +147,12 @@ fn charge_readback_bytes_per_row() -> u32 {
     unpadded.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
 }
 
-fn output_buffer_size() -> u64 {
-    u64::from(OUTPUT_BUFFER_LEN) * std::mem::size_of::<u32>() as u64
+fn output_buffer_size(words: u32) -> u64 {
+    u64::from(words) * std::mem::size_of::<u32>() as u64
 }
 
-fn input_buffer_size() -> u64 {
-    u64::from(INPUT_BUFFER_LEN) * std::mem::size_of::<u32>() as u64
+fn input_buffer_size(words: u32) -> u64 {
+    u64::from(words) * std::mem::size_of::<u32>() as u64
 }
 
 pub fn output_slot_index(x: u32, y: u32, z: u32) -> usize {
@@ -164,6 +177,15 @@ pub fn device_descriptor(adapter: &wgpu::Adapter) -> wgpu::DeviceDescriptor<'sta
 
 impl BoardTextures {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+        Self::with_buffer_lengths(device, queue, INPUT_BUFFER_LEN, OUTPUT_BUFFER_LEN)
+    }
+
+    pub fn with_buffer_lengths(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        input_len: u32,
+        output_len: u32,
+    ) -> Self {
         let charge_buffers: Vec<_> = (0..CHARGE_BUFFER_COUNT)
             .map(|_| {
                 let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -215,13 +237,13 @@ impl BoardTextures {
 
         let input_write_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("input-buffer-write"),
-            size: input_buffer_size(),
+            size: input_buffer_size(input_len),
             usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let input_read_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("input-buffer-read"),
-            size: input_buffer_size(),
+            size: input_buffer_size(input_len),
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
@@ -230,7 +252,7 @@ impl BoardTextures {
 
         let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("output-buffer"),
-            size: output_buffer_size(),
+            size: output_buffer_size(output_len),
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
@@ -242,17 +264,17 @@ impl BoardTextures {
         queue.write_buffer(
             &input_write_buffer,
             0,
-            bytemuck::cast_slice(&vec![0u32; INPUT_BUFFER_LEN as usize]),
+            bytemuck::cast_slice(&vec![0u32; input_len as usize]),
         );
         queue.write_buffer(
             &input_read_buffer,
             0,
-            bytemuck::cast_slice(&vec![0u32; INPUT_BUFFER_LEN as usize]),
+            bytemuck::cast_slice(&vec![0u32; input_len as usize]),
         );
         queue.write_buffer(
             &output_buffer,
             0,
-            bytemuck::cast_slice(&vec![0u32; OUTPUT_BUFFER_LEN as usize]),
+            bytemuck::cast_slice(&vec![0u32; output_len as usize]),
         );
 
         Self {
@@ -261,6 +283,8 @@ impl BoardTextures {
             input_write_buffer,
             input_read_buffer,
             output_buffer,
+            input_len,
+            output_len,
         }
     }
 
@@ -294,11 +318,11 @@ impl BoardTextures {
     }
 
     pub fn write_input_buffer(&self, queue: &wgpu::Queue, values: &[u32]) {
-        let mut packed = vec![0u32; INPUT_BUFFER_LEN as usize];
+        let mut packed = vec![0u32; self.input_len as usize];
         for (ix, value) in values
             .iter()
             .copied()
-            .take(INPUT_BUFFER_LEN as usize)
+            .take(self.input_len as usize)
             .enumerate()
         {
             packed[ix] = value & 0xff;
@@ -313,10 +337,7 @@ impl BoardTextures {
 
         let start = start_index as usize;
         let end = start + values.len();
-        assert!(
-            end <= INPUT_BUFFER_LEN as usize,
-            "input range out of bounds"
-        );
+        assert!(end <= self.input_len as usize, "input range out of bounds");
 
         let packed: Vec<u32> = values.iter().map(|value| value & 0xff).collect();
         queue.write_buffer(
@@ -662,10 +683,7 @@ impl BoardTextures {
         let start = start_index as usize;
         let len = len as usize;
         let end = start + len;
-        assert!(
-            end <= INPUT_BUFFER_LEN as usize,
-            "input range out of bounds"
-        );
+        assert!(end <= self.input_len as usize, "input range out of bounds");
 
         let byte_offset = (start * std::mem::size_of::<u32>()) as u64;
         let byte_len = (len * std::mem::size_of::<u32>()) as u64;
@@ -701,7 +719,7 @@ impl BoardTextures {
     }
 
     pub async fn read_input_buffer(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<u32> {
-        self.read_input_range(device, queue, 0, INPUT_BUFFER_LEN)
+        self.read_input_range(device, queue, 0, self.input_len)
             .await
     }
 
@@ -731,10 +749,7 @@ impl BoardTextures {
         let start = start_index as usize;
         let len = len as usize;
         let end = start + len;
-        assert!(
-            end <= OUTPUT_BUFFER_LEN as usize,
-            "output range out of bounds"
-        );
+        assert!(end <= self.output_len as usize, "output range out of bounds");
 
         let byte_offset = (start * std::mem::size_of::<u32>()) as u64;
         let byte_len = (len * std::mem::size_of::<u32>()) as u64;
@@ -770,7 +785,7 @@ impl BoardTextures {
     }
 
     pub async fn read_output_buffer(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<u32> {
-        self.read_output_range(device, queue, 0, OUTPUT_BUFFER_LEN)
+        self.read_output_range(device, queue, 0, self.output_len)
             .await
     }
 
@@ -884,7 +899,7 @@ impl Simulation {
             0,
             board.input_read_buffer(),
             0,
-            input_buffer_size(),
+            input_buffer_size(board.input_len),
         );
         encoder.clear_buffer(board.output_buffer(), 0, None);
 
@@ -1023,6 +1038,11 @@ fn circuit_cell_from_snapshot(snapshot: CellSnapshot) -> CircuitCell {
             9 => CircuitTag::Xnor,
             10 => CircuitTag::Output,
             11 => CircuitTag::Input,
+            12 => CircuitTag::ChildWrite,
+            13 => CircuitTag::ChildRead,
+            14 => CircuitTag::ChildReadWrite,
+            15 => CircuitTag::ChildWrite1,
+            16 => CircuitTag::ChildNoop,
             _ => CircuitTag::Empty,
         },
         data: [snapshot.words[1], snapshot.words[2], snapshot.words[3]],
@@ -1056,6 +1076,26 @@ impl CellSnapshot {
         Self::from_cell(input_cell())
     }
 
+    pub fn child_write() -> Self {
+        Self::from_cell(child_write_cell())
+    }
+
+    pub fn child_write_1() -> Self {
+        Self::from_cell(child_write_1_cell())
+    }
+
+    pub fn child_read() -> Self {
+        Self::from_cell(child_read_cell())
+    }
+
+    pub fn child_read_write() -> Self {
+        Self::from_cell(child_read_write_cell())
+    }
+
+    pub fn child_noop() -> Self {
+        Self::from_cell(child_noop_cell())
+    }
+
     pub fn with_primary_input(self, source: GridCell) -> Self {
         let mut snapshot = self;
         snapshot.words[1] = pack_input_ref(source);
@@ -1078,6 +1118,32 @@ impl CellSnapshot {
 
     pub fn source_value(self) -> u8 {
         self.words[1] as u8
+    }
+
+    pub fn with_buffer_offset(self, offset: u32) -> Self {
+        let mut snapshot = self;
+        snapshot.words[1] = offset;
+        snapshot
+    }
+
+    pub fn with_output_offset(self, offset: u32) -> Self {
+        let mut snapshot = self;
+        snapshot.words[3] = offset;
+        snapshot
+    }
+
+    pub fn with_child_wire_input(self, source: GridCell) -> Self {
+        let mut snapshot = self;
+        snapshot.words[2] = pack_input_ref(source);
+        snapshot
+    }
+
+    pub fn buffer_offset(self) -> u32 {
+        self.words[1]
+    }
+
+    pub fn output_offset(self) -> u32 {
+        self.words[3]
     }
 
     pub fn gate(kind: GateKind) -> Self {
@@ -1106,6 +1172,11 @@ impl CellSnapshot {
             9 => CellKind::Xnor,
             10 => CellKind::Output,
             11 => CellKind::Input,
+            12 => CellKind::ChildWrite,
+            13 => CellKind::ChildRead,
+            14 => CellKind::ChildReadWrite,
+            15 => CellKind::ChildWrite1,
+            16 => CellKind::ChildNoop,
             _ => CellKind::Empty,
         }
     }
@@ -1146,7 +1217,7 @@ fn gate_cell(tag: CircuitTag) -> CircuitCell {
 fn output_cell() -> CircuitCell {
     CircuitCell {
         tag: CircuitTag::Output,
-        data: [INVALID_INPUT_REF, INVALID_INPUT_REF, 0],
+        data: [INVALID_INPUT_REF, INVALID_INPUT_REF, INVALID_CHILD_BUFFER_OFFSET],
     }
 }
 
@@ -1154,6 +1225,41 @@ fn input_cell() -> CircuitCell {
     CircuitCell {
         tag: CircuitTag::Input,
         data: [INVALID_INPUT_REF, INVALID_INPUT_REF, 0],
+    }
+}
+
+fn child_write_cell() -> CircuitCell {
+    CircuitCell {
+        tag: CircuitTag::ChildWrite,
+        data: [INVALID_INPUT_REF, INVALID_INPUT_REF, INVALID_CHILD_BUFFER_OFFSET],
+    }
+}
+
+fn child_write_1_cell() -> CircuitCell {
+    CircuitCell {
+        tag: CircuitTag::ChildWrite1,
+        data: [INVALID_INPUT_REF, INVALID_INPUT_REF, INVALID_CHILD_BUFFER_OFFSET],
+    }
+}
+
+fn child_read_cell() -> CircuitCell {
+    CircuitCell {
+        tag: CircuitTag::ChildRead,
+        data: [INVALID_CHILD_BUFFER_OFFSET, INVALID_INPUT_REF, INVALID_INPUT_REF],
+    }
+}
+
+fn child_read_write_cell() -> CircuitCell {
+    CircuitCell {
+        tag: CircuitTag::ChildReadWrite,
+        data: [INVALID_CHILD_BUFFER_OFFSET, INVALID_INPUT_REF, INVALID_CHILD_BUFFER_OFFSET],
+    }
+}
+
+fn child_noop_cell() -> CircuitCell {
+    CircuitCell {
+        tag: CircuitTag::ChildNoop,
+        data: [INVALID_INPUT_REF, INVALID_INPUT_REF, INVALID_CHILD_BUFFER_OFFSET],
     }
 }
 
@@ -1216,6 +1322,11 @@ mod tests {
             }
             CircuitTag::Output => read_input(cell.data[0]),
             CircuitTag::Input => 0,
+            CircuitTag::ChildWrite => 0,
+            CircuitTag::ChildRead => 0,
+            CircuitTag::ChildReadWrite => 0,
+            CircuitTag::ChildWrite1 => 0,
+            CircuitTag::ChildNoop => 0,
         }
     }
 
@@ -1330,6 +1441,90 @@ mod tests {
                 .enumerate()
                 .all(|(ix, value)| ix == output_slot_index(1, 0, 0) || *value == 0)
         );
+    }
+
+    #[test]
+    fn child_write_cells_write_selected_wires_to_output_buffer_offsets() {
+        let Some(gpu) = crate::test_gpu::shared_test_gpu() else {
+            return;
+        };
+
+        let device = &gpu.device;
+        let queue = &gpu.queue;
+
+        let board = BoardTextures::new(device, queue);
+        board.write_cell(queue, GridCell { x: 0, y: 0 }, 0, CellSnapshot::source(0xaa));
+        board.write_cell(queue, GridCell { x: 0, y: 1 }, 0, CellSnapshot::source(0x55));
+        for buffer_index in 0..CHARGE_BUFFER_COUNT {
+            board.write_charge_value(device, queue, buffer_index, GridCell { x: 0, y: 0 }, 0, 0xaa);
+            board.write_charge_value(device, queue, buffer_index, GridCell { x: 0, y: 1 }, 0, 0x55);
+        }
+        board.write_cell(
+            queue,
+            GridCell { x: 1, y: 0 },
+            0,
+            CellSnapshot::child_write()
+                .with_primary_input(GridCell { x: 0, y: 0 })
+                .with_secondary_input(GridCell { x: 0, y: 1 })
+                .with_output_offset(12),
+        );
+
+        let simulation = Simulation::new(device);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("child-write-test-step"),
+        });
+        simulation.step(device, &mut encoder, &board, 0, 1);
+        queue.submit(Some(encoder.finish()));
+
+        let outputs = pollster::block_on(board.read_output_buffer(device, queue));
+        assert_eq!(outputs[12], 0xaa);
+        assert_eq!(outputs[13], 0x55);
+    }
+
+    #[test]
+    fn child_read_and_rw_cells_round_trip_buffer_offsets() {
+        let Some(gpu) = crate::test_gpu::shared_test_gpu() else {
+            return;
+        };
+
+        let device = &gpu.device;
+        let queue = &gpu.queue;
+
+        let board = BoardTextures::new(device, queue);
+        board.write_input_range(queue, 20, &[0x66, 0x00, 0x99]);
+        board.write_cell(
+            queue,
+            GridCell { x: 1, y: 0 },
+            0,
+            CellSnapshot::child_read().with_buffer_offset(20),
+        );
+        board.write_cell(queue, GridCell { x: 0, y: 0 }, 0, CellSnapshot::source(0xcc));
+        for buffer_index in 0..CHARGE_BUFFER_COUNT {
+            board.write_charge_value(device, queue, buffer_index, GridCell { x: 0, y: 0 }, 0, 0xcc);
+        }
+        board.write_cell(
+            queue,
+            GridCell { x: 2, y: 0 },
+            0,
+            CellSnapshot::child_read_write()
+                .with_buffer_offset(22)
+                .with_child_wire_input(GridCell { x: 0, y: 0 })
+                .with_output_offset(24),
+        );
+
+        let simulation = Simulation::new(device);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("child-read-rw-test-step"),
+        });
+        simulation.step(device, &mut encoder, &board, 0, 1);
+        queue.submit(Some(encoder.finish()));
+
+        let texels = pollster::block_on(board.read_charge_buffer(device, queue, 1));
+        assert_eq!(read_packed_charge(&texels, 1, 0, 0), 0x66);
+        assert_eq!(read_packed_charge(&texels, 2, 0, 0), 0x99);
+
+        let outputs = pollster::block_on(board.read_output_buffer(device, queue));
+        assert_eq!(outputs[24], 0xcc);
     }
 
     #[test]

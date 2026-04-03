@@ -5,7 +5,7 @@ use egui::{
 
 use egui_wgpu::wgpu;
 
-use crate::{render, simulation, wire_render, wires};
+use crate::{component_plan::ComponentId, render, simulation, wire_render, wires};
 
 const TAG_WIDTH: f32 = 54.0;
 const TAG_HEIGHT: f32 = 24.0;
@@ -22,6 +22,9 @@ const PANEL_MARGIN: f32 = 12.0;
 const PANEL_INNER_WIDTH: f32 = PANEL_WIDTH - 24.0;
 const TOOL_CARD_HEIGHT: f32 = 78.0;
 const WIRE_COLOR_MENU_WIDTH: f32 = 152.0;
+const SECTION_SPACING: f32 = 10.0;
+const COMPONENT_BUTTON_HEIGHT: f32 = 30.0;
+const COMPONENT_PANEL_HEIGHT: f32 = 260.0;
 
 const WIRE_COLOR_OPTIONS: [([f32; 4], &str); 6] = [
     (wires::DEFAULT_WIRE_COLOR, "Blue"),
@@ -135,9 +138,31 @@ const TOOL_OPTIONS: &[EditorTool] = &EditorTool::ALL;
 
 pub struct EditorUi {
     expanded: bool,
-    selected_tool: EditorTool,
+    component_panel_expanded: bool,
+    selected_placement: EditorPlacementSelection,
     selected_wire_color: [f32; 4],
     tool_preview_textures: [TextureId; EditorTool::COUNT],
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EditorPlacementSelection {
+    BuiltIn(EditorTool),
+    ChildComponent(ComponentId),
+}
+
+#[derive(Clone, Debug)]
+pub struct EditorComponentListEntry {
+    pub id: ComponentId,
+    pub name: String,
+    pub outside_shape: [u32; 2],
+}
+
+#[derive(Clone, Debug)]
+pub struct EditorChildInstanceOverlay {
+    pub component_id: ComponentId,
+    pub name: String,
+    pub origin: [u32; 2],
+    pub size: [u32; 2],
 }
 
 pub struct EditorHistory<T> {
@@ -192,6 +217,8 @@ pub enum EditorPanelAction {
     BackToEdit,
     SaveSchematic,
     LoadSchematic,
+    CreateComponent,
+    EditComponent(ComponentId),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -208,6 +235,10 @@ enum ConnectionCellKind {
     UnaryGate,
     BinaryGate,
     Output,
+    ChildRead,
+    ChildReadWrite,
+    ChildWrite,
+    ChildWrite1,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -343,6 +374,10 @@ impl EditorSession {
         self.ui.selected_tool()
     }
 
+    pub fn selected_placement(&self) -> EditorPlacementSelection {
+        self.ui.selected_placement()
+    }
+
     pub fn selected_wire_color(&self) -> [f32; 4] {
         self.ui.selected_wire_color()
     }
@@ -355,6 +390,7 @@ impl EditorSession {
     ) {
         self.history = EditorHistory::default();
         self.invalid_connection_feedback = None;
+        self.ui.reset_to_default_tool();
         self.update_draft(wire_overlay, |overlay| {
             overlay.restore_draft(device, queue, None);
         });
@@ -364,10 +400,27 @@ impl EditorSession {
     pub fn show(
         &mut self,
         ctx: &egui::Context,
+        camera: render::CameraState,
+        cursor_position: Option<[f32; 2]>,
         displayed_arena_z: u32,
         mode: EditorMode,
+        edited_component_id: ComponentId,
+        edited_component_name: &str,
+        components: &[EditorComponentListEntry],
+        child_overlays: &[EditorChildInstanceOverlay],
     ) -> EditorFrameOutput {
-        self.ui.show(ctx, displayed_arena_z, &self.history, mode)
+        self.ui.show(
+            ctx,
+            camera,
+            cursor_position,
+            displayed_arena_z,
+            &self.history,
+            mode,
+            edited_component_id,
+            edited_component_name,
+            components,
+            child_overlays,
+        )
     }
 
     pub fn advance_visual_feedback(&mut self) {
@@ -410,7 +463,12 @@ impl EditorSession {
             });
         }
 
-        hover_preview_state_with_visibility(camera, cursor_position, self.selected_tool(), visible)
+        match self.selected_placement() {
+            EditorPlacementSelection::BuiltIn(tool) => {
+                hover_preview_state_with_visibility(camera, cursor_position, tool, visible)
+            }
+            EditorPlacementSelection::ChildComponent(_) => None,
+        }
     }
 
     pub fn sync_tool_state(
@@ -419,12 +477,18 @@ impl EditorSession {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) {
+        let selected_placement = self.selected_placement();
         let selected_tool = self.selected_tool();
-        if self.previous_tool == selected_tool {
+        if self.previous_tool == selected_tool
+            && !matches!(
+                selected_placement,
+                EditorPlacementSelection::ChildComponent(_)
+            )
+        {
             return;
         }
 
-        if selected_tool != EditorTool::Wire {
+        if selected_placement != EditorPlacementSelection::BuiltIn(EditorTool::Wire) {
             self.update_draft(wire_overlay, |overlay| {
                 overlay.restore_draft(device, queue, None);
             });
@@ -550,8 +614,8 @@ impl EditorSession {
             return false;
         };
 
-        match self.selected_tool() {
-            EditorTool::Wire => {
+        match self.selected_placement() {
+            EditorPlacementSelection::BuiltIn(EditorTool::Wire) => {
                 let had_draft = wire_overlay.has_draft();
                 let point = if had_draft {
                     center_point_for_cell(source)
@@ -568,7 +632,7 @@ impl EditorSession {
                     true
                 }
             }
-            tool => {
+            EditorPlacementSelection::BuiltIn(tool) => {
                 if let Some(action) = place_cell_at_cursor(
                     simulation,
                     device,
@@ -584,6 +648,7 @@ impl EditorSession {
                     false
                 }
             }
+            EditorPlacementSelection::ChildComponent(_) => false,
         }
     }
 
@@ -599,7 +664,7 @@ impl EditorSession {
         displayed_arena_z: u32,
         extend_wire: bool,
     ) -> bool {
-        if self.selected_tool() != EditorTool::Wire {
+        if self.selected_placement() != EditorPlacementSelection::BuiltIn(EditorTool::Wire) {
             self.ui.reset_to_default_tool();
             self.previous_tool = self.selected_tool();
             self.cancel_wire_draft(wire_overlay, device, queue);
@@ -665,14 +730,22 @@ impl EditorUi {
     pub fn new(tool_preview_textures: [TextureId; EditorTool::COUNT]) -> Self {
         Self {
             expanded: false,
-            selected_tool: EditorTool::Wire,
+            component_panel_expanded: false,
+            selected_placement: EditorPlacementSelection::BuiltIn(EditorTool::Wire),
             selected_wire_color: wires::DEFAULT_WIRE_COLOR,
             tool_preview_textures,
         }
     }
 
     pub fn selected_tool(&self) -> EditorTool {
-        self.selected_tool
+        match self.selected_placement {
+            EditorPlacementSelection::BuiltIn(tool) => tool,
+            EditorPlacementSelection::ChildComponent(_) => EditorTool::Wire,
+        }
+    }
+
+    pub fn selected_placement(&self) -> EditorPlacementSelection {
+        self.selected_placement
     }
 
     pub fn selected_wire_color(&self) -> [f32; 4] {
@@ -680,15 +753,21 @@ impl EditorUi {
     }
 
     pub fn reset_to_default_tool(&mut self) {
-        self.selected_tool = EditorTool::Wire;
+        self.selected_placement = EditorPlacementSelection::BuiltIn(EditorTool::Wire);
     }
 
     pub fn show<T>(
         &mut self,
         ctx: &egui::Context,
+        camera: render::CameraState,
+        cursor_position: Option<[f32; 2]>,
         _displayed_arena_z: u32,
         _history: &EditorHistory<T>,
         mode: EditorMode,
+        edited_component_id: ComponentId,
+        edited_component_name: &str,
+        components: &[EditorComponentListEntry],
+        child_overlays: &[EditorChildInstanceOverlay],
     ) -> EditorFrameOutput {
         let screen_rect = ctx.content_rect();
         let panel_height = PANEL_HEIGHT.min((screen_rect.height() - PANEL_MARGIN * 2.0).max(160.0));
@@ -728,6 +807,7 @@ impl EditorUi {
             TAG_HEIGHT
         };
         self.expanded = hovered_activation || hovered_panel;
+        let tool_panel_right = origin.x + visible_width;
 
         egui::Area::new(Id::new("editor_hover_menu"))
             .order(Order::Foreground)
@@ -748,10 +828,12 @@ impl EditorUi {
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 for tool in TOOL_OPTIONS {
+                                    let is_selected = self.selected_placement
+                                        == EditorPlacementSelection::BuiltIn(*tool);
                                     let response = draw_tool_card(
                                         ui,
                                         *tool,
-                                        *tool == self.selected_tool,
+                                        is_selected,
                                         if *tool == EditorTool::Wire {
                                             Some(self.selected_wire_color)
                                         } else {
@@ -761,12 +843,16 @@ impl EditorUi {
                                     );
                                     if *tool == EditorTool::Wire
                                         && (response.hovered()
-                                            || self.selected_tool == EditorTool::Wire)
+                                            || self.selected_placement
+                                                == EditorPlacementSelection::BuiltIn(
+                                                    EditorTool::Wire,
+                                                ))
                                     {
                                         wire_menu_anchor = Some(response.rect);
                                     }
                                     if response.clicked() {
-                                        self.selected_tool = *tool;
+                                        self.selected_placement =
+                                            EditorPlacementSelection::BuiltIn(*tool);
                                     }
                                     ui.add_space(6.0);
                                 }
@@ -803,10 +889,23 @@ impl EditorUi {
                     ctx,
                     anchor,
                     &mut self.selected_wire_color,
-                    &mut self.selected_tool,
+                    &mut self.selected_placement,
                 );
             }
         }
+
+        show_component_panel(
+            ctx,
+            mode,
+            edited_component_id,
+            edited_component_name,
+            components,
+            &mut self.selected_placement,
+            &mut action,
+            tool_panel_right,
+            origin.y,
+            &mut self.component_panel_expanded,
+        );
 
         egui::Area::new(Id::new("editor_top_buttons"))
             .order(Order::Foreground)
@@ -855,11 +954,170 @@ impl EditorUi {
                 });
             });
 
+        if matches!(mode, EditorMode::Edit) {
+            let selected_child_size = match self.selected_placement {
+                EditorPlacementSelection::ChildComponent(component_id) => components
+                    .iter()
+                    .find(|component| component.id == component_id)
+                    .map(|component| component.outside_shape),
+                EditorPlacementSelection::BuiltIn(_) => None,
+            };
+            draw_child_instance_overlays(
+                ctx,
+                camera,
+                cursor_position,
+                child_overlays,
+                self.selected_placement,
+                selected_child_size,
+            );
+        }
+
         EditorFrameOutput {
             reset_camera: reset_requested,
             action,
         }
     }
+}
+
+fn show_component_panel(
+    ctx: &egui::Context,
+    mode: EditorMode,
+    edited_component_id: ComponentId,
+    edited_component_name: &str,
+    components: &[EditorComponentListEntry],
+    selected_placement: &mut EditorPlacementSelection,
+    action: &mut Option<EditorPanelAction>,
+    tool_panel_right: f32,
+    tool_panel_top: f32,
+    expanded: &mut bool,
+) {
+    let origin = Pos2::new(tool_panel_right + 12.0, tool_panel_top);
+    let tag_rect = Rect::from_min_size(origin, Vec2::new(TAG_WIDTH, TAG_HEIGHT));
+    let expanded_rect = Rect::from_min_size(origin, Vec2::new(PANEL_WIDTH, COMPONENT_PANEL_HEIGHT));
+    let pointer_pos = ctx.input(|input| input.pointer.hover_pos());
+    let hovered_tag = pointer_pos.is_some_and(|pos| tag_rect.contains(pos));
+    let hovered_panel = *expanded && pointer_pos.is_some_and(|pos| expanded_rect.contains(pos));
+    *expanded = hovered_tag || hovered_panel;
+
+    egui::Area::new(Id::new("editor_component_panel"))
+        .order(Order::Foreground)
+        .fixed_pos(origin)
+        .show(ctx, |ui| {
+            if *expanded {
+                egui::Frame::new()
+                    .fill(Color32::from_rgba_unmultiplied(10, 12, 16, 236))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(58, 72, 90)))
+                    .corner_radius(CornerRadius::same(12))
+                    .inner_margin(10.0)
+                    .show(ui, |ui| {
+                        ui.set_width(PANEL_INNER_WIDTH);
+                        ui.set_min_height(COMPONENT_PANEL_HEIGHT);
+                        ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                draw_section_heading(ui, "Editing");
+                                ui.label(
+                                    RichText::new(edited_component_name)
+                                        .color(Color32::from_rgb(230, 236, 242))
+                                        .strong(),
+                                );
+                                if matches!(mode, EditorMode::Edit)
+                                    && ui
+                                        .add_sized(
+                                            [ui.available_width(), COMPONENT_BUTTON_HEIGHT],
+                                            egui::Button::new("New Component"),
+                                        )
+                                        .clicked()
+                                    && action.is_none()
+                                {
+                                    *action = Some(EditorPanelAction::CreateComponent);
+                                }
+
+                                ui.add_space(6.0);
+                                for component in components {
+                                    if ui
+                                        .add_sized(
+                                            [ui.available_width(), COMPONENT_BUTTON_HEIGHT],
+                                            egui::Button::new(component.name.as_str()).fill(
+                                                if component.id == edited_component_id {
+                                                    Color32::from_rgb(34, 44, 58)
+                                                } else {
+                                                    Color32::from_rgb(16, 20, 27)
+                                                },
+                                            ),
+                                        )
+                                        .clicked()
+                                        && action.is_none()
+                                    {
+                                        *action =
+                                            Some(EditorPanelAction::EditComponent(component.id));
+                                    }
+                                }
+
+                                if matches!(mode, EditorMode::Edit) {
+                                    let child_candidates: Vec<_> = components
+                                        .iter()
+                                        .filter(|component| component.id != edited_component_id)
+                                        .collect();
+                                    if !child_candidates.is_empty() {
+                                        ui.add_space(SECTION_SPACING);
+                                        draw_section_heading(ui, "Place Child");
+                                        for component in child_candidates {
+                                            let selected = *selected_placement
+                                                == EditorPlacementSelection::ChildComponent(
+                                                    component.id,
+                                                );
+                                            let label = format!(
+                                                "{}  {}x{}",
+                                                component.name,
+                                                component.outside_shape[0],
+                                                component.outside_shape[1]
+                                            );
+                                            if ui
+                                                .add_sized(
+                                                    [ui.available_width(), COMPONENT_BUTTON_HEIGHT],
+                                                    egui::Button::new(label).fill(if selected {
+                                                        Color32::from_rgb(34, 44, 58)
+                                                    } else {
+                                                        Color32::from_rgb(16, 20, 27)
+                                                    }),
+                                                )
+                                                .clicked()
+                                            {
+                                                *selected_placement =
+                                                    EditorPlacementSelection::ChildComponent(
+                                                        component.id,
+                                                    );
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+                    });
+            } else {
+                let (rect, _) =
+                    ui.allocate_exact_size(Vec2::new(TAG_WIDTH, TAG_HEIGHT), Sense::hover());
+                let painter = ui.painter();
+                painter.rect_filled(
+                    rect,
+                    CornerRadius::same(8),
+                    Color32::from_rgba_unmultiplied(12, 16, 22, 220),
+                );
+                painter.rect_stroke(
+                    rect,
+                    CornerRadius::same(8),
+                    Stroke::new(1.0, Color32::from_rgb(58, 72, 90)),
+                    StrokeKind::Outside,
+                );
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Components",
+                    FontId::proportional(12.0),
+                    Color32::from_rgb(214, 224, 235),
+                );
+            }
+        });
 }
 
 pub fn hover_preview_state_with_visibility(
@@ -1297,6 +1555,11 @@ fn classify_connection_cell(snapshot: simulation::CellSnapshot) -> Option<Connec
         | simulation::CellKind::Nor
         | simulation::CellKind::Xnor => Some(ConnectionCellKind::BinaryGate),
         simulation::CellKind::Output => Some(ConnectionCellKind::Output),
+        simulation::CellKind::ChildWrite => Some(ConnectionCellKind::ChildWrite),
+        simulation::CellKind::ChildRead => Some(ConnectionCellKind::ChildRead),
+        simulation::CellKind::ChildReadWrite => Some(ConnectionCellKind::ChildReadWrite),
+        simulation::CellKind::ChildWrite1 => Some(ConnectionCellKind::ChildWrite1),
+        simulation::CellKind::ChildNoop => None,
     }
 }
 
@@ -1309,8 +1572,12 @@ fn validate_source_endpoint_kind(
         | ConnectionCellKind::Input
         | ConnectionCellKind::Noop
         | ConnectionCellKind::UnaryGate
-        | ConnectionCellKind::BinaryGate => Ok(()),
-        ConnectionCellKind::Output => Err(WireConnectionError::InvalidSource(_grid_cell)),
+        | ConnectionCellKind::BinaryGate
+        | ConnectionCellKind::ChildRead
+        | ConnectionCellKind::ChildReadWrite => Ok(()),
+        ConnectionCellKind::Output
+        | ConnectionCellKind::ChildWrite
+        | ConnectionCellKind::ChildWrite1 => Err(WireConnectionError::InvalidSource(_grid_cell)),
     }
 }
 
@@ -1328,20 +1595,22 @@ fn destination_input_slot_for_edge(
         ConnectionCellKind::Noop
         | ConnectionCellKind::Input
         | ConnectionCellKind::UnaryGate
+        | ConnectionCellKind::ChildReadWrite
+        | ConnectionCellKind::ChildWrite1
         | ConnectionCellKind::Output => {
             // Unary destinations only have one logical input, so any snapped hit on the tile
             // resolves to that single input.
             let _ = local_x;
             Some(DestinationInputSlot::Inline)
         }
-        ConnectionCellKind::BinaryGate => {
+        ConnectionCellKind::BinaryGate | ConnectionCellKind::ChildWrite => {
             if local_y < 0.5 {
                 Some(DestinationInputSlot::Upper)
             } else {
                 Some(DestinationInputSlot::Lower)
             }
         }
-        ConnectionCellKind::Source => None,
+        ConnectionCellKind::Source | ConnectionCellKind::ChildRead => None,
     }
 }
 
@@ -1418,7 +1687,11 @@ fn destination_input_for_slot(
     destination_slot: DestinationInputSlot,
 ) -> Option<wires::GridCell> {
     match destination_slot {
-        DestinationInputSlot::Inline | DestinationInputSlot::Upper => snapshot.primary_input(),
+        DestinationInputSlot::Inline => match snapshot.kind() {
+            simulation::CellKind::ChildReadWrite => snapshot.secondary_input(),
+            _ => snapshot.primary_input(),
+        },
+        DestinationInputSlot::Upper => snapshot.primary_input(),
         DestinationInputSlot::Lower => snapshot.secondary_input(),
     }
 }
@@ -1432,7 +1705,15 @@ fn snapshot_with_destination_input(
         .map(simulation::pack_input_ref)
         .unwrap_or(simulation::INVALID_INPUT_REF);
     match destination_slot {
-        DestinationInputSlot::Inline | DestinationInputSlot::Upper => {
+        DestinationInputSlot::Inline => match snapshot.kind() {
+            simulation::CellKind::ChildReadWrite => {
+                snapshot.words[2] = packed;
+            }
+            _ => {
+                snapshot.words[1] = packed;
+            }
+        },
+        DestinationInputSlot::Upper => {
             snapshot.words[1] = packed;
         }
         DestinationInputSlot::Lower => {
@@ -1468,11 +1749,15 @@ fn output_anchor_for_cell(
     let y = grid_cell.y as f32;
     let anchor_x = match cell_kind {
         ConnectionCellKind::Source => 0.73,
-        ConnectionCellKind::Input => 0.885,
+        ConnectionCellKind::Input
+        | ConnectionCellKind::ChildRead
+        | ConnectionCellKind::ChildReadWrite => 0.885,
         ConnectionCellKind::Noop
         | ConnectionCellKind::UnaryGate
         | ConnectionCellKind::BinaryGate
-        | ConnectionCellKind::Output => 0.885,
+        | ConnectionCellKind::Output
+        | ConnectionCellKind::ChildWrite
+        | ConnectionCellKind::ChildWrite1 => 0.885,
     };
     wires::WirePoint {
         x: x + anchor_x,
@@ -1488,7 +1773,10 @@ fn input_anchor_for_cell(
     let x = grid_cell.x as f32;
     let y = grid_cell.y as f32;
     match (cell_kind, destination_slot) {
-        (ConnectionCellKind::BinaryGate, DestinationInputSlot::Lower) => wires::WirePoint {
+        (
+            ConnectionCellKind::BinaryGate | ConnectionCellKind::ChildWrite,
+            DestinationInputSlot::Lower,
+        ) => wires::WirePoint {
             x: x + 0.11,
             y: y + 0.76,
         },
@@ -1901,11 +2189,123 @@ fn draw_tool_card(
     response
 }
 
+fn draw_section_heading(ui: &mut egui::Ui, title: &str) {
+    ui.label(
+        RichText::new(title)
+            .small()
+            .strong()
+            .color(Color32::from_rgb(160, 174, 190)),
+    );
+    ui.add_space(4.0);
+}
+
+fn draw_child_instance_overlays(
+    ctx: &egui::Context,
+    camera: render::CameraState,
+    cursor_position: Option<[f32; 2]>,
+    child_overlays: &[EditorChildInstanceOverlay],
+    selected_placement: EditorPlacementSelection,
+    selected_child_size: Option<[u32; 2]>,
+) {
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        Order::Foreground,
+        Id::new("child-component-overlays"),
+    ));
+
+    for child in child_overlays {
+        let Some(rect) = board_rect_for_region(camera, child.origin, child.size) else {
+            continue;
+        };
+        let selected =
+            selected_placement == EditorPlacementSelection::ChildComponent(child.component_id);
+        painter.rect_filled(
+            rect,
+            CornerRadius::same(8),
+            if selected {
+                Color32::from_rgba_unmultiplied(86, 110, 180, 72)
+            } else {
+                Color32::from_rgba_unmultiplied(90, 96, 116, 52)
+            },
+        );
+        painter.rect_stroke(
+            rect,
+            CornerRadius::same(8),
+            Stroke::new(
+                2.0,
+                if selected {
+                    Color32::from_rgb(145, 176, 244)
+                } else {
+                    Color32::from_rgb(118, 132, 162)
+                },
+            ),
+            StrokeKind::Outside,
+        );
+        painter.text(
+            rect.center_top() + Vec2::new(0.0, 6.0),
+            egui::Align2::CENTER_TOP,
+            &child.name,
+            FontId::proportional(12.0),
+            Color32::from_rgb(236, 240, 246),
+        );
+    }
+
+    if let (Some(cursor), EditorPlacementSelection::ChildComponent(_), Some(size)) =
+        (cursor_position, selected_placement, selected_child_size)
+    {
+        if let Some(point) = wires::cursor_to_board_point(
+            camera,
+            cursor,
+            [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
+        ) {
+            let origin = [
+                point.x.floor().max(0.0) as u32,
+                point.y.floor().max(0.0) as u32,
+            ];
+            if let Some(rect) = board_rect_for_region(camera, origin, size) {
+                painter.rect_stroke(
+                    rect,
+                    CornerRadius::same(6),
+                    Stroke::new(1.0, Color32::from_rgba_unmultiplied(200, 214, 244, 180)),
+                    StrokeKind::Outside,
+                );
+            }
+        }
+    }
+}
+
+fn board_rect_for_region(
+    camera: render::CameraState,
+    origin: [u32; 2],
+    size: [u32; 2],
+) -> Option<Rect> {
+    let min = board_cell_corner_to_screen(camera, origin[0] as f32, origin[1] as f32)?;
+    let max = board_cell_corner_to_screen(
+        camera,
+        origin[0] as f32 + size[0] as f32,
+        origin[1] as f32 + size[1] as f32,
+    )?;
+    Some(Rect::from_min_max(min, max))
+}
+
+fn board_cell_corner_to_screen(camera: render::CameraState, x: f32, y: f32) -> Option<Pos2> {
+    let view = camera.view_params();
+    let surface = camera.surface_size_pixels();
+    if view[0] <= 0.0 || view[1] <= 0.0 {
+        return None;
+    }
+
+    let world_x = x / simulation::GRID_WIDTH as f32;
+    let world_y = y / simulation::GRID_HEIGHT as f32;
+    let screen_x = ((world_x - 0.5 - camera.offset[0]) / view[0] + 0.5) * surface[0];
+    let screen_y = ((world_y - 0.5 - camera.offset[1]) / view[1] + 0.5) * surface[1];
+    Some(Pos2::new(screen_x, screen_y))
+}
+
 fn show_wire_color_menu(
     ctx: &egui::Context,
     anchor: Rect,
     selected_wire_color: &mut [f32; 4],
-    selected_tool: &mut EditorTool,
+    selected_placement: &mut EditorPlacementSelection,
 ) {
     egui::Area::new(Id::new("wire_color_submenu"))
         .order(Order::Foreground)
@@ -1970,7 +2370,8 @@ fn show_wire_color_menu(
 
                         if response.clicked() {
                             *selected_wire_color = color;
-                            *selected_tool = EditorTool::Wire;
+                            *selected_placement =
+                                EditorPlacementSelection::BuiltIn(EditorTool::Wire);
                         }
 
                         ui.add_space(4.0);
@@ -2288,6 +2689,24 @@ mod tests {
     }
 
     #[test]
+    fn reset_for_loaded_schematic_resets_child_selection_to_wire() {
+        let Some((device, queue, _simulation, _component, mut wire_overlay, _camera, mut session)) =
+            create_editor_test_context()
+        else {
+            return;
+        };
+
+        session.ui.selected_placement = EditorPlacementSelection::ChildComponent(ComponentId(99));
+
+        session.reset_for_loaded_schematic(&mut wire_overlay, &device, &queue);
+
+        assert_eq!(
+            session.selected_placement(),
+            EditorPlacementSelection::BuiltIn(EditorTool::Wire)
+        );
+    }
+
+    #[test]
     fn wire_draft_point_edits_are_undoable() {
         let Some((device, queue, simulation, mut component, mut wire_overlay, camera, mut session)) =
             create_editor_test_context()
@@ -2493,6 +2912,103 @@ mod tests {
 
         let wire = component.wire_edges().next().unwrap();
         assert_eq!(wire.color, selected_color);
+    }
+
+    #[test]
+    fn child_proxy_wire_connections_work_through_click_sequence() {
+        let Some((device, queue, simulation, mut component, mut wire_overlay, camera, mut session)) =
+            create_editor_test_context()
+        else {
+            return;
+        };
+
+        let source = wires::GridCell { x: 1, y: 1 };
+        let child_rw = wires::GridCell { x: 3, y: 1 };
+        let lower_source = wires::GridCell { x: 1, y: 2 };
+        let child_write = wires::GridCell { x: 5, y: 1 };
+
+        simulation.write_cell(&queue, source, 0, simulation::CellSnapshot::source(0xff));
+        simulation.write_cell(
+            &queue,
+            child_rw,
+            0,
+            simulation::CellSnapshot::child_read_write()
+                .with_buffer_offset(12)
+                .with_output_offset(16),
+        );
+        simulation.write_cell(
+            &queue,
+            lower_source,
+            0,
+            simulation::CellSnapshot::source(0xff),
+        );
+        simulation.write_cell(
+            &queue,
+            child_write,
+            0,
+            simulation::CellSnapshot::child_write().with_output_offset(20),
+        );
+
+        assert!(session.handle_left_click(
+            &simulation,
+            &mut component,
+            &mut wire_overlay,
+            &device,
+            &queue,
+            camera,
+            cursor_for_cell(source),
+            0,
+            true,
+        ));
+        assert!(session.handle_left_click(
+            &simulation,
+            &mut component,
+            &mut wire_overlay,
+            &device,
+            &queue,
+            camera,
+            cursor_for_cell(child_rw),
+            0,
+            false,
+        ));
+
+        assert_eq!(component.wire_edges().count(), 1);
+        assert_eq!(
+            simulation
+                .read_cell(&device, &queue, child_rw, 0)
+                .secondary_input(),
+            Some(source)
+        );
+
+        assert!(session.handle_left_click(
+            &simulation,
+            &mut component,
+            &mut wire_overlay,
+            &device,
+            &queue,
+            camera,
+            cursor_for_cell(lower_source),
+            0,
+            true,
+        ));
+        assert!(session.handle_left_click(
+            &simulation,
+            &mut component,
+            &mut wire_overlay,
+            &device,
+            &queue,
+            camera,
+            cursor_for_cell(child_write),
+            0,
+            false,
+        ));
+
+        assert_eq!(
+            simulation
+                .read_cell(&device, &queue, child_write, 0)
+                .secondary_input(),
+            Some(lower_source)
+        );
     }
 
     #[test]
@@ -2739,6 +3255,185 @@ mod tests {
                 .read_cell(&device, &queue, destination, 0)
                 .primary_input(),
             Some(source)
+        );
+    }
+
+    #[test]
+    fn child_proxy_cells_accept_wires_on_their_exposed_ports() {
+        let Some((device, queue, simulation, component, _wire_overlay, _camera, _session)) =
+            create_editor_test_context()
+        else {
+            return;
+        };
+
+        let child_read = wires::GridCell { x: 1, y: 1 };
+        let child_read_write = wires::GridCell { x: 2, y: 1 };
+        let child_write = wires::GridCell { x: 3, y: 1 };
+        let child_write_1 = wires::GridCell { x: 4, y: 1 };
+        let source_a = wires::GridCell { x: 0, y: 0 };
+        let source_b = wires::GridCell { x: 0, y: 1 };
+
+        simulation.write_cell(
+            &queue,
+            child_read,
+            0,
+            simulation::CellSnapshot::child_read().with_buffer_offset(8),
+        );
+        simulation.write_cell(
+            &queue,
+            child_read_write,
+            0,
+            simulation::CellSnapshot::child_read_write()
+                .with_buffer_offset(12)
+                .with_output_offset(16),
+        );
+        simulation.write_cell(
+            &queue,
+            child_write,
+            0,
+            simulation::CellSnapshot::child_write().with_output_offset(20),
+        );
+        simulation.write_cell(
+            &queue,
+            child_write_1,
+            0,
+            simulation::CellSnapshot::child_write_1().with_output_offset(24),
+        );
+        simulation.write_cell(&queue, source_a, 0, simulation::CellSnapshot::source(0xff));
+        simulation.write_cell(&queue, source_b, 0, simulation::CellSnapshot::source(0xff));
+
+        let child_read_source = resolve_endpoint(
+            &simulation,
+            &device,
+            &queue,
+            child_read,
+            0,
+            EndpointRole::Source,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            child_read_source.effective_kind,
+            ConnectionCellKind::ChildRead
+        );
+
+        let child_read_destination_plan = plan_wire_commit(
+            &simulation,
+            &component,
+            &device,
+            &queue,
+            wire_render::StoredWireEdge {
+                source_id: wire_render::WireEndpointId::from_grid_cell(source_a, 0),
+                destination_id: wire_render::WireEndpointId::from_grid_cell(child_read, 0),
+                points: vec![
+                    center_point_for_cell(source_a),
+                    wires::WirePoint {
+                        x: child_read.x as f32 + 0.5,
+                        y: child_read.y as f32 + 0.5,
+                    },
+                ],
+                color: wires::DEFAULT_WIRE_COLOR,
+            },
+        );
+        assert!(matches!(
+            child_read_destination_plan,
+            Err(WireConnectionError::InvalidDestinationSlot(cell)) if cell == child_read
+        ));
+
+        let rw_plan = plan_wire_commit(
+            &simulation,
+            &component,
+            &device,
+            &queue,
+            wire_render::StoredWireEdge {
+                source_id: wire_render::WireEndpointId::from_grid_cell(source_a, 0),
+                destination_id: wire_render::WireEndpointId::from_grid_cell(child_read_write, 0),
+                points: vec![
+                    center_point_for_cell(source_a),
+                    wires::WirePoint {
+                        x: child_read_write.x as f32 + 0.5,
+                        y: child_read_write.y as f32 + 0.5,
+                    },
+                ],
+                color: wires::DEFAULT_WIRE_COLOR,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            rw_plan.cell_edits[0].new_cell.secondary_input(),
+            Some(source_a)
+        );
+
+        let write_plan = plan_wire_commit(
+            &simulation,
+            &component,
+            &device,
+            &queue,
+            wire_render::StoredWireEdge {
+                source_id: wire_render::WireEndpointId::from_grid_cell(source_a, 0),
+                destination_id: wire_render::WireEndpointId::from_grid_cell(child_write, 0),
+                points: vec![
+                    center_point_for_cell(source_a),
+                    wires::WirePoint {
+                        x: child_write.x as f32 + 0.5,
+                        y: child_write.y as f32 + 0.25,
+                    },
+                ],
+                color: wires::DEFAULT_WIRE_COLOR,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            write_plan.cell_edits[0].new_cell.primary_input(),
+            Some(source_a)
+        );
+
+        let write_lower_plan = plan_wire_commit(
+            &simulation,
+            &component,
+            &device,
+            &queue,
+            wire_render::StoredWireEdge {
+                source_id: wire_render::WireEndpointId::from_grid_cell(source_b, 0),
+                destination_id: wire_render::WireEndpointId::from_grid_cell(child_write, 0),
+                points: vec![
+                    center_point_for_cell(source_b),
+                    wires::WirePoint {
+                        x: child_write.x as f32 + 0.5,
+                        y: child_write.y as f32 + 0.75,
+                    },
+                ],
+                color: wires::DEFAULT_WIRE_COLOR,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            write_lower_plan.cell_edits[0].new_cell.secondary_input(),
+            Some(source_b)
+        );
+
+        let write1_plan = plan_wire_commit(
+            &simulation,
+            &component,
+            &device,
+            &queue,
+            wire_render::StoredWireEdge {
+                source_id: wire_render::WireEndpointId::from_grid_cell(source_a, 0),
+                destination_id: wire_render::WireEndpointId::from_grid_cell(child_write_1, 0),
+                points: vec![
+                    center_point_for_cell(source_a),
+                    wires::WirePoint {
+                        x: child_write_1.x as f32 + 0.5,
+                        y: child_write_1.y as f32 + 0.5,
+                    },
+                ],
+                color: wires::DEFAULT_WIRE_COLOR,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            write1_plan.cell_edits[0].new_cell.primary_input(),
+            Some(source_a)
         );
     }
 }

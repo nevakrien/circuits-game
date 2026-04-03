@@ -230,6 +230,36 @@ fn render_input(local_uv: vec2<f32>, centered: vec2<f32>, charge: u32) -> vec3<f
     return color;
 }
 
+fn render_child_cell(local_uv: vec2<f32>, centered: vec2<f32>, charge: u32, circuit: vec4<u32>) -> vec3<f32> {
+    _ = local_uv;
+    let tag = circuit.x & 0xffu;
+    let charge_level = f32(charge) / 255.0;
+    let body_mask = rounded_box_mask(centered, vec2(0.39, 0.27), 0.08);
+    let border_mask = body_mask - rounded_box_mask(centered, vec2(0.35, 0.23), 0.07);
+    let left_top = circle_mask(centered, GATE_INPUT_TOP_CENTER, GATE_INPUT_RADIUS);
+    let left_middle = circle_mask(centered, GATE_INPUT_SINGLE_CENTER, GATE_INPUT_RADIUS);
+    let left_bottom = circle_mask(centered, GATE_INPUT_BOTTOM_CENTER, GATE_INPUT_RADIUS);
+    let right_output = diamond_mask(centered, vec2(0.385, 0.0), 0.1);
+    let core_mask = rounded_box_mask(centered, vec2(0.10, 0.10), 0.04);
+
+    let has_top_input = tag == 12u;
+    let has_middle_input = tag == 14u || tag == 15u;
+    let has_bottom_input = tag == 12u;
+    let has_output = tag == 13u || tag == 14u;
+    let body_color = mix(vec3(0.17, 0.15, 0.28), vec3(0.72, 0.70, 0.96), charge_level * 0.3);
+
+    var color = vec3(0.035, 0.035, 0.045);
+    color = mix(color, body_color, body_mask);
+    color = mix(color, vec3(0.36, 0.34, 0.72), border_mask * 0.82);
+    color = mix(color, vec3(0.34, 0.92, 0.42), left_top * select(0.0, 1.0, has_top_input));
+    color = mix(color, vec3(0.34, 0.92, 0.42), left_middle * select(0.0, 1.0, has_middle_input));
+    color = mix(color, vec3(0.34, 0.92, 0.42), left_bottom * select(0.0, 1.0, has_bottom_input));
+    color = mix(color, vec3(1.0, 0.88, 0.22), right_output * select(0.0, 1.0, has_output));
+    color = mix(color, vec3(0.82, 0.78, 0.98), core_mask * 0.8);
+    color += vec3(0.20, 0.18, 0.34) * (charge_level * 0.18);
+    return color;
+}
+
 fn render_cell_color(coord: vec2<u32>, local_uv: vec2<f32>, centered: vec2<f32>, charge: u32, circuit: vec4<u32>) -> vec3<f32> {
     _ = coord;
     switch (circuit.x & 0xffu) {
@@ -244,6 +274,9 @@ fn render_cell_color(coord: vec2<u32>, local_uv: vec2<f32>, centered: vec2<f32>,
         }
         case 11u: {
             return render_input(local_uv, centered, charge);
+        }
+        case 12u, 13u, 14u, 15u, 16u: {
+            return render_child_cell(local_uv, centered, charge, circuit);
         }
         default: {
             return render_empty(local_uv, centered, charge);

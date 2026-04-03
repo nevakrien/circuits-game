@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
-const TEX_W: u32 = 1024;
-const TEX_H: u32 = 1024;
+pub const DEFAULT_PAGE_WIDTH: u32 = 1024;
+pub const DEFAULT_PAGE_HEIGHT: u32 = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ClassId(pub u16);
@@ -56,16 +56,16 @@ pub enum AllocError {
 }
 
 impl SlotClass {
-    fn new(id: u16, w: u16, h: u16) -> Self {
+    fn new(id: u16, page_width: u32, page_height: u32, w: u16, h: u16) -> Self {
         assert!(w.is_power_of_two());
         assert!(h.is_power_of_two());
-        assert!(w as u32 <= TEX_W);
-        assert!(h as u32 <= TEX_H);
-        assert_eq!(TEX_W % w as u32, 0);
-        assert_eq!(TEX_H % h as u32, 0);
+        assert!(w as u32 <= page_width);
+        assert!(h as u32 <= page_height);
+        assert_eq!(page_width % w as u32, 0);
+        assert_eq!(page_height % h as u32, 0);
 
-        let cols = (TEX_W / w as u32) as u16;
-        let rows = (TEX_H / h as u32) as u16;
+        let cols = (page_width / w as u32) as u16;
+        let rows = (page_height / h as u32) as u16;
         let capacity = cols as u32 * rows as u32;
 
         Self {
@@ -250,6 +250,8 @@ impl ClassState {
 }
 
 pub struct TextureAllocator {
+    page_width: u32,
+    page_height: u32,
     classes: Vec<ClassState>,
     pages: Vec<Page>,
 
@@ -262,18 +264,36 @@ pub struct TextureAllocator {
 
 impl TextureAllocator {
     pub fn new(slot_classes: Vec<(u16, u16)>) -> Self {
+        Self::with_page_size(DEFAULT_PAGE_WIDTH, DEFAULT_PAGE_HEIGHT, slot_classes)
+    }
+
+    pub fn with_page_size(
+        page_width: u32,
+        page_height: u32,
+        slot_classes: Vec<(u16, u16)>,
+    ) -> Self {
+        assert!(page_width.is_power_of_two());
+        assert!(page_height.is_power_of_two());
         let classes = slot_classes
             .into_iter()
             .enumerate()
-            .map(|(i, (w, h))| ClassState::new(SlotClass::new(i as u16, w, h)))
+            .map(|(i, (w, h))| {
+                ClassState::new(SlotClass::new(i as u16, page_width, page_height, w, h))
+            })
             .collect();
 
         Self {
+            page_width,
+            page_height,
             classes,
             pages: Vec::new(),
             global_empty_pages: Vec::new(),
             z_len: 0,
         }
+    }
+
+    pub fn page_size(&self) -> [u32; 2] {
+        [self.page_width, self.page_height]
     }
 
     pub fn z_len(&self) -> u32 {
@@ -466,6 +486,14 @@ mod tests {
 
     fn make_alloc(classes: &[(u16, u16)]) -> TextureAllocator {
         TextureAllocator::new(classes.to_vec())
+    }
+
+    fn make_alloc_with_page(
+        page_width: u32,
+        page_height: u32,
+        classes: &[(u16, u16)],
+    ) -> TextureAllocator {
+        TextureAllocator::with_page_size(page_width, page_height, classes.to_vec())
     }
 
     fn rects_overlap(a: AllocRange, b: AllocRange) -> bool {
@@ -855,5 +883,24 @@ mod tests {
         .collect();
 
         assert_eq!(live_set, expected);
+    }
+
+    #[test]
+    fn configurable_page_size_supports_small_test_limits() {
+        let mut alloc = make_alloc_with_page(16, 16, &[(8, 8)]);
+
+        let a = alloc.alloc_exact(8, 8).unwrap();
+        let b = alloc.alloc_exact(8, 8).unwrap();
+        let c = alloc.alloc_exact(8, 8).unwrap();
+        let d = alloc.alloc_exact(8, 8).unwrap();
+
+        assert_eq!(alloc.page_size(), [16, 16]);
+        assert_eq!(a.range.z, 0);
+        assert_eq!(b.range.z, 0);
+        assert_eq!(c.range.z, 0);
+        assert_eq!(d.range.z, 0);
+
+        let spill = alloc.alloc_exact(8, 8).unwrap();
+        assert_eq!(spill.range.z, 1);
     }
 }

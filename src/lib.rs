@@ -1,8 +1,11 @@
 pub mod allocator;
+pub mod buffer_allocator;
 pub mod circuit_runtime;
+pub mod child_components;
 pub mod component_plan;
 pub mod demo_scene;
 pub mod editor;
+pub mod game_constants;
 pub mod level_context;
 pub mod render;
 pub mod simulation;

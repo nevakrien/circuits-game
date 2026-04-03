@@ -59,6 +59,13 @@ impl CameraState {
         view_uv_scale(self.surface_size, self.zoom)
     }
 
+    pub fn surface_size_pixels(&self) -> [f32; 2] {
+        [
+            self.surface_size.width as f32,
+            self.surface_size.height as f32,
+        ]
+    }
+
     pub fn surface_to_world_uv(&self, position: [f32; 2]) -> Option<[f32; 2]> {
         let width = self.surface_size.width.max(1) as f32;
         let height = self.surface_size.height.max(1) as f32;

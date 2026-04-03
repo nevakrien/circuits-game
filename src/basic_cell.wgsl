@@ -16,6 +16,9 @@ var<storage, read> input_buffer: array<u32>;
 @group(0) @binding(4)
 var<storage, read_write> output_buffer: array<u32>;
 
+const INVALID_INPUT_REF: u32 = 0xffffffffu;
+const INVALID_CHILD_BUFFER_OFFSET: u32 = 0xffffffffu;
+
 fn byte_channel(coord: vec2<u32>) -> u32 {
     return (coord.y & 1u) * 2u + (coord.x & 1u);
 }
@@ -111,7 +114,7 @@ fn decode_same_layer_input(input_ref: u32, coord: vec3<u32>) -> vec3<u32> {
 }
 
 fn read_input_charge(dims: vec3<u32>, coord: vec3<u32>, input_ref: u32) -> u32 {
-    if (input_ref == 0xffffffffu) {
+    if (input_ref == INVALID_INPUT_REF) {
         return 0u;
     }
 
@@ -131,8 +134,22 @@ fn write_output(dims: vec3<u32>, coord: vec3<u32>, value: u32) {
     output_buffer[output_index(dims, coord)] = value & 0xffu;
 }
 
+fn write_buffer_value(index: u32, value: u32) {
+    if (index == INVALID_CHILD_BUFFER_OFFSET || index >= arrayLength(&output_buffer)) {
+        return;
+    }
+    output_buffer[index] = value & 0xffu;
+}
+
 fn read_input_buffer(dims: vec3<u32>, coord: vec3<u32>) -> u32 {
     return input_buffer[output_index(dims, coord)] & 0xffu;
+}
+
+fn read_buffer_value(index: u32) -> u32 {
+    if (index == INVALID_CHILD_BUFFER_OFFSET || index >= arrayLength(&input_buffer)) {
+        return 0u;
+    }
+    return input_buffer[index] & 0xffu;
 }
 
 fn update_not(
@@ -194,6 +211,7 @@ fn update_output(
     _ = circuit;
     let next_charge = read_input_charge(dims, coord, payload.x);
     write_output(dims, coord, next_charge);
+    write_buffer_value(payload.z, next_charge);
     return next_charge;
 }
 
@@ -206,8 +224,86 @@ fn update_input(
 ) -> u32 {
     _ = current_charge;
     _ = circuit;
+    if (payload.x == INVALID_INPUT_REF) {
+        return read_input_buffer(dims, coord);
+    }
+    return read_buffer_value(payload.x);
+}
+
+fn update_child_write(
+    dims: vec3<u32>,
+    coord: vec3<u32>,
+    current_charge: u32,
+    circuit: vec4<u32>,
+    payload: vec3<u32>,
+) -> u32 {
+    _ = current_charge;
+    _ = circuit;
+    let first = read_input_charge(dims, coord, payload.x);
+    let second = read_input_charge(dims, coord, payload.y);
+    write_buffer_value(payload.z, first);
+    write_buffer_value(payload.z + 1u, second);
+    return 0u;
+}
+
+fn update_child_read(
+    dims: vec3<u32>,
+    coord: vec3<u32>,
+    current_charge: u32,
+    circuit: vec4<u32>,
+    payload: vec3<u32>,
+) -> u32 {
+    _ = dims;
+    _ = coord;
+    _ = current_charge;
+    _ = circuit;
+    _ = payload.y;
+    _ = payload.z;
+    return read_buffer_value(payload.x);
+}
+
+fn update_child_read_write(
+    dims: vec3<u32>,
+    coord: vec3<u32>,
+    current_charge: u32,
+    circuit: vec4<u32>,
+    payload: vec3<u32>,
+) -> u32 {
+    _ = current_charge;
+    _ = circuit;
+    let outbound = read_input_charge(dims, coord, payload.y);
+    write_buffer_value(payload.z, outbound);
+    return read_buffer_value(payload.x);
+}
+
+fn update_child_write_1(
+    dims: vec3<u32>,
+    coord: vec3<u32>,
+    current_charge: u32,
+    circuit: vec4<u32>,
+    payload: vec3<u32>,
+) -> u32 {
+    _ = current_charge;
+    _ = circuit;
+    _ = payload.y;
+    let first = read_input_charge(dims, coord, payload.x);
+    write_buffer_value(payload.z, first);
+    return 0u;
+}
+
+fn update_child_noop(
+    dims: vec3<u32>,
+    coord: vec3<u32>,
+    current_charge: u32,
+    circuit: vec4<u32>,
+    payload: vec3<u32>,
+) -> u32 {
+    _ = dims;
+    _ = coord;
+    _ = current_charge;
+    _ = circuit;
     _ = payload;
-    return read_input_buffer(dims, coord);
+    return 0u;
 }
 
 fn update_tag(
@@ -238,6 +334,21 @@ fn update_tag(
         }
         case 11u: {
             return update_input(dims, coord, current_charge, circuit, payload);
+        }
+        case 12u: {
+            return update_child_write(dims, coord, current_charge, circuit, payload);
+        }
+        case 13u: {
+            return update_child_read(dims, coord, current_charge, circuit, payload);
+        }
+        case 14u: {
+            return update_child_read_write(dims, coord, current_charge, circuit, payload);
+        }
+        case 15u: {
+            return update_child_write_1(dims, coord, current_charge, circuit, payload);
+        }
+        case 16u: {
+            return update_child_noop(dims, coord, current_charge, circuit, payload);
         }
         default: {
             return current_charge;
