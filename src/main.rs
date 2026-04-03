@@ -1,6 +1,6 @@
 use circuits_game::{
-    child_components, circuit_runtime, component_plan, editor, level_context, render, simulation, windowing,
-    wire_render, wires,
+    child_components, circuit_runtime, component_plan, editor, level_context, render, simulation,
+    windowing, wire_render, wires,
 };
 use egui_wgpu::wgpu;
 use egui_winit::winit;
@@ -451,10 +451,11 @@ fn place_child_instance_at_cursor(
     }) {
         return Ok(false);
     }
-    plan.child_instances.push(child_components::ChildInstancePlan {
-        component_id: child_component_id,
-        origin: [origin_cell.x, origin_cell.y],
-    });
+    plan.child_instances
+        .push(child_components::ChildInstancePlan {
+            component_id: child_component_id,
+            origin: [origin_cell.x, origin_cell.y],
+        });
     plan.sync_child_links();
 
     restore_edit_component(

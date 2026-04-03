@@ -1,8 +1,11 @@
 use egui_wgpu::wgpu;
 
 use crate::{
-    child_components::ChildInstancePlan,
+    child_components::{
+        ChildInstancePlan, ChildPortLayout, ChildResourcePlanNode, plan_child_runtime,
+    },
     component_plan::{ComponentId, ComponentPlan},
+    game_constants::GameConstants,
     level_context::{LevelContext, LevelContextError},
     simulation::{self, BoardTextures, CellKind, CellSnapshot, Simulation},
     wire_render::WireRenderInfo,
@@ -32,6 +35,12 @@ pub struct CircuitRuntime {
     pub root: RuntimeComponent,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlannedBufferLayout {
+    page_starts: Vec<u32>,
+    total_len: u32,
+}
+
 impl CircuitRuntime {
     pub fn build_and_link(
         context: &LevelContext,
@@ -42,7 +51,9 @@ impl CircuitRuntime {
         context.validate()?;
 
         let simulation = Simulation::new(device);
-        let root = build_runtime_component(context, root_component_id, device, queue, true)?;
+        let constants = GameConstants::default();
+        let root =
+            build_runtime_component(context, root_component_id, device, queue, &constants, true)?;
         Ok(Self { simulation, root })
     }
 
@@ -112,6 +123,7 @@ fn build_runtime_component(
     component_id: ComponentId,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
+    constants: &GameConstants,
     is_root: bool,
 ) -> Result<RuntimeComponent, LevelContextError> {
     let plan = context
@@ -119,17 +131,33 @@ fn build_runtime_component(
         .ok_or(LevelContextError::MissingRoot(component_id))?;
     let input_ports = collect_port_cells(plan, CellKind::Input);
     let output_ports = collect_port_cells(plan, CellKind::Output);
+    let child_runtime_plan = build_child_runtime_plan(context, &plan.child_instances, constants)?;
+    let parent_output_layout = planned_buffer_layout(
+        child_runtime_plan
+            .root_children
+            .iter()
+            .map(|child| child.io.input),
+    );
+    let parent_input_layout = planned_buffer_layout(
+        child_runtime_plan
+            .root_children
+            .iter()
+            .map(|child| child.io.output),
+    );
 
-    let mut next_parent_input_start = CHILD_LINK_BUFFER_BASE;
-    let mut next_parent_output_start = CHILD_LINK_BUFFER_BASE;
     let mut children = Vec::with_capacity(plan.child_instances.len());
 
-    for child in &plan.child_instances {
-        let runtime = build_runtime_component(context, child.component_id, device, queue, false)?;
-        let parent_input_start = next_parent_input_start;
-        let parent_output_start = next_parent_output_start;
-        next_parent_input_start += runtime.output_port_count;
-        next_parent_output_start += runtime.input_port_count;
+    for (child, planned_child) in plan
+        .child_instances
+        .iter()
+        .zip(child_runtime_plan.root_children.iter())
+    {
+        let runtime =
+            build_runtime_component(context, child.component_id, device, queue, constants, false)?;
+        let parent_input_start = CHILD_LINK_BUFFER_BASE
+            + planned_buffer_offset(&parent_input_layout, planned_child.io.output);
+        let parent_output_start = CHILD_LINK_BUFFER_BASE
+            + planned_buffer_offset(&parent_output_layout, planned_child.io.input);
         children.push(RuntimeChildInstance {
             parent_input_start,
             parent_output_start,
@@ -141,8 +169,9 @@ fn build_runtime_component(
     let board = BoardTextures::with_buffer_lengths(
         device,
         queue,
-        next_parent_input_start.max(simulation::INPUT_BUFFER_LEN),
-        next_parent_output_start.max(simulation::OUTPUT_BUFFER_LEN),
+        (CHILD_LINK_BUFFER_BASE + parent_input_layout.total_len).max(simulation::INPUT_BUFFER_LEN),
+        (CHILD_LINK_BUFFER_BASE + parent_output_layout.total_len)
+            .max(simulation::OUTPUT_BUFFER_LEN),
     );
     let wires = context.upload_component_to_board(component_id, &board, device, queue)?;
 
@@ -159,6 +188,75 @@ fn build_runtime_component(
         input_port_count: input_ports.len() as u32,
         output_port_count: output_ports.len() as u32,
     })
+}
+
+fn build_child_runtime_plan(
+    context: &LevelContext,
+    child_instances: &[ChildInstancePlan],
+    constants: &GameConstants,
+) -> Result<crate::child_components::ChildRuntimePlan, LevelContextError> {
+    let mut root_children = Vec::with_capacity(child_instances.len());
+    for child in child_instances {
+        root_children.push(build_child_resource_plan_node(context, child.component_id)?);
+    }
+    Ok(plan_child_runtime(&root_children, constants))
+}
+
+fn build_child_resource_plan_node(
+    context: &LevelContext,
+    component_id: ComponentId,
+) -> Result<ChildResourcePlanNode, LevelContextError> {
+    let plan = context
+        .component(component_id)
+        .ok_or(LevelContextError::MissingDependency {
+            component: component_id,
+            dependency: component_id,
+        })?;
+    let mut children = Vec::with_capacity(plan.child_instances.len());
+    for child in &plan.child_instances {
+        children.push(build_child_resource_plan_node(context, child.component_id)?);
+    }
+
+    Ok(ChildResourcePlanNode {
+        grid_size: [plan.internal_size[0] as u16, plan.internal_size[1] as u16],
+        port_layout: ChildPortLayout {
+            input_words: plan.input_count(),
+            output_words: plan.output_count(),
+        },
+        children,
+    })
+}
+
+fn planned_buffer_layout(
+    ranges: impl Iterator<Item = crate::buffer_allocator::BufferAllocRange>,
+) -> PlannedBufferLayout {
+    let mut page_spans = Vec::<u32>::new();
+    for range in ranges {
+        let page = range.page as usize;
+        if page_spans.len() <= page {
+            page_spans.resize(page + 1, 0);
+        }
+        page_spans[page] = page_spans[page].max(range.offset_words + range.len_words);
+    }
+
+    let mut page_starts = Vec::with_capacity(page_spans.len());
+    let mut total_len = 0;
+    for span in page_spans {
+        page_starts.push(total_len);
+        total_len += span;
+    }
+
+    PlannedBufferLayout {
+        page_starts,
+        total_len,
+    }
+}
+
+fn planned_buffer_offset(
+    layout: &PlannedBufferLayout,
+    range: crate::buffer_allocator::BufferAllocRange,
+) -> u32 {
+    layout.page_starts[range.page as usize] + range.offset_words
 }
 
 fn patch_component_ports(
@@ -360,11 +458,18 @@ mod tests {
     use super::*;
     use crate::wire_render::{StoredWireEdge, WireEndpointId};
 
+    fn constants_with_child_page_words(words_per_page: u32) -> GameConstants {
+        let mut constants = GameConstants::default();
+        constants.child_io_sizing.words_per_page = words_per_page;
+        constants
+    }
+
     #[test]
     fn child_passthrough_runtime_links_parent_and_child_ports() {
-        let Some(gpu) = crate::test_gpu::shared_test_gpu() else {
-            return;
-        };
+        // We keep the actual runtime test tiny on purpose. The planner-side tests cover massive
+        // allocation counts cheaply; this test covers the other half of the contract by proving a
+        // nontrivial child runtime can be built and stepped end-to-end on real GPU resources.
+        let gpu = crate::test_gpu::shared_test_gpu();
 
         let mut context = LevelContext::with_starter_root();
         let root_id = context.root_component_id();
@@ -427,5 +532,181 @@ mod tests {
             0,
         ));
         assert_eq!(output, 0xff);
+    }
+
+    #[test]
+    fn runtime_child_link_buffers_fit_guaranteed_storage_binding_limits() {
+        // This is the small real-build counterpart to the planner stress tests. It proves that a
+        // runtime with planner-derived child-link IO buffers still builds against guaranteed wgpu
+        // limits. What is still missing is the texture-side equivalent for child runtime textures:
+        // once a planned z page count exceeds one texture's depth, runtime should materialize
+        // multiple textures instead of keeping the current fixed-size `BoardTextures` model.
+        let gpu = crate::test_gpu::shared_test_gpu();
+
+        let mut context = LevelContext::with_starter_root();
+        let root_id = context.root_component_id();
+        let child_id =
+            context.create_component("Child", [simulation::GRID_WIDTH, simulation::GRID_HEIGHT]);
+
+        {
+            let child = context.component_mut(child_id).unwrap();
+            child.set_cell_words_at(0, 0, CellSnapshot::input().words);
+            child.set_cell_words_at(1, 0, CellSnapshot::input().words);
+            child.set_cell_words_at(2, 0, CellSnapshot::input().words);
+            child.set_cell_words_at(0, 1, CellSnapshot::output().words);
+            child.set_cell_words_at(1, 1, CellSnapshot::output().words);
+            child.recompute_outside_shape();
+        }
+
+        {
+            let root = context.component_mut(root_id).unwrap();
+            root.child_instances = vec![
+                ChildInstancePlan {
+                    component_id: child_id,
+                    origin: [0, 0],
+                },
+                ChildInstancePlan {
+                    component_id: child_id,
+                    origin: [3, 0],
+                },
+            ];
+            root.sync_child_links();
+        }
+
+        let runtime =
+            CircuitRuntime::build_and_link(&context, root_id, &gpu.device, &gpu.queue).unwrap();
+
+        assert_eq!(
+            runtime.root.board.input_len(),
+            simulation::OUTPUT_BUFFER_LEN + 4
+        );
+        assert_eq!(
+            runtime.root.board.output_len(),
+            simulation::OUTPUT_BUFFER_LEN + 6
+        );
+        assert!(
+            runtime.root.board.input_len() <= simulation::max_guaranteed_storage_buffer_words()
+        );
+        assert!(
+            runtime.root.board.output_len() <= simulation::max_guaranteed_storage_buffer_words()
+        );
+    }
+
+    #[test]
+    fn runtime_child_link_offsets_follow_planner_allocations() {
+        let gpu = crate::test_gpu::shared_test_gpu();
+        let constants = constants_with_child_page_words(4);
+
+        let mut context = LevelContext::with_starter_root();
+        let root_id = context.root_component_id();
+        let read_only_child = context.create_component(
+            "ReadOnlyChild",
+            [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
+        );
+        let write_only_child = context.create_component(
+            "WriteOnlyChild",
+            [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
+        );
+        let read_write_child = context.create_component(
+            "ReadWriteChild",
+            [simulation::GRID_WIDTH, simulation::GRID_HEIGHT],
+        );
+
+        {
+            let child = context.component_mut(read_only_child).unwrap();
+            child.set_cell_words_at(0, 0, CellSnapshot::output().words);
+            child.recompute_outside_shape();
+        }
+
+        {
+            let child = context.component_mut(write_only_child).unwrap();
+            child.set_cell_words_at(0, 0, CellSnapshot::input().words);
+            child.recompute_outside_shape();
+        }
+
+        {
+            let child = context.component_mut(read_write_child).unwrap();
+            child.set_cell_words_at(0, 0, CellSnapshot::input().words);
+            child.set_cell_words_at(1, 0, CellSnapshot::output().words);
+            child.recompute_outside_shape();
+        }
+
+        let child_instances = vec![
+            ChildInstancePlan {
+                component_id: read_only_child,
+                origin: [0, 0],
+            },
+            ChildInstancePlan {
+                component_id: write_only_child,
+                origin: [2, 0],
+            },
+            ChildInstancePlan {
+                component_id: read_write_child,
+                origin: [4, 0],
+            },
+        ];
+
+        {
+            let root = context.component_mut(root_id).unwrap();
+            root.cells.fill(CellSnapshot::empty().words);
+            root.wires.clear();
+            root.child_instances = child_instances.clone();
+            root.sync_child_links();
+        }
+
+        let planned = build_child_runtime_plan(&context, &child_instances, &constants).unwrap();
+        let parent_output_layout =
+            planned_buffer_layout(planned.root_children.iter().map(|child| child.io.input));
+        let parent_input_layout =
+            planned_buffer_layout(planned.root_children.iter().map(|child| child.io.output));
+
+        let runtime =
+            build_runtime_component(&context, root_id, &gpu.device, &gpu.queue, &constants, true)
+                .unwrap();
+
+        assert_eq!(runtime.children.len(), planned.root_children.len());
+        assert_eq!(
+            runtime.board.input_len(),
+            CHILD_LINK_BUFFER_BASE + parent_input_layout.total_len
+        );
+        assert_eq!(
+            runtime.board.output_len(),
+            CHILD_LINK_BUFFER_BASE + parent_output_layout.total_len
+        );
+
+        for (runtime_child, planned_child) in
+            runtime.children.iter().zip(planned.root_children.iter())
+        {
+            assert_eq!(
+                runtime_child.parent_input_start,
+                CHILD_LINK_BUFFER_BASE
+                    + planned_buffer_offset(&parent_input_layout, planned_child.io.output)
+            );
+            assert_eq!(
+                runtime_child.parent_output_start,
+                CHILD_LINK_BUFFER_BASE
+                    + planned_buffer_offset(&parent_output_layout, planned_child.io.input)
+            );
+        }
+
+        let read_only_proxy =
+            runtime
+                .board
+                .read_cell(&gpu.device, &gpu.queue, GridCell { x: 0, y: 0 }, 0);
+        assert_eq!(read_only_proxy.kind(), CellKind::ChildRead);
+        assert_eq!(
+            read_only_proxy.buffer_offset(),
+            runtime.children[0].parent_input_start
+        );
+
+        let write_only_proxy =
+            runtime
+                .board
+                .read_cell(&gpu.device, &gpu.queue, GridCell { x: 2, y: 0 }, 0);
+        assert_eq!(write_only_proxy.kind(), CellKind::ChildWrite1);
+        assert_eq!(
+            write_only_proxy.output_offset(),
+            runtime.children[1].parent_output_start
+        );
     }
 }

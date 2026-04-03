@@ -175,6 +175,50 @@ pub fn device_descriptor(adapter: &wgpu::Adapter) -> wgpu::DeviceDescriptor<'sta
     }
 }
 
+pub fn guaranteed_wgpu_limits() -> wgpu::Limits {
+    wgpu::Limits::default()
+}
+
+pub fn max_guaranteed_storage_buffer_words() -> u32 {
+    let bytes_per_word = std::mem::size_of::<u32>() as u32;
+    guaranteed_wgpu_limits().max_storage_buffer_binding_size / bytes_per_word
+}
+
+fn assert_board_resource_lengths_fit_guaranteed_limits(input_len: u32, output_len: u32) {
+    let limits = guaranteed_wgpu_limits();
+
+    assert!(
+        GRID_WIDTH <= limits.max_texture_dimension_3d,
+        "board width {} exceeds guaranteed max 3D texture dimension {}",
+        GRID_WIDTH,
+        limits.max_texture_dimension_3d
+    );
+    assert!(
+        GRID_HEIGHT <= limits.max_texture_dimension_3d,
+        "board height {} exceeds guaranteed max 3D texture dimension {}",
+        GRID_HEIGHT,
+        limits.max_texture_dimension_3d
+    );
+    assert!(
+        BOARD_LAYERS <= limits.max_texture_dimension_3d,
+        "board layer count {} exceeds guaranteed max 3D texture depth {}",
+        BOARD_LAYERS,
+        limits.max_texture_dimension_3d
+    );
+
+    let max_binding_bytes = u64::from(limits.max_storage_buffer_binding_size);
+    let input_bytes = input_buffer_size(input_len);
+    let output_bytes = output_buffer_size(output_len);
+    assert!(
+        input_bytes <= max_binding_bytes,
+        "input buffer size {input_bytes} exceeds guaranteed storage binding limit {max_binding_bytes}"
+    );
+    assert!(
+        output_bytes <= max_binding_bytes,
+        "output buffer size {output_bytes} exceeds guaranteed storage binding limit {max_binding_bytes}"
+    );
+}
+
 impl BoardTextures {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
         Self::with_buffer_lengths(device, queue, INPUT_BUFFER_LEN, OUTPUT_BUFFER_LEN)
@@ -186,6 +230,8 @@ impl BoardTextures {
         input_len: u32,
         output_len: u32,
     ) -> Self {
+        assert_board_resource_lengths_fit_guaranteed_limits(input_len, output_len);
+
         let charge_buffers: Vec<_> = (0..CHARGE_BUFFER_COUNT)
             .map(|_| {
                 let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -306,6 +352,14 @@ impl BoardTextures {
 
     pub fn input_read_buffer(&self) -> &wgpu::Buffer {
         &self.input_read_buffer
+    }
+
+    pub fn input_len(&self) -> u32 {
+        self.input_len
+    }
+
+    pub fn output_len(&self) -> u32 {
+        self.output_len
     }
 
     pub fn write_input_value(&self, queue: &wgpu::Queue, x: u32, y: u32, z: u32, value: u32) {
@@ -749,7 +803,10 @@ impl BoardTextures {
         let start = start_index as usize;
         let len = len as usize;
         let end = start + len;
-        assert!(end <= self.output_len as usize, "output range out of bounds");
+        assert!(
+            end <= self.output_len as usize,
+            "output range out of bounds"
+        );
 
         let byte_offset = (start * std::mem::size_of::<u32>()) as u64;
         let byte_len = (len * std::mem::size_of::<u32>()) as u64;
@@ -1217,7 +1274,11 @@ fn gate_cell(tag: CircuitTag) -> CircuitCell {
 fn output_cell() -> CircuitCell {
     CircuitCell {
         tag: CircuitTag::Output,
-        data: [INVALID_INPUT_REF, INVALID_INPUT_REF, INVALID_CHILD_BUFFER_OFFSET],
+        data: [
+            INVALID_INPUT_REF,
+            INVALID_INPUT_REF,
+            INVALID_CHILD_BUFFER_OFFSET,
+        ],
     }
 }
 
@@ -1231,35 +1292,55 @@ fn input_cell() -> CircuitCell {
 fn child_write_cell() -> CircuitCell {
     CircuitCell {
         tag: CircuitTag::ChildWrite,
-        data: [INVALID_INPUT_REF, INVALID_INPUT_REF, INVALID_CHILD_BUFFER_OFFSET],
+        data: [
+            INVALID_INPUT_REF,
+            INVALID_INPUT_REF,
+            INVALID_CHILD_BUFFER_OFFSET,
+        ],
     }
 }
 
 fn child_write_1_cell() -> CircuitCell {
     CircuitCell {
         tag: CircuitTag::ChildWrite1,
-        data: [INVALID_INPUT_REF, INVALID_INPUT_REF, INVALID_CHILD_BUFFER_OFFSET],
+        data: [
+            INVALID_INPUT_REF,
+            INVALID_INPUT_REF,
+            INVALID_CHILD_BUFFER_OFFSET,
+        ],
     }
 }
 
 fn child_read_cell() -> CircuitCell {
     CircuitCell {
         tag: CircuitTag::ChildRead,
-        data: [INVALID_CHILD_BUFFER_OFFSET, INVALID_INPUT_REF, INVALID_INPUT_REF],
+        data: [
+            INVALID_CHILD_BUFFER_OFFSET,
+            INVALID_INPUT_REF,
+            INVALID_INPUT_REF,
+        ],
     }
 }
 
 fn child_read_write_cell() -> CircuitCell {
     CircuitCell {
         tag: CircuitTag::ChildReadWrite,
-        data: [INVALID_CHILD_BUFFER_OFFSET, INVALID_INPUT_REF, INVALID_CHILD_BUFFER_OFFSET],
+        data: [
+            INVALID_CHILD_BUFFER_OFFSET,
+            INVALID_INPUT_REF,
+            INVALID_CHILD_BUFFER_OFFSET,
+        ],
     }
 }
 
 fn child_noop_cell() -> CircuitCell {
     CircuitCell {
         tag: CircuitTag::ChildNoop,
-        data: [INVALID_INPUT_REF, INVALID_INPUT_REF, INVALID_CHILD_BUFFER_OFFSET],
+        data: [
+            INVALID_INPUT_REF,
+            INVALID_INPUT_REF,
+            INVALID_CHILD_BUFFER_OFFSET,
+        ],
     }
 }
 
@@ -1405,9 +1486,7 @@ mod tests {
 
     #[test]
     fn output_cells_write_to_output_buffer() {
-        let Some(gpu) = crate::test_gpu::shared_test_gpu() else {
-            return;
-        };
+        let gpu = crate::test_gpu::shared_test_gpu();
 
         let device = &gpu.device;
         let queue = &gpu.queue;
@@ -1445,19 +1524,41 @@ mod tests {
 
     #[test]
     fn child_write_cells_write_selected_wires_to_output_buffer_offsets() {
-        let Some(gpu) = crate::test_gpu::shared_test_gpu() else {
-            return;
-        };
+        let gpu = crate::test_gpu::shared_test_gpu();
 
         let device = &gpu.device;
         let queue = &gpu.queue;
 
         let board = BoardTextures::new(device, queue);
-        board.write_cell(queue, GridCell { x: 0, y: 0 }, 0, CellSnapshot::source(0xaa));
-        board.write_cell(queue, GridCell { x: 0, y: 1 }, 0, CellSnapshot::source(0x55));
+        board.write_cell(
+            queue,
+            GridCell { x: 0, y: 0 },
+            0,
+            CellSnapshot::source(0xaa),
+        );
+        board.write_cell(
+            queue,
+            GridCell { x: 0, y: 1 },
+            0,
+            CellSnapshot::source(0x55),
+        );
         for buffer_index in 0..CHARGE_BUFFER_COUNT {
-            board.write_charge_value(device, queue, buffer_index, GridCell { x: 0, y: 0 }, 0, 0xaa);
-            board.write_charge_value(device, queue, buffer_index, GridCell { x: 0, y: 1 }, 0, 0x55);
+            board.write_charge_value(
+                device,
+                queue,
+                buffer_index,
+                GridCell { x: 0, y: 0 },
+                0,
+                0xaa,
+            );
+            board.write_charge_value(
+                device,
+                queue,
+                buffer_index,
+                GridCell { x: 0, y: 1 },
+                0,
+                0x55,
+            );
         }
         board.write_cell(
             queue,
@@ -1483,9 +1584,7 @@ mod tests {
 
     #[test]
     fn child_read_and_rw_cells_round_trip_buffer_offsets() {
-        let Some(gpu) = crate::test_gpu::shared_test_gpu() else {
-            return;
-        };
+        let gpu = crate::test_gpu::shared_test_gpu();
 
         let device = &gpu.device;
         let queue = &gpu.queue;
@@ -1498,9 +1597,21 @@ mod tests {
             0,
             CellSnapshot::child_read().with_buffer_offset(20),
         );
-        board.write_cell(queue, GridCell { x: 0, y: 0 }, 0, CellSnapshot::source(0xcc));
+        board.write_cell(
+            queue,
+            GridCell { x: 0, y: 0 },
+            0,
+            CellSnapshot::source(0xcc),
+        );
         for buffer_index in 0..CHARGE_BUFFER_COUNT {
-            board.write_charge_value(device, queue, buffer_index, GridCell { x: 0, y: 0 }, 0, 0xcc);
+            board.write_charge_value(
+                device,
+                queue,
+                buffer_index,
+                GridCell { x: 0, y: 0 },
+                0,
+                0xcc,
+            );
         }
         board.write_cell(
             queue,
@@ -1529,9 +1640,7 @@ mod tests {
 
     #[test]
     fn input_cells_read_from_input_buffer() {
-        let Some(gpu) = crate::test_gpu::shared_test_gpu() else {
-            return;
-        };
+        let gpu = crate::test_gpu::shared_test_gpu();
 
         let device = &gpu.device;
         let queue = &gpu.queue;
@@ -1563,9 +1672,7 @@ mod tests {
 
     #[test]
     fn input_output_range_helpers_round_trip_contiguous_slots() {
-        let Some(gpu) = crate::test_gpu::shared_test_gpu() else {
-            return;
-        };
+        let gpu = crate::test_gpu::shared_test_gpu();
 
         let device = &gpu.device;
         let queue = &gpu.queue;
@@ -1617,9 +1724,7 @@ mod tests {
 
     #[test]
     fn simulation_step_can_be_read_back_without_window() {
-        let Some(gpu) = crate::test_gpu::shared_test_gpu() else {
-            return;
-        };
+        let gpu = crate::test_gpu::shared_test_gpu();
 
         let device = &gpu.device;
         let queue = &gpu.queue;
@@ -1658,5 +1763,25 @@ mod tests {
 
             current_buffer = next_buffer;
         }
+    }
+
+    #[test]
+    fn board_resource_sizes_fit_guaranteed_wgpu_limits() {
+        assert_board_resource_lengths_fit_guaranteed_limits(INPUT_BUFFER_LEN, OUTPUT_BUFFER_LEN);
+        assert!(BOARD_LAYERS <= guaranteed_wgpu_limits().max_texture_dimension_3d);
+    }
+
+    #[test]
+    #[should_panic(expected = "input buffer size")]
+    fn board_textures_reject_storage_buffers_above_guaranteed_limit() {
+        let gpu = crate::test_gpu::shared_test_gpu();
+        let overflow_words = max_guaranteed_storage_buffer_words() + 1;
+
+        let _ = BoardTextures::with_buffer_lengths(
+            &gpu.device,
+            &gpu.queue,
+            overflow_words,
+            OUTPUT_BUFFER_LEN,
+        );
     }
 }

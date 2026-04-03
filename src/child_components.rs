@@ -53,15 +53,7 @@ pub struct AllocatedChildIo {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ChildRuntimePlanSummary {
-    pub texture_resources: u32,
-    pub input_resources: u32,
-    pub output_resources: u32,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChildRuntimePlan {
-    pub summary: ChildRuntimePlanSummary,
     pub root_children: Vec<PlannedChildInstance>,
 }
 
@@ -138,11 +130,6 @@ pub fn plan_child_runtime(
     }
 
     ChildRuntimePlan {
-        summary: ChildRuntimePlanSummary {
-            texture_resources: texture_alloc.z_len(),
-            input_resources: input_alloc.page_count(),
-            output_resources: output_alloc.page_count(),
-        },
         root_children: planned_children,
     }
 }
@@ -211,6 +198,7 @@ fn plan_child_instance(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     fn constants_with_limits(texture_page: [u32; 2], words_per_page: u32) -> GameConstants {
         let mut constants = GameConstants::default();
@@ -228,6 +216,25 @@ mod tests {
             },
             children: Vec::new(),
         }
+    }
+
+    fn collect_resource_usage(
+        children: &[PlannedChildInstance],
+        texture_pages: &mut BTreeSet<u32>,
+        input_pages: &mut BTreeSet<u32>,
+        output_pages: &mut BTreeSet<u32>,
+    ) {
+        for child in children {
+            texture_pages.insert(child.grid.range.z);
+            input_pages.insert(child.io.input.page);
+            output_pages.insert(child.io.output.page);
+            collect_resource_usage(&child.children, texture_pages, input_pages, output_pages);
+        }
+    }
+
+    fn textures_needed_for_pages(page_count: usize) -> u32 {
+        let max_depth = crate::simulation::guaranteed_wgpu_limits().max_texture_dimension_3d;
+        (page_count as u32).div_ceil(max_depth)
     }
 
     #[test]
@@ -254,6 +261,44 @@ mod tests {
     }
 
     #[test]
+    fn massive_child_runtime_plan_can_be_checked_with_tiny_pages() {
+        // We cannot efficiently run a truly massive runtime build in tests just to prove the
+        // allocator math scales. Instead, this test forces one child per texture page and one
+        // child per input/output buffer page by using tiny limits, then plans more pages than the
+        // guaranteed wgpu 3D texture depth. That gives us a cheap planner-side stress test for a
+        // massive build without constructing the actual GPU resources.
+        //
+        // What is still missing: runtime construction does not consume `plan_child_runtime`, so we
+        // do not yet have a path that turns these planned z pages into multiple real textures once
+        // they exceed a single texture's guaranteed depth. The correct behavior is to split across
+        // textures, not reject the plan.
+        let child_count = crate::simulation::guaranteed_wgpu_limits().max_texture_dimension_3d + 1;
+        let constants = constants_with_limits([8, 8], 4);
+        let root_children = vec![leaf([8, 8], 4, 4); child_count as usize];
+
+        let planned = plan_child_runtime(&root_children, &constants);
+
+        let mut texture_pages = BTreeSet::new();
+        let mut input_pages = BTreeSet::new();
+        let mut output_pages = BTreeSet::new();
+        collect_resource_usage(
+            &planned.root_children,
+            &mut texture_pages,
+            &mut input_pages,
+            &mut output_pages,
+        );
+
+        assert_eq!(texture_pages.len(), child_count as usize);
+        assert_eq!(input_pages.len(), child_count as usize);
+        assert_eq!(output_pages.len(), child_count as usize);
+        assert!(
+            texture_pages.len() as u32
+                > crate::simulation::guaranteed_wgpu_limits().max_texture_dimension_3d
+        );
+        assert_eq!(textures_needed_for_pages(texture_pages.len()), 2);
+    }
+
+    #[test]
     fn small_hierarchy_reuses_single_child_io_resource_pair() {
         let constants = constants_with_limits([16, 16], 64);
         let grandchild = leaf([8, 8], 2, 2);
@@ -273,9 +318,20 @@ mod tests {
         let root_children = vec![child.clone(), child.clone(), child.clone(), child];
 
         let planned = plan_child_runtime(&root_children, &constants);
-        assert_eq!(planned.summary.input_resources, 1);
-        assert_eq!(planned.summary.output_resources, 1);
-        assert_eq!(planned.summary.texture_resources, 5);
+
+        let mut texture_pages = BTreeSet::new();
+        let mut input_pages = BTreeSet::new();
+        let mut output_pages = BTreeSet::new();
+        collect_resource_usage(
+            &planned.root_children,
+            &mut texture_pages,
+            &mut input_pages,
+            &mut output_pages,
+        );
+
+        assert_eq!(input_pages.len(), 1);
+        assert_eq!(output_pages.len(), 1);
+        assert_eq!(texture_pages.len(), 5);
     }
 
     #[test]
@@ -290,7 +346,30 @@ mod tests {
         ];
 
         let planned = plan_child_runtime(&root_children, &constants);
-        assert_eq!(planned.summary.input_resources, 2);
-        assert_eq!(planned.summary.output_resources, 2);
+
+        let mut texture_pages = BTreeSet::new();
+        let mut input_pages = BTreeSet::new();
+        let mut output_pages = BTreeSet::new();
+        collect_resource_usage(
+            &planned.root_children,
+            &mut texture_pages,
+            &mut input_pages,
+            &mut output_pages,
+        );
+
+        assert_eq!(input_pages.len(), 2);
+        assert_eq!(output_pages.len(), 2);
+    }
+
+    #[test]
+    fn oversized_child_io_request_panics_before_it_can_overallocate_a_page() {
+        let constants = constants_with_limits([16, 16], 8);
+        let root_children = vec![leaf([8, 8], 9, 2)];
+
+        let panic = std::panic::catch_unwind(|| {
+            let _ = plan_child_runtime(&root_children, &constants);
+        });
+
+        assert!(panic.is_err());
     }
 }

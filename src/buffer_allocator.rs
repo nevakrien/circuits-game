@@ -236,4 +236,17 @@ mod tests {
 
         let _ = a;
     }
+
+    #[test]
+    fn buffer_allocator_rejects_requests_larger_than_a_page() {
+        let mut alloc = BufferAllocator::new(8);
+
+        assert_eq!(
+            alloc.alloc(9),
+            Err(BufferAllocError::RequestedPageOverflow {
+                requested: 9,
+                capacity: 8,
+            })
+        );
+    }
 }

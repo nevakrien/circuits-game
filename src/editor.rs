@@ -2397,7 +2397,7 @@ mod tests {
 
     const TEST_SURFACE_SIZE: PhysicalSize<u32> = PhysicalSize::new(1600, 900);
 
-    fn create_editor_test_context() -> Option<(
+    fn create_editor_test_context() -> (
         &'static wgpu::Device,
         &'static wgpu::Queue,
         simulation::BoardTextures,
@@ -2405,8 +2405,8 @@ mod tests {
         wires::WireOverlay,
         render::CameraState,
         EditorSession,
-    )> {
-        let gpu = crate::test_gpu::shared_test_gpu()?;
+    ) {
+        let gpu = crate::test_gpu::shared_test_gpu();
         let device = &gpu.device;
         let queue = &gpu.queue;
         let simulation = simulation::BoardTextures::new(device, queue);
@@ -2421,7 +2421,7 @@ mod tests {
         let camera = render::CameraState::new(TEST_SURFACE_SIZE);
         let session = EditorSession::new([TextureId::Managed(0); EditorTool::COUNT]);
 
-        Some((
+        (
             device,
             queue,
             simulation,
@@ -2429,7 +2429,7 @@ mod tests {
             wire_overlay,
             camera,
             session,
-        ))
+        )
     }
 
     fn cursor_for_cell(cell: wires::GridCell) -> [f32; 2] {
@@ -2508,10 +2508,7 @@ mod tests {
 
     #[test]
     fn placing_tools_writes_expected_cell_and_charge_values() {
-        let Some((device, queue, simulation, _, _, camera, _)) = create_editor_test_context()
-        else {
-            return;
-        };
+        let (device, queue, simulation, _, _, camera, _) = create_editor_test_context();
 
         let cases = [
             (
@@ -2611,11 +2608,8 @@ mod tests {
 
     #[test]
     fn undo_and_redo_restore_previous_cell_and_charge_values() {
-        let Some((device, queue, simulation, mut component, mut wire_overlay, camera, mut session)) =
-            create_editor_test_context()
-        else {
-            return;
-        };
+        let (device, queue, simulation, mut component, mut wire_overlay, camera, mut session) =
+            create_editor_test_context();
 
         let grid_cell = wires::GridCell { x: 3, y: 4 };
         let layer = 0;
@@ -2690,11 +2684,8 @@ mod tests {
 
     #[test]
     fn reset_for_loaded_schematic_resets_child_selection_to_wire() {
-        let Some((device, queue, _simulation, _component, mut wire_overlay, _camera, mut session)) =
-            create_editor_test_context()
-        else {
-            return;
-        };
+        let (device, queue, _simulation, _component, mut wire_overlay, _camera, mut session) =
+            create_editor_test_context();
 
         session.ui.selected_placement = EditorPlacementSelection::ChildComponent(ComponentId(99));
 
@@ -2708,11 +2699,8 @@ mod tests {
 
     #[test]
     fn wire_draft_point_edits_are_undoable() {
-        let Some((device, queue, simulation, mut component, mut wire_overlay, camera, mut session)) =
-            create_editor_test_context()
-        else {
-            return;
-        };
+        let (device, queue, simulation, mut component, mut wire_overlay, camera, mut session) =
+            create_editor_test_context();
 
         let first = wires::GridCell { x: 2, y: 0 };
         let second = wires::GridCell { x: 3, y: 0 };
@@ -2812,11 +2800,8 @@ mod tests {
 
     #[test]
     fn undoing_a_committed_wire_clears_it_without_reviving_the_draft() {
-        let Some((device, queue, simulation, mut component, mut wire_overlay, camera, mut session)) =
-            create_editor_test_context()
-        else {
-            return;
-        };
+        let (device, queue, simulation, mut component, mut wire_overlay, camera, mut session) =
+            create_editor_test_context();
 
         let first = wires::GridCell { x: 2, y: 0 };
         let second = wires::GridCell { x: 3, y: 0 };
@@ -2870,11 +2855,8 @@ mod tests {
 
     #[test]
     fn committed_wires_use_selected_wire_color() {
-        let Some((device, queue, simulation, mut component, mut wire_overlay, camera, mut session)) =
-            create_editor_test_context()
-        else {
-            return;
-        };
+        let (device, queue, simulation, mut component, mut wire_overlay, camera, mut session) =
+            create_editor_test_context();
 
         let selected_color = [0.87, 0.32, 0.28, 1.0];
         session.ui.selected_wire_color = selected_color;
@@ -2916,11 +2898,8 @@ mod tests {
 
     #[test]
     fn child_proxy_wire_connections_work_through_click_sequence() {
-        let Some((device, queue, simulation, mut component, mut wire_overlay, camera, mut session)) =
-            create_editor_test_context()
-        else {
-            return;
-        };
+        let (device, queue, simulation, mut component, mut wire_overlay, camera, mut session) =
+            create_editor_test_context();
 
         let source = wires::GridCell { x: 1, y: 1 };
         let child_rw = wires::GridCell { x: 3, y: 1 };
@@ -3013,18 +2992,8 @@ mod tests {
 
     #[test]
     fn replacing_a_wire_input_keeps_logic_and_wire_in_sync_across_undo_redo() {
-        let Some((
-            device,
-            queue,
-            simulation,
-            mut component,
-            mut wire_overlay,
-            _camera,
-            mut session,
-        )) = create_editor_test_context()
-        else {
-            return;
-        };
+        let (device, queue, simulation, mut component, mut wire_overlay, _camera, mut session) =
+            create_editor_test_context();
 
         let source_a = wires::GridCell { x: 1, y: 1 };
         let source_b = wires::GridCell { x: 2, y: 1 };
@@ -3168,11 +3137,8 @@ mod tests {
 
     #[test]
     fn deleting_a_source_to_not_wire_and_undoing_restores_both_wire_and_connection() {
-        let Some((device, queue, simulation, mut component, mut wire_overlay, camera, mut session)) =
-            create_editor_test_context()
-        else {
-            return;
-        };
+        let (device, queue, simulation, mut component, mut wire_overlay, camera, mut session) =
+            create_editor_test_context();
 
         let source = wires::GridCell { x: 1, y: 1 };
         let destination = wires::GridCell { x: 3, y: 1 };
@@ -3260,11 +3226,8 @@ mod tests {
 
     #[test]
     fn child_proxy_cells_accept_wires_on_their_exposed_ports() {
-        let Some((device, queue, simulation, component, _wire_overlay, _camera, _session)) =
-            create_editor_test_context()
-        else {
-            return;
-        };
+        let (device, queue, simulation, component, _wire_overlay, _camera, _session) =
+            create_editor_test_context();
 
         let child_read = wires::GridCell { x: 1, y: 1 };
         let child_read_write = wires::GridCell { x: 2, y: 1 };

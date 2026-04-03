@@ -4,7 +4,7 @@ use egui_wgpu::wgpu;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    child_components::{validate_component_shapes, ChildInstancePlan},
+    child_components::{ChildInstancePlan, validate_component_shapes},
     component_plan::{ComponentId, ComponentPlan},
     game_constants::GameConstants,
     simulation::{self, BoardTextures, CellSnapshot},
@@ -494,9 +494,7 @@ mod tests {
 
     #[test]
     fn duplicate_child_instances_reflect_updated_child_footprint_when_uploaded() {
-        let Some(gpu) = crate::test_gpu::shared_test_gpu() else {
-            return;
-        };
+        let gpu = crate::test_gpu::shared_test_gpu();
 
         let mut context = LevelContext::with_starter_root();
         let root_id = context.root_component_id();
@@ -571,9 +569,7 @@ mod tests {
 
     #[test]
     fn compact_child_proxy_uses_real_child_io_cell_mix() {
-        let Some(gpu) = crate::test_gpu::shared_test_gpu() else {
-            return;
-        };
+        let gpu = crate::test_gpu::shared_test_gpu();
 
         let mut context = LevelContext::with_starter_root();
         let root_id = context.root_component_id();
@@ -633,9 +629,7 @@ mod tests {
 
     #[test]
     fn child_connected_parent_wires_survive_refresh_and_restore() {
-        let Some(gpu) = crate::test_gpu::shared_test_gpu() else {
-            return;
-        };
+        let gpu = crate::test_gpu::shared_test_gpu();
 
         let mut context = LevelContext::with_starter_root();
         let root_id = context.root_component_id();

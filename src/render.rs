@@ -646,9 +646,7 @@ mod tests {
 
     #[test]
     fn renderer_initializes_with_headless_device() {
-        let Some(gpu) = crate::test_gpu::shared_test_gpu() else {
-            return;
-        };
+        let gpu = crate::test_gpu::shared_test_gpu();
 
         let _renderer = Renderer::new(
             &gpu.device,
