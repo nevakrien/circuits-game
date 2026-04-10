@@ -3,40 +3,41 @@ This game is about simulating the internal circuts of a computer chip.
 I am aiming for ridiclout levels of performance so that larger chips can be build and ran extremly quickly.
 
 
-# Software Design
+# GPU double buffer
+This game runs its main logic on GPU since its anyway double buffered writes.
+logically speaking we have 1 giant double buffer setup which we write individual into.
 
-## Terminology
+but because of GPU memory limitations we need to be slightly clever and split it into multiple buffers
+and batch the writes into u32s so they dont have to be atomic.
 
-The project still has older code that talks about `layer`, but that is not the intended product model.
+each u32 in the write buffer has a single invocation worker assosited with it,
+that worker goes ahead and runs all the relvent logic for figuring out a single non atomic write.
+This means that it gets an ARRAY of commands which would be an index+len into a command buffer.
+we may run out of room in the command buffer and need to run multiple shader invocations on diffrent buffers.
 
-- We edit a **component plan**, not a layer.
-- Runtime state belongs to **component instances**.
-- The packed `z` coordinate inside a 3D texture is an implementation detail for batching, not a user-facing editing concept.
+for comunication between buffers we write into INPUT/OUTPUT components which have their own subslice in the write buffer.
+we generally want to group these components at the start of the buffer so cache behivior is nicer, but this isnt technically a hard requirment.
 
-See `docs/component-model-notes.md` for the current direction.
+during the normal forward pass INPUT/OUTPUT bits get 0s written to them.
+then AFTER this normal forward pass is complete we have the write buffer ready for reading.
 
-for circuts to not care about insertion and excution order the only way to do an update is a double buffer. 
-where we only read from previous steps and write to the current one. update happens explictly in these ticks,
-which is very parallalizem friednly
+to glue the INPUT/OUTPUT pairs we run a shader between the 2 write buffers. 
+so we take the write buffer of OUTPUT and we copy the correct bits into INPUT 
+using the same u32 batching idea from earlier and a basic bitwise OR.
 
-Now there is a question of when/how we go about runing each circuts update rule.
-supporting some sort of sleep can potentialy be very helpful. BUT we still have to render sleeping circuts.
-so relying on sleep still forces us to run a render step which means we cant use it as agressively.
+This means we dont need atomics anywhere for anything!!!
+and if we batch logical components to be generally on the same buffer we seriously limit cross buffer writes.
 
-This observation naturally leads us to want the circuts data to already be ready for render, 
-without forcing us to construct a render graph every tick. And that kind of implies a GPU based setup.
-Which works very well with double-buffers (no false share risk).
+We benifit a lot from GPU having no memory coherence requirment here. because it means all the false shares which on CPU would be a huge issue are not a factor. instead the GPU should be able to put each u32 into the correct part of memory to be modified independently.
 
-when you add to this the fact most human built circuts follow a natural 2D structure it pushes us to want to store things closely based on their 2D distance to eachother, to have the best cache locality possible.
+# Packing
+we generally dont want to run a small component with 8ish elements as a full kernel invocation.
+instead we try and allocate multiple components onto the same buffer+ops combo.
+This also reduces the need for INPUT/OUTPUT gluing later on because local indecies do not need any gluing.
 
-Each circut board is simulated as a grid where each cell has a charge and we run a kernel over that space to write the charge to the next buffer.
-we also support having multiple sub component, these grids are allocated in standard sizes of Nx(N+-4) N<=1024 in an arena which is a list of 2D Textures (arrays?) subdivides properly into diffrent types of pages containing texture of thier type so each 1024x1024 slice can be split into multiple smaller slice.
+to allow this we record all connections in a logical plan which then gets compiled down before we actually run it on GPU.
+this cost should be acceptable as its O(N) and we generally need to be able to run O(N) on every sinlge frame anyway.
+so for now we compile from scratch every time.
 
-cross component reads can be handeled by a dedicated buffer that binds the specific components used to their parent and then runst a sample. IDEALLY we would use arrays/3dtextures for children so that if we have C=600 children we run just C/256=3 copy shader passes. realistically it should be possible to fit vast majority of cases into a single copy pass on a single 3d texture.
-
-circut are stored in a similar manner with a tag+data union aproch.
-each location has 1 circut which it stores, this is chosen over a sparse represntation because the index would be 32bit (10x10x12) which is a lot of memory for this setup. for a CPU based aproch we would go dense and eat the cost.
-the reason for using tags is that tag based scans have better cache locality which for this mostly memory bound setup is going to matter a lot.
-
-since we are on GPU we can render directly from the grid texture and we can even render subcomponents directly without needing additional setup from CPU since the info about which grid subsecsion to render is stored at each subcompoenent. 
-This should allow extremly smooth togeling on/off of subcomponent rendering as there is no addional graphs to be constructed.
+there is some argument for how large to make the buffer, its probably best to choose as large a size as we can get away with.
+altogh large buffers mean there is more risk of requiring more than 1 command buffers per charge buffer. and that can cause issues with sleeping work groups. So a moderately large is probably best for getting a smooth exprince.

@@ -16,3 +16,4 @@ png = "0.18.1"
 serde = { version = "1.0.228", features = ["derive"] }
 bincode = "1.3.3"
 rfd = "0.15.4"
+foldhash = "0.2.0"
