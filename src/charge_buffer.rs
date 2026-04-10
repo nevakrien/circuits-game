@@ -45,13 +45,13 @@ impl WorkingMem {
             return None;
         }
 
-        let tgt_word_byte_offset = (tgt.1 .0 >> 5) << 2;
+        let tgt_word_byte_offset = (tgt.1.0 >> 5) << 2;
         let word = WordIndex(tgt.0, tgt_word_byte_offset);
         let key = (src.0, word);
         self.bit_cross
             .entry(key)
             .or_default()
-            .insert((src.1, (tgt.1 .0 % 32) as u8));
+            .insert((src.1, (tgt.1.0 % 32) as u8));
         Some(key)
     }
     pub fn make_bit_cross(&self) -> Vec<PreparedBitCross> {
@@ -134,7 +134,6 @@ impl WorkingMem {
                         tgt_word_byte_offset: *tgt_word_byte_offset,
                         instruction_start,
                         instruction_len: take as u32,
-                        _pad: 0,
                     });
 
                     local_i += take;
@@ -156,7 +155,6 @@ pub struct BitCrossWorker {
     pub tgt_word_byte_offset: u32,
     pub instruction_start: u32,
     pub instruction_len: u32,
-    pub _pad: u32,
 }
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -332,13 +330,11 @@ mod tests {
                     tgt_word_byte_offset: 0,
                     instruction_start: 0,
                     instruction_len: 2,
-                    _pad: 0,
                 },
                 BitCrossWorker {
                     tgt_word_byte_offset: 4,
                     instruction_start: 2,
                     instruction_len: 1,
-                    _pad: 0,
                 },
             ]
         );
@@ -369,7 +365,6 @@ mod tests {
                 tgt_word_byte_offset: 0,
                 instruction_start: 0,
                 instruction_len: 1,
-                _pad: 0,
             }]
         );
         assert_eq!(

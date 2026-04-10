@@ -1,5 +1,10 @@
-use crate::charge_buffer::{Bits, BitsIndex, ChargeAlloc, WorkingMem};
+use crate::charge_buffer::{
+    BitCrossWorker, Bits, BitsIndex, ChargeAlloc, PreparedBitCross, WorkingMem,
+};
 use foldhash::{HashMap, HashSet};
+
+const MAX_KERNEL_INSTRUCTIONS: usize = 1 << 8;
+const MAX_KERNEL_WORKERS: usize = 1 << 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub u32);
@@ -88,6 +93,67 @@ pub struct CompiledComponentInfo {
 #[derive(Debug, Clone)]
 pub struct CompiledTree {
     pub components: HashMap<NodeId, CompiledComponentInfo>,
+    pub gpu_plan: GpuPlan,
+}
+
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BasicGateOp {
+    BitNAND = 1,
+    BitAND,
+    BitOR,
+    BitNOR,
+    BitXOR,
+    BitXNOR,
+    BitNot,
+    BitNop,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BasicGateInstruction {
+    pub op: BasicGateOp,
+    pub dst_bit_in_word: Bits,
+    pub src_a: BitsIndex,
+    pub src_b: BitsIndex,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BasicGateWorker {
+    pub tgt_word_byte_offset: u32,
+    pub instruction_start: u32,
+    pub instruction_len: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedBasicGates {
+    pub tgt_buffer: crate::charge_buffer::BufferId,
+    pub workers: Vec<BasicGateWorker>,
+    pub instructions: Vec<BasicGateInstruction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedOutputWrites {
+    pub workers: Vec<BitCrossWorker>,
+    pub instructions: Vec<OutputWriteInstruction>,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OutputWriteInstruction {
+    pub src: BitsIndex,
+    pub dst_bit_in_word: Bits,
+}
+
+#[derive(Debug, Clone)]
+pub struct GpuPlan {
+    pub bits_per_buffer: u32,
+    pub words_per_buffer: u32,
+    pub output_words: u32,
+    pub basic_gates: Vec<PreparedBasicGates>,
+    pub cross_writes: Vec<PreparedBitCross>,
+    pub output_writes: Vec<PreparedOutputWrites>,
 }
 
 pub struct GateCompiler {
@@ -188,10 +254,316 @@ pub fn compile_component_tree(
 
     compile_component_rec(root, &[], &usage, &mut compiler)?;
     lower_cross_component_edges(root, &[], &by_id, &mut compiler)?;
+    let gpu_plan = lower_gpu_plan(root, &by_id, &compiler)?;
 
     Ok(CompiledTree {
         components: compiler.components,
+        gpu_plan,
     })
+}
+
+fn lower_gpu_plan(
+    root: &Component,
+    by_id: &HashMap<NodeId, &Component>,
+    compiler: &GateCompiler,
+) -> Result<GpuPlan, CompileError> {
+    Ok(GpuPlan {
+        bits_per_buffer: compiler.alloc.total_bits,
+        words_per_buffer: compiler.alloc.total_bits.div_ceil(32),
+        output_words: root.gate_count().div_ceil(32),
+        basic_gates: lower_basic_gate_groups(root, &[], by_id, compiler)?,
+        cross_writes: compiler.mem.make_bit_cross(),
+        output_writes: lower_output_write_groups(root, compiler)?,
+    })
+}
+
+fn lower_basic_gate_groups(
+    root: &Component,
+    parent_stack: &[NodeId],
+    by_id: &HashMap<NodeId, &Component>,
+    compiler: &GateCompiler,
+) -> Result<Vec<PreparedBasicGates>, CompileError> {
+    fn rec(
+        node: &Component,
+        parent_stack: &[NodeId],
+        by_id: &HashMap<NodeId, &Component>,
+        compiler: &GateCompiler,
+        grouped: &mut HashMap<
+            crate::charge_buffer::BufferId,
+            HashMap<u32, Vec<BasicGateInstruction>>,
+        >,
+    ) -> Result<(), CompileError> {
+        let child_ids: Vec<NodeId> = node.children.iter().map(|c| c.id).collect();
+        let ctx = CompileCtx {
+            current: node.id,
+            parent_stack,
+            child_ids: &child_ids,
+        };
+
+        for (gate_i, gate) in node.gates.iter().copied().enumerate() {
+            let gate_id = GateId(gate_i as u32);
+            let dst = compiler.bits.get(&(node.id, gate_id)).copied().ok_or(
+                CompileError::MissingBitsForGate {
+                    node: node.id,
+                    gate: gate_id,
+                },
+            )?;
+
+            let mut inputs = gate_inputs(gate).into_iter();
+            let src_a_ref = inputs
+                .next()
+                .expect("basic gates always have at least one input");
+            let src_a = resolve_gate_bits(node.id, gate_id, src_a_ref, &ctx, by_id, compiler)?;
+            let src_b = match inputs.next() {
+                Some(src_b_ref) => {
+                    resolve_gate_bits(node.id, gate_id, src_b_ref, &ctx, by_id, compiler)?
+                }
+                None => src_a,
+            };
+
+            let tgt_word_byte_offset = (dst.1.0 >> 5) << 2;
+            grouped
+                .entry(dst.0)
+                .or_default()
+                .entry(tgt_word_byte_offset)
+                .or_default()
+                .push(BasicGateInstruction {
+                    op: BasicGateOp::from_gate(gate),
+                    dst_bit_in_word: Bits(dst.1.0 % 32),
+                    src_a,
+                    src_b,
+                });
+        }
+
+        let mut next_stack = Vec::with_capacity(parent_stack.len() + 1);
+        next_stack.extend_from_slice(parent_stack);
+        next_stack.push(node.id);
+
+        for child in &node.children {
+            rec(child, &next_stack, by_id, compiler, grouped)?;
+        }
+
+        Ok(())
+    }
+
+    let mut grouped: HashMap<
+        crate::charge_buffer::BufferId,
+        HashMap<u32, Vec<BasicGateInstruction>>,
+    > = HashMap::default();
+    rec(root, parent_stack, by_id, compiler, &mut grouped)?;
+
+    let mut buffer_ids: Vec<_> = grouped.keys().copied().collect();
+    buffer_ids.sort();
+
+    let mut out = Vec::new();
+
+    for buffer_id in buffer_ids {
+        let mut by_word: Vec<(u32, Vec<BasicGateInstruction>)> = grouped
+            .remove(&buffer_id)
+            .expect("buffer id collected from map keys")
+            .into_iter()
+            .collect();
+        by_word.sort_by_key(|(tgt_word_byte_offset, _)| *tgt_word_byte_offset);
+
+        let word_count = by_word.len();
+        let mut cur = PreparedBasicGates {
+            tgt_buffer: buffer_id,
+            workers: Vec::with_capacity(MAX_KERNEL_WORKERS.min(word_count)),
+            instructions: Vec::with_capacity(MAX_KERNEL_INSTRUCTIONS),
+        };
+
+        for (tgt_word_byte_offset, mut local) in by_word {
+            local.sort_by_key(|task| task.dst_bit_in_word.0);
+
+            let mut local_i = 0usize;
+            while local_i < local.len() {
+                if cur.workers.len() == MAX_KERNEL_WORKERS
+                    || cur.instructions.len() == MAX_KERNEL_INSTRUCTIONS
+                {
+                    if !cur.workers.is_empty() || !cur.instructions.is_empty() {
+                        out.push(cur);
+                    }
+                    cur = PreparedBasicGates {
+                        tgt_buffer: buffer_id,
+                        workers: Vec::with_capacity(MAX_KERNEL_WORKERS.min(word_count)),
+                        instructions: Vec::with_capacity(MAX_KERNEL_INSTRUCTIONS),
+                    };
+                }
+
+                let remaining_instruction_slots = MAX_KERNEL_INSTRUCTIONS - cur.instructions.len();
+                let remaining_worker_slots = MAX_KERNEL_WORKERS - cur.workers.len();
+
+                if remaining_instruction_slots == 0 || remaining_worker_slots == 0 {
+                    out.push(cur);
+                    cur = PreparedBasicGates {
+                        tgt_buffer: buffer_id,
+                        workers: Vec::with_capacity(MAX_KERNEL_WORKERS.min(word_count)),
+                        instructions: Vec::with_capacity(MAX_KERNEL_INSTRUCTIONS),
+                    };
+                    continue;
+                }
+
+                let take = remaining_instruction_slots.min(local.len() - local_i);
+                let instruction_start = cur.instructions.len() as u32;
+
+                cur.instructions
+                    .extend_from_slice(&local[local_i..local_i + take]);
+                cur.workers.push(BasicGateWorker {
+                    tgt_word_byte_offset,
+                    instruction_start,
+                    instruction_len: take as u32,
+                });
+
+                local_i += take;
+            }
+        }
+
+        if !cur.workers.is_empty() || !cur.instructions.is_empty() {
+            out.push(cur);
+        }
+    }
+
+    Ok(out)
+}
+
+fn lower_output_write_groups(
+    root: &Component,
+    compiler: &GateCompiler,
+) -> Result<Vec<PreparedOutputWrites>, CompileError> {
+    let mut by_word: HashMap<u32, Vec<OutputWriteInstruction>> = HashMap::default();
+
+    for (gate_i, _) in root.gates.iter().enumerate() {
+        let gate_id = GateId(gate_i as u32);
+        let src = compiler.bits.get(&(root.id, gate_id)).copied().ok_or(
+            CompileError::MissingBitsForGate {
+                node: root.id,
+                gate: gate_id,
+            },
+        )?;
+        let output_word_index = gate_id.0 / 32;
+        by_word
+            .entry(output_word_index)
+            .or_default()
+            .push(OutputWriteInstruction {
+                src,
+                dst_bit_in_word: Bits(gate_id.0 % 32),
+            });
+    }
+
+    let mut ordered_words: Vec<_> = by_word.into_iter().collect();
+    ordered_words.sort_by_key(|(output_word_index, _)| *output_word_index);
+
+    let mut out = Vec::new();
+    let word_count = ordered_words.len();
+    let mut cur = PreparedOutputWrites {
+        workers: Vec::with_capacity(MAX_KERNEL_WORKERS.min(word_count)),
+        instructions: Vec::with_capacity(MAX_KERNEL_INSTRUCTIONS),
+    };
+
+    for (output_word_index, mut local) in ordered_words {
+        local.sort_by_key(|task| task.dst_bit_in_word.0);
+
+        let mut local_i = 0usize;
+        while local_i < local.len() {
+            if cur.workers.len() == MAX_KERNEL_WORKERS
+                || cur.instructions.len() == MAX_KERNEL_INSTRUCTIONS
+            {
+                if !cur.workers.is_empty() || !cur.instructions.is_empty() {
+                    out.push(cur);
+                }
+                cur = PreparedOutputWrites {
+                    workers: Vec::with_capacity(MAX_KERNEL_WORKERS.min(word_count)),
+                    instructions: Vec::with_capacity(MAX_KERNEL_INSTRUCTIONS),
+                };
+            }
+
+            let remaining_instruction_slots = MAX_KERNEL_INSTRUCTIONS - cur.instructions.len();
+            let remaining_worker_slots = MAX_KERNEL_WORKERS - cur.workers.len();
+
+            if remaining_instruction_slots == 0 || remaining_worker_slots == 0 {
+                out.push(cur);
+                cur = PreparedOutputWrites {
+                    workers: Vec::with_capacity(MAX_KERNEL_WORKERS.min(word_count)),
+                    instructions: Vec::with_capacity(MAX_KERNEL_INSTRUCTIONS),
+                };
+                continue;
+            }
+
+            let take = remaining_instruction_slots.min(local.len() - local_i);
+            let instruction_start = cur.instructions.len() as u32;
+
+            cur.instructions
+                .extend_from_slice(&local[local_i..local_i + take]);
+            cur.workers.push(BitCrossWorker {
+                tgt_word_byte_offset: output_word_index * 4,
+                instruction_start,
+                instruction_len: take as u32,
+            });
+
+            local_i += take;
+        }
+    }
+
+    if !cur.workers.is_empty() || !cur.instructions.is_empty() {
+        out.push(cur);
+    }
+
+    Ok(out)
+}
+
+fn resolve_gate_bits(
+    from_node: NodeId,
+    from_gate: GateId,
+    r: GateRef,
+    ctx: &CompileCtx<'_>,
+    by_id: &HashMap<NodeId, &Component>,
+    compiler: &GateCompiler,
+) -> Result<BitsIndex, CompileError> {
+    let target_node = resolve_scope(ctx, r.scope).ok_or(CompileError::InvalidGateRef {
+        from_node,
+        from_gate,
+        bad_ref: r,
+        reason: "scope does not exist from this location",
+    })?;
+
+    let target = by_id
+        .get(&target_node)
+        .copied()
+        .ok_or(CompileError::MissingNode(target_node))?;
+
+    if r.gate.0 >= target.gates.len() as u32 {
+        return Err(CompileError::TargetGateOutOfRange {
+            from_node,
+            from_gate,
+            target_node,
+            target_gate: r.gate,
+            target_gate_count: target.gates.len() as u32,
+        });
+    }
+
+    compiler
+        .bits
+        .get(&(target_node, r.gate))
+        .copied()
+        .ok_or(CompileError::MissingBitsForGate {
+            node: target_node,
+            gate: r.gate,
+        })
+}
+
+impl BasicGateOp {
+    fn from_gate(gate: Gate) -> Self {
+        match gate {
+            Gate::BitNAND { .. } => Self::BitNAND,
+            Gate::BitAND { .. } => Self::BitAND,
+            Gate::BitOR { .. } => Self::BitOR,
+            Gate::BitNOR { .. } => Self::BitNOR,
+            Gate::BitXOR { .. } => Self::BitXOR,
+            Gate::BitXNOR { .. } => Self::BitXNOR,
+            Gate::BitNot { .. } => Self::BitNot,
+            Gate::BitNop { .. } => Self::BitNop,
+        }
+    }
 }
 
 fn collect_components<'a>(root: &'a Component) -> HashMap<NodeId, &'a Component> {
@@ -777,7 +1149,7 @@ mod tests {
 
         assert_eq!(info.outline.layout, CompileLayout::Inline);
         assert_eq!(info.self_bits.len(), 40);
-        assert!(info.self_bits.iter().all(|bit| bit.1 .0 < 32));
+        assert!(info.self_bits.iter().all(|bit| bit.1.0 < 32));
 
         let used_buffers: HashSet<BufferId> = info.self_bits.iter().map(|bit| bit.0).collect();
         assert!(used_buffers.len() > 1);
@@ -793,13 +1165,15 @@ mod tests {
         let compiler = compile_with_state(&mut root, 64).expect("deep tree should compile");
 
         assert_eq!(compiler.components.len(), 21);
-        assert!(compiler
-            .components
-            .values()
-            .all(|info| info.outline.layout == CompileLayout::Inline));
+        assert!(
+            compiler
+                .components
+                .values()
+                .all(|info| info.outline.layout == CompileLayout::Inline)
+        );
         assert!(compiler.mem.bit_cross.is_empty());
         assert!(compiler.bits.values().all(|bit| bit.0 == BufferId(0)));
-        assert!(compiler.bits.values().all(|bit| bit.1 .0 < 64));
+        assert!(compiler.bits.values().all(|bit| bit.1.0 < 64));
     }
 
     #[test]
@@ -900,5 +1274,125 @@ mod tests {
             .get(&(BufferId(0), WordIndex(BufferId(2), 0)))
             .expect("root output should stitch into the grandchild target word");
         assert!(root_to_grandchild.contains(&(Bits(5), 13)));
+    }
+
+    #[test]
+    fn gpu_plan_includes_basic_cross_and_output_write_passes() {
+        let root_gates = (0..32)
+            .map(|gate| Gate::BitNop {
+                src: this_ref(gate),
+            })
+            .collect();
+
+        let child_gates = (0..14)
+            .map(|gate| {
+                if gate == 13 {
+                    Gate::BitNop { src: parent_ref(5) }
+                } else {
+                    Gate::BitNop {
+                        src: this_ref(gate),
+                    }
+                }
+            })
+            .collect();
+
+        let mut root = Component::new(root_gates, vec![Component::new(child_gates, vec![])]);
+        let compiled = compile_component_tree(&mut root, 32).expect("tree should compile");
+
+        assert!(!compiled.gpu_plan.basic_gates.is_empty());
+        assert!(!compiled.gpu_plan.cross_writes.is_empty());
+        assert!(!compiled.gpu_plan.output_writes.is_empty());
+    }
+
+    #[test]
+    fn basic_gate_plan_groups_tasks_by_target_word() {
+        let gates = vec![
+            Gate::BitNop { src: this_ref(0) },
+            Gate::BitNot { src: this_ref(0) },
+            Gate::BitAND {
+                a: this_ref(0),
+                b: this_ref(1),
+            },
+            Gate::BitOR {
+                a: this_ref(0),
+                b: this_ref(1),
+            },
+            Gate::BitNAND {
+                a: this_ref(0),
+                b: this_ref(1),
+            },
+            Gate::BitNOR {
+                a: this_ref(0),
+                b: this_ref(1),
+            },
+            Gate::BitXOR {
+                a: this_ref(0),
+                b: this_ref(1),
+            },
+            Gate::BitXNOR {
+                a: this_ref(0),
+                b: this_ref(1),
+            },
+        ];
+
+        let mut root = Component::new(gates, vec![]);
+        let compiled = compile_component_tree(&mut root, 64).expect("component should compile");
+
+        assert_eq!(compiled.gpu_plan.basic_gates.len(), 1);
+
+        let main = &compiled.gpu_plan.basic_gates[0];
+        assert_eq!(main.tgt_buffer, BufferId(0));
+        assert_eq!(
+            main.workers,
+            vec![BasicGateWorker {
+                tgt_word_byte_offset: 0,
+                instruction_start: 0,
+                instruction_len: 8,
+            }]
+        );
+        assert_eq!(main.instructions.len(), 8);
+        assert_eq!(main.instructions[0].op, BasicGateOp::BitNop);
+        assert_eq!(main.instructions[1].op, BasicGateOp::BitNot);
+        assert_eq!(main.instructions[2].op, BasicGateOp::BitAND);
+        assert_eq!(main.instructions[3].op, BasicGateOp::BitOR);
+        assert_eq!(main.instructions[4].op, BasicGateOp::BitNAND);
+        assert_eq!(main.instructions[5].op, BasicGateOp::BitNOR);
+        assert_eq!(main.instructions[6].op, BasicGateOp::BitXOR);
+        assert_eq!(main.instructions[7].op, BasicGateOp::BitXNOR);
+
+        assert_eq!(compiled.gpu_plan.output_writes.len(), 1);
+        assert_eq!(
+            compiled.gpu_plan.output_writes[0].workers,
+            vec![BitCrossWorker {
+                tgt_word_byte_offset: 0,
+                instruction_start: 0,
+                instruction_len: 8,
+            }]
+        );
+    }
+
+    #[test]
+    fn output_writes_split_root_outputs_by_word() {
+        let mut root = make_large_inline_component(35);
+        let compiled = compile_component_tree(&mut root, 32).expect("component should compile");
+
+        assert_eq!(compiled.gpu_plan.output_writes.len(), 1);
+        assert_eq!(compiled.gpu_plan.output_writes[0].workers.len(), 2);
+        assert_eq!(
+            compiled.gpu_plan.output_writes[0].workers,
+            vec![
+                BitCrossWorker {
+                    tgt_word_byte_offset: 0,
+                    instruction_start: 0,
+                    instruction_len: 32,
+                },
+                BitCrossWorker {
+                    tgt_word_byte_offset: 4,
+                    instruction_start: 32,
+                    instruction_len: 3,
+                },
+            ]
+        );
+        assert_eq!(compiled.gpu_plan.output_writes[0].instructions.len(), 35);
     }
 }
