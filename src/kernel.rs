@@ -479,7 +479,7 @@ fn flatten_output_write_instruction(
 }
 
 fn absolute_bit_index(bits_per_buffer: u32, bit: BitsIndex) -> u32 {
-    absolute_buffer_bit(bits_per_buffer, bit.0, bit.1.0)
+    absolute_buffer_bit(bits_per_buffer, bit.0, bit.1 .0)
 }
 
 fn absolute_buffer_bit(bits_per_buffer: u32, buffer: BufferId, bit_in_buffer: u32) -> u32 {
@@ -493,13 +493,70 @@ fn absolute_word_index(words_per_buffer: u32, buffer: BufferId, word_in_buffer: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gate_plans::{Component, Gate, GateId, GateRef, ScopeRef, compile_component_tree};
+    use crate::{
+        gate_plans::{compile_component_tree, Component, Gate, GateId, GateRef, ScopeRef},
+        setup,
+    };
+    use wgpu::util::DeviceExt;
 
     fn this_ref(gate: u32) -> GateRef {
         GateRef {
             scope: ScopeRef::This,
             gate: GateId(gate),
         }
+    }
+
+    fn make_large_inline_component(gate_count: u32) -> Component {
+        let gates = (0..gate_count)
+            .map(|gate| Gate::BitNop {
+                src: this_ref(gate),
+            })
+            .collect();
+        Component::new(gates, vec![])
+    }
+
+    fn read_buffer_words(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        buffer: &wgpu::Buffer,
+        words: u32,
+        label: &str,
+    ) -> Vec<u32> {
+        let size = words.max(1) as u64 * std::mem::size_of::<u32>() as u64;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("kernel-test-readback"),
+        });
+        encoder.copy_buffer_to_buffer(buffer, 0, &readback, 0, size);
+        queue.submit(Some(encoder.finish()));
+
+        let slice = readback.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            sender
+                .send(result)
+                .expect("readback sender should be alive");
+        });
+        let _ = device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        receiver
+            .recv()
+            .expect("readback receiver should get a mapping result")
+            .expect("readback buffer should map successfully");
+
+        let mapped = slice.get_mapped_range();
+        let values = bytemuck::cast_slice::<u8, u32>(&mapped).to_vec();
+        drop(mapped);
+        readback.unmap();
+        values
     }
 
     #[test]
@@ -554,5 +611,102 @@ mod tests {
         assert_eq!(crate::gate_plans::BasicGateOp::BitXNOR as u32, 6);
         assert_eq!(crate::gate_plans::BasicGateOp::BitNot as u32, 7);
         assert_eq!(crate::gate_plans::BasicGateOp::BitNop as u32, 8);
+    }
+
+    #[test]
+    fn gpu_kernel_handles_outputs_spread_across_multiple_small_buffers() {
+        let bits_per_buffer = 32;
+        let gate_count = 160;
+        let mut root = make_large_inline_component(gate_count);
+        let compiled =
+            compile_component_tree(&mut root, bits_per_buffer).expect("component should compile");
+
+        let used_buffers: std::collections::BTreeSet<_> = compiled
+            .gpu_plan
+            .basic_gates
+            .iter()
+            .map(|batch| batch.tgt_buffer.0)
+            .collect();
+        assert!(used_buffers.len() > 1, "test should span multiple buffers");
+
+        let buffer_count = gate_count.div_ceil(bits_per_buffer);
+        let storage_words = buffer_count * compiled.gpu_plan.words_per_buffer;
+        let input_words = vec![
+            0xA5A5_5A5A,
+            0x3CC3_F00F,
+            0x9669_6996,
+            0xF0F0_0F0F,
+            0x1357_9BDF,
+        ];
+        assert_eq!(input_words.len() as u32, storage_words);
+
+        let mut expected_write_words = vec![0u32; storage_words as usize];
+        for gate in 0..gate_count {
+            let src_word = gate / bits_per_buffer;
+            let src_bit = gate % bits_per_buffer;
+            let bit = (input_words[src_word as usize] >> src_bit) & 1;
+            expected_write_words[src_word as usize] |= bit << src_bit;
+        }
+
+        let mut expected_output_words = vec![0u32; compiled.gpu_plan.output_words as usize];
+        for gate in 0..gate_count {
+            let src_word = gate / bits_per_buffer;
+            let src_bit = gate % bits_per_buffer;
+            let bit = (input_words[src_word as usize] >> src_bit) & 1;
+            expected_output_words[(gate / 32) as usize] |= bit << (gate % 32);
+        }
+
+        let gpu = setup::gpu();
+        let device = &gpu.device;
+        let queue = &gpu.queue;
+
+        let kernel = GateKernel::new(device);
+        let uploaded = GateKernel::upload_plan(device, &compiled.gpu_plan);
+        let read_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("kernel-test-read-buffer"),
+            contents: bytemuck::cast_slice(&input_words),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+        let write_buffer = GateKernel::create_io_buffer(device, storage_words, "kernel-test-write");
+        let output_buffer = GateKernel::create_io_buffer(
+            device,
+            compiled.gpu_plan.output_words,
+            "kernel-test-output",
+        );
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("kernel-test-encoder"),
+        });
+        kernel.encode(
+            device,
+            &mut encoder,
+            &uploaded,
+            &read_buffer,
+            &write_buffer,
+            &output_buffer,
+        );
+        queue.submit(Some(encoder.finish()));
+        let _ = device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+
+        let actual_write_words = read_buffer_words(
+            device,
+            queue,
+            &write_buffer,
+            storage_words,
+            "kernel-test-write-readback",
+        );
+        let actual_output_words = read_buffer_words(
+            device,
+            queue,
+            &output_buffer,
+            compiled.gpu_plan.output_words,
+            "kernel-test-output-readback",
+        );
+
+        assert_eq!(actual_write_words, expected_write_words);
+        assert_eq!(actual_output_words, expected_output_words);
     }
 }
