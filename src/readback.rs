@@ -115,6 +115,12 @@ impl ReadManager {
             }
         }
 
+        for port in &scene.ancestor_ports {
+            if let Some(store) = scene.gate_store.get(&port.source_gate).copied() {
+                self.require_bit(store.buffer.0, store.bit.0);
+            }
+        }
+
         for child in &scene.children {
             self.require_scene(&child.scene);
         }

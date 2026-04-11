@@ -52,6 +52,7 @@ pub struct FocusedScene {
 #[derive(Debug, Clone)]
 pub struct PlacedPort {
     pub id: PortId,
+    pub source_gate: (NodeId, GateId),
     pub anchor: Pos2,
     pub location: PortLocation,
     pub label: String,
@@ -61,6 +62,7 @@ pub struct PlacedPort {
 pub struct PlacedGate {
     pub id: GateId,
     pub gate: Gate,
+    pub input_sources: [Option<(NodeId, GateId)>; 2],
     pub rect: Rect,
 }
 
@@ -79,6 +81,7 @@ pub struct ExternalPort {
     pub child: Option<ChildId>,
     pub node: Option<NodeId>,
     pub port: PortId,
+    pub source_gate: (NodeId, GateId),
     pub anchor: Pos2,
     pub label: String,
 }
@@ -136,12 +139,19 @@ fn build_focused_scene_with_index(
     let grid_dims = plan.grid_size;
     let grid_size = Vec2::new(grid_dims[0] as f32 * CELL, grid_dims[1] as f32 * CELL);
     let grid_rect = Rect::from_min_size(Pos2::new(PAD, PAD + 36.0), grid_size);
+    let parent_stack = parent_stack_to(root, focused).unwrap_or_default();
+    let child_ids: Vec<_> = focus.children.iter().map(|child| child.id).collect();
+    let ctx = VisualCtx {
+        parent_stack: &parent_stack,
+        child_ids: &child_ids,
+    };
 
     let input_ports: Vec<_> = plan
         .inputs
         .iter()
         .map(|port| PlacedPort {
             id: port.id,
+            source_gate: (focused, port.gate),
             anchor: grid_anchor_for_port(grid_rect, grid_dims, port.location),
             location: port.location,
             label: port.label.unwrap_or_default().to_owned(),
@@ -152,6 +162,7 @@ fn build_focused_scene_with_index(
         .iter()
         .map(|port| PlacedPort {
             id: port.id,
+            source_gate: (focused, port.gate),
             anchor: grid_anchor_for_port(grid_rect, grid_dims, port.location),
             location: port.location,
             label: port.label.unwrap_or_default().to_owned(),
@@ -168,9 +179,14 @@ fn build_focused_scene_with_index(
             let gx = index % grid_dims[0];
             let gy = index / grid_dims[0];
             let min = grid_rect.min + Vec2::new(gx as f32 * CELL, gy as f32 * CELL);
+            let input_sources = gate.input_refs().map(|source| {
+                source
+                    .and_then(|signal| source_gate_of_ref(focus, signal, &ctx, plans, &by_id).ok())
+            });
             PlacedGate {
                 id: GateId(index),
                 gate,
+                input_sources,
                 rect: Rect::from_min_size(min, Vec2::splat(CELL)),
             }
         })
@@ -197,6 +213,7 @@ fn build_focused_scene_with_index(
                 .iter()
                 .map(|port| PlacedPort {
                     id: port.id,
+                    source_gate: (child.id, port.gate),
                     anchor: child_port_anchor(rect, child_plan.grid_size, port.location),
                     location: port.location,
                     label: port.label.unwrap_or_default().to_owned(),
@@ -207,6 +224,7 @@ fn build_focused_scene_with_index(
                 .iter()
                 .map(|port| PlacedPort {
                     id: port.id,
+                    source_gate: (child.id, port.gate),
                     anchor: child_port_anchor(rect, child_plan.grid_size, port.location),
                     location: port.location,
                     label: port.label.unwrap_or_default().to_owned(),
@@ -231,7 +249,6 @@ fn build_focused_scene_with_index(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    let parent_stack = parent_stack_to(root, focused).unwrap_or_default();
     let ancestor_ports = parent_stack
         .last()
         .and_then(|parent_id| by_id.get(parent_id).copied())
@@ -245,6 +262,7 @@ fn build_focused_scene_with_index(
                     child: None,
                     node: Some(parent.id),
                     port: port.id,
+                    source_gate: (parent.id, port.gate),
                     anchor: Pos2::new(
                         grid_rect.left() - 28.0,
                         grid_rect.top() + 20.0 + i as f32 * 32.0,
@@ -290,12 +308,6 @@ fn build_focused_scene_with_index(
             .iter()
             .map(|gate| (gate.id, (gate.rect, gate.gate)))
             .collect(),
-    };
-
-    let child_ids: Vec<_> = focus.children.iter().map(|child| child.id).collect();
-    let ctx = VisualCtx {
-        parent_stack: &parent_stack,
-        child_ids: &child_ids,
     };
 
     let mut wires = Vec::new();
@@ -562,26 +574,58 @@ fn paint_scene(
 
     if options.show_component_ports {
         for port in &scene.input_ports {
-            paint_port(painter, port, INPUT_PORT_COLOR, camera, true);
+            paint_port(
+                painter,
+                port,
+                INPUT_PORT_COLOR,
+                scene,
+                read_manager,
+                camera,
+                true,
+            );
         }
         for port in &scene.output_ports {
-            paint_port(painter, port, OUTPUT_PORT_COLOR, camera, true);
+            paint_port(
+                painter,
+                port,
+                OUTPUT_PORT_COLOR,
+                scene,
+                read_manager,
+                camera,
+                true,
+            );
         }
     }
 
     if options.show_ancestor_ports {
         for port in &scene.ancestor_ports {
-            paint_external_port(painter, port, ANCESTOR_COLOR, camera);
+            paint_external_port(painter, port, ANCESTOR_COLOR, scene, read_manager, camera);
         }
     }
 
     if options.show_child_ports {
         for child in &scene.children {
             for port in &child.inputs {
-                paint_port(painter, port, CHILD_INPUT_COLOR, camera, true);
+                paint_port(
+                    painter,
+                    port,
+                    CHILD_INPUT_COLOR,
+                    scene,
+                    read_manager,
+                    camera,
+                    true,
+                );
             }
             for port in &child.outputs {
-                paint_port(painter, port, CHILD_OUTPUT_COLOR, camera, true);
+                paint_port(
+                    painter,
+                    port,
+                    CHILD_OUTPUT_COLOR,
+                    scene,
+                    read_manager,
+                    camera,
+                    true,
+                );
             }
         }
     }
@@ -652,12 +696,22 @@ fn paint_gate(
         );
     }
 
-    for input in gate.gate.input_refs().into_iter().flatten().enumerate() {
-        let anchor = camera.pos(gate_anchor(gate.rect, gate.gate, Some(input.0)));
-        paint_gate_input_marker(painter, anchor, camera.scale);
+    for (input_index, source_gate) in gate.input_sources.iter().enumerate() {
+        let anchor = camera.pos(gate_anchor(gate.rect, gate.gate, Some(input_index)));
+        paint_gate_input_marker(
+            painter,
+            anchor,
+            source_gate.is_some_and(|source_gate| gate_is_active(scene, read_manager, source_gate)),
+            camera.scale,
+        );
     }
     let output_anchor = camera.pos(gate_anchor(gate.rect, gate.gate, None));
-    paint_gate_output_marker(painter, output_anchor, camera.scale);
+    paint_gate_output_marker(
+        painter,
+        output_anchor,
+        gate_is_active(scene, read_manager, (scene.node, gate.id)),
+        camera.scale,
+    );
 }
 
 fn paint_child(
@@ -698,10 +752,18 @@ fn paint_port(
     painter: &Painter,
     port: &PlacedPort,
     color: Color32,
+    scene: &FocusedScene,
+    read_manager: &ReadManager,
     camera: &Camera,
     show_label: bool,
 ) {
     let anchor = camera.pos(port.anchor);
+    let active = gate_is_active(scene, read_manager, port.source_gate);
+    let color = if active {
+        color
+    } else {
+        color.gamma_multiply(0.45)
+    };
     painter.circle_filled(anchor, PORT_RADIUS * camera.scale.clamp(0.7, 1.4), color);
     let font_size = 12.0 * camera.scale;
     if show_label && !port.label.is_empty() && font_size >= 8.0 {
@@ -711,25 +773,62 @@ fn paint_port(
             align,
             &port.label,
             FontId::monospace(font_size.min(12.0)),
-            Color32::from_rgb(220, 227, 238),
+            if active {
+                Color32::from_rgb(220, 227, 238)
+            } else {
+                Color32::from_rgb(112, 118, 128)
+            },
         );
     }
 }
 
-fn paint_gate_input_marker(painter: &Painter, anchor: Pos2, zoom: f32) {
+fn paint_gate_input_marker(painter: &Painter, anchor: Pos2, active: bool, zoom: f32) {
     let radius = 5.5 * zoom.clamp(0.75, 1.35);
-    painter.circle_filled(anchor, radius, GATE_INPUT_FILL);
-    painter.circle_stroke(anchor, radius, Stroke::new(1.4, GATE_INPUT_STROKE));
+    let fill = if active {
+        GATE_INPUT_FILL
+    } else {
+        GATE_INPUT_FILL.gamma_multiply(0.45)
+    };
+    let stroke = if active {
+        GATE_INPUT_STROKE
+    } else {
+        GATE_INPUT_STROKE.gamma_multiply(0.45)
+    };
+    painter.circle_filled(anchor, radius, fill);
+    painter.circle_stroke(anchor, radius, Stroke::new(1.4, stroke));
 }
 
-fn paint_gate_output_marker(painter: &Painter, anchor: Pos2, zoom: f32) {
+fn paint_gate_output_marker(painter: &Painter, anchor: Pos2, active: bool, zoom: f32) {
     let radius = 5.5 * zoom.clamp(0.75, 1.35);
-    painter.circle_filled(anchor, radius, GATE_OUTPUT_FILL);
-    painter.circle_stroke(anchor, radius, Stroke::new(1.4, GATE_OUTPUT_STROKE));
+    let fill = if active {
+        GATE_OUTPUT_FILL
+    } else {
+        GATE_OUTPUT_FILL.gamma_multiply(0.45)
+    };
+    let stroke = if active {
+        GATE_OUTPUT_STROKE
+    } else {
+        GATE_OUTPUT_STROKE.gamma_multiply(0.45)
+    };
+    painter.circle_filled(anchor, radius, fill);
+    painter.circle_stroke(anchor, radius, Stroke::new(1.4, stroke));
 }
 
-fn paint_external_port(painter: &Painter, port: &ExternalPort, color: Color32, camera: &Camera) {
+fn paint_external_port(
+    painter: &Painter,
+    port: &ExternalPort,
+    color: Color32,
+    scene: &FocusedScene,
+    read_manager: &ReadManager,
+    camera: &Camera,
+) {
     let anchor = camera.pos(port.anchor);
+    let active = gate_is_active(scene, read_manager, port.source_gate);
+    let color = if active {
+        color
+    } else {
+        color.gamma_multiply(0.45)
+    };
     painter.circle_filled(anchor, PORT_RADIUS * camera.scale.clamp(0.7, 1.4), color);
     let font_size = 12.0 * camera.scale;
     if !port.label.is_empty() && font_size >= 8.0 {
@@ -738,7 +837,11 @@ fn paint_external_port(painter: &Painter, port: &ExternalPort, color: Color32, c
             Align2::LEFT_CENTER,
             &port.label,
             FontId::monospace(font_size.min(12.0)),
-            Color32::from_rgb(216, 224, 235),
+            if active {
+                Color32::from_rgb(216, 224, 235)
+            } else {
+                Color32::from_rgb(112, 118, 128)
+            },
         );
     }
 }
@@ -754,12 +857,11 @@ fn paint_wire(
 ) {
     let active = wire
         .source_gate
-        .and_then(|key| scene.gate_store.get(&key).copied())
-        .is_some_and(|store| gate_value(read_manager, store));
+        .is_some_and(|source_gate| gate_is_active(scene, read_manager, source_gate));
     let color = if active {
         wire.color
     } else {
-        Color32::from_rgba_unmultiplied(wire.color.r(), wire.color.g(), wire.color.b(), 70)
+        wire.color.gamma_multiply(0.6)
     };
     let points: Vec<_> = wire.points.iter().map(|point| camera.pos(*point)).collect();
     painter.add(Shape::line(
@@ -1074,6 +1176,18 @@ fn gate_value(read_manager: &ReadManager, store: GateStoreLocation) -> bool {
     read_manager
         .get_bit(store.buffer.0, store.bit.0)
         .unwrap_or(false)
+}
+
+fn gate_is_active(
+    scene: &FocusedScene,
+    read_manager: &ReadManager,
+    source_gate: (NodeId, GateId),
+) -> bool {
+    scene
+        .gate_store
+        .get(&source_gate)
+        .copied()
+        .is_some_and(|store| gate_value(read_manager, store))
 }
 
 fn palette_color(index: usize) -> Color32 {
