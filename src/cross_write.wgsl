@@ -31,8 +31,12 @@ fn write_bit(word: u32, bit_index: u32, bit_value: u32) -> u32 {
     return (word & ~mask) | ((bit_value & 1u) << bit_index);
 }
 
-@compute @workgroup_size(1)
+@compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.x >= arrayLength(&workers)) {
+        return;
+    }
+
     let worker = workers[id.x];
     var word = dst_words[worker.tgt_word_index];
 

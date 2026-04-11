@@ -10,6 +10,8 @@ use crate::{
     },
 };
 
+const COMPUTE_WORKGROUP_SIZE: u32 = 256;
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
 pub struct BasicGateGpuWorker {
@@ -216,7 +218,7 @@ impl GateKernel {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             pass.set_pipeline(&self.basic_gates_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(plan.basic_gates.worker_count, 1, 1);
+            pass.dispatch_workgroups(dispatch_count(plan.basic_gates.worker_count), 1, 1);
         }
 
         if plan.cross_writes.worker_count > 0 {
@@ -242,7 +244,7 @@ impl GateKernel {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             pass.set_pipeline(&self.cross_write_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(plan.cross_writes.worker_count, 1, 1);
+            pass.dispatch_workgroups(dispatch_count(plan.cross_writes.worker_count), 1, 1);
         }
 
         if plan.output_writes.worker_count > 0 {
@@ -259,9 +261,13 @@ impl GateKernel {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             pass.set_pipeline(&self.cross_write_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(plan.output_writes.worker_count, 1, 1);
+            pass.dispatch_workgroups(dispatch_count(plan.output_writes.worker_count), 1, 1);
         }
     }
+}
+
+fn dispatch_count(worker_count: u32) -> u32 {
+    worker_count.div_ceil(COMPUTE_WORKGROUP_SIZE)
 }
 
 fn create_pipeline(
@@ -488,7 +494,7 @@ fn flatten_output_write_instruction(
 }
 
 fn absolute_bit_index(bits_per_buffer: u32, bit: BitsIndex) -> u32 {
-    absolute_buffer_bit(bits_per_buffer, bit.0, bit.1.0)
+    absolute_buffer_bit(bits_per_buffer, bit.0, bit.1 .0)
 }
 
 fn absolute_buffer_bit(bits_per_buffer: u32, buffer: BufferId, bit_in_buffer: u32) -> u32 {
@@ -504,8 +510,8 @@ mod tests {
     use super::*;
     use crate::{
         gate_plans::{
-            ChildId, ChildInputConnection, Component, ComponentPlan, ComponentPlans, ComponentPort,
-            Gate, GateId, PortId, PortLocation, SignalRef, compile_component_tree,
+            compile_component_tree, ChildId, ChildInputConnection, Component, ComponentPlan,
+            ComponentPlans, ComponentPort, Gate, GateId, PortId, PortLocation, SignalRef,
         },
         setup,
     };
