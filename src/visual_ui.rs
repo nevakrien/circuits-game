@@ -8,6 +8,7 @@ use crate::gate_plans::{
     ChildId, ChildPlacement, CompileError, Component, ComponentPlans, Gate, GateId,
     GateStoreLocation, NodeId, PortId, PortLocation, SignalRef,
 };
+use crate::readback::ReadManager;
 use crate::ui_config::{
     ANCESTOR_COLOR, CELL, CHILD_BG, CHILD_INPUT_COLOR, CHILD_OUTPUT_COLOR, CHILD_PORT_INSET,
     CHILD_ZOOM_PREVIEW, GATE_INPUT_FILL, GATE_INPUT_STROKE, GATE_OFF, GATE_ON, GATE_OUTPUT_FILL,
@@ -404,7 +405,7 @@ pub fn child_ids_of(root: &Component, node_id: NodeId) -> Vec<NodeId> {
 pub fn show_focused_scene(
     ui: &mut Ui,
     scene: &FocusedScene,
-    read_words: &[u32],
+    read_manager: &ReadManager,
     time: f64,
     pulse_rate_hz: f32,
     viewport: &mut ViewportState,
@@ -435,7 +436,7 @@ pub fn show_focused_scene(
     paint_scene(
         &painter,
         scene,
-        read_words,
+        read_manager,
         time,
         pulse_rate_hz,
         &camera,
@@ -521,7 +522,7 @@ impl ScenePaintOptions {
 fn paint_scene(
     painter: &Painter,
     scene: &FocusedScene,
-    read_words: &[u32],
+    read_manager: &ReadManager,
     time: f64,
     pulse_rate_hz: f32,
     camera: &Camera,
@@ -540,11 +541,11 @@ fn paint_scene(
     }
 
     for gate in &scene.gates {
-        paint_gate(painter, gate, scene, read_words, camera);
+        paint_gate(painter, gate, scene, read_manager, camera);
     }
 
     for child in &scene.children {
-        paint_child(painter, child, read_words, time, pulse_rate_hz, camera);
+        paint_child(painter, child, read_manager, time, pulse_rate_hz, camera);
     }
 
     for wire in &scene.wires {
@@ -552,7 +553,7 @@ fn paint_scene(
             painter,
             wire,
             scene,
-            read_words,
+            read_manager,
             time,
             pulse_rate_hz,
             camera,
@@ -625,14 +626,14 @@ fn paint_gate(
     painter: &Painter,
     gate: &PlacedGate,
     scene: &FocusedScene,
-    read_words: &[u32],
+    read_manager: &ReadManager,
     camera: &Camera,
 ) {
     let rect = camera.rect(gate.rect.shrink(10.0));
     let is_on = scene
         .gate_store
         .get(&(scene.node, gate.id))
-        .is_some_and(|store| gate_value(read_words, scene.words_per_buffer, *store));
+        .is_some_and(|store| gate_value(read_manager, *store));
     painter.rect(
         rect,
         10.0,
@@ -662,7 +663,7 @@ fn paint_gate(
 fn paint_child(
     painter: &Painter,
     child: &PlacedChild,
-    read_words: &[u32],
+    read_manager: &ReadManager,
     time: f64,
     pulse_rate_hz: f32,
     camera: &Camera,
@@ -685,7 +686,7 @@ fn paint_child(
     paint_scene(
         &clip_painter,
         &child.scene,
-        read_words,
+        read_manager,
         time,
         pulse_rate_hz,
         &nested_camera,
@@ -746,7 +747,7 @@ fn paint_wire(
     painter: &Painter,
     wire: &VisualWire,
     scene: &FocusedScene,
-    read_words: &[u32],
+    read_manager: &ReadManager,
     time: f64,
     pulse_rate_hz: f32,
     camera: &Camera,
@@ -754,7 +755,7 @@ fn paint_wire(
     let active = wire
         .source_gate
         .and_then(|key| scene.gate_store.get(&key).copied())
-        .is_some_and(|store| gate_value(read_words, scene.words_per_buffer, store));
+        .is_some_and(|store| gate_value(read_manager, store));
     let color = if active {
         wire.color
     } else {
@@ -1069,11 +1070,10 @@ fn collect_components<'a>(root: &'a Component) -> HashMap<NodeId, &'a Component>
     out
 }
 
-fn gate_value(read_words: &[u32], words_per_buffer: u32, store: GateStoreLocation) -> bool {
-    let absolute_word = store.buffer.0.saturating_mul(words_per_buffer) + (store.bit.0 / 32);
-    read_words
-        .get(absolute_word as usize)
-        .is_some_and(|word| ((word >> store.bit_in_word) & 1) != 0)
+fn gate_value(read_manager: &ReadManager, store: GateStoreLocation) -> bool {
+    read_manager
+        .get_bit(store.buffer.0, store.bit.0)
+        .unwrap_or(false)
 }
 
 fn palette_color(index: usize) -> Color32 {
