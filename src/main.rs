@@ -29,7 +29,6 @@ const INPUT_A: PortId = PortId(10);
 const INPUT_B: PortId = PortId(11);
 const OUTPUT_Y: PortId = PortId(20);
 const OUTPUT_Z: PortId = PortId(21);
-const BITS_PER_BUFFER: u32 = 64;
 const LABEL_A: &str = "A";
 const LABEL_B: &str = "B";
 const LABEL_SUM: &str = "sum";
@@ -37,6 +36,12 @@ const LABEL_CARRY: &str = "carry";
 const STRESS_GATES_PER_COMPONENT: u32 = 8_192;
 const STRESS_BRANCH_FACTOR: usize = 4;
 const STRESS_DEPTH: u32 = 5;
+
+fn runtime_bits_per_buffer(device: &wgpu::Device) -> u32 {
+    let max_storage_bytes = device.limits().max_storage_buffer_binding_size;
+    let max_storage_bits = max_storage_bytes.saturating_mul(8);
+    (max_storage_bits & !31).max(32)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DemoSceneKind {
@@ -397,7 +402,8 @@ impl DemoRuntime {
             mut root,
             plans,
         } = scene;
-        let compiled = compile_component_tree(&mut root, &plans, BITS_PER_BUFFER)
+        let bits_per_buffer = runtime_bits_per_buffer(device);
+        let compiled = compile_component_tree(&mut root, &plans, bits_per_buffer)
             .map_err(|error| format!("failed to compile demo circuit: {error:?}"))?;
         let buffer_count = compiled
             .gate_store
