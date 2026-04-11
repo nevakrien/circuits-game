@@ -46,6 +46,22 @@ pub struct ComponentPort {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ChildPlacement {
+    pub min: PortLocation,
+    pub max: PortLocation,
+}
+
+impl ChildPlacement {
+    pub const ONE_CELL: Self = Self {
+        min: PortLocation { x: 0, y: 0 },
+        max: PortLocation {
+            x: u16::MAX / 4,
+            y: u16::MAX / 4,
+        },
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SignalRef {
     ThisGate(GateId),
     InputPort(PortId),
@@ -66,19 +82,50 @@ pub enum Gate {
     BitNop { src: SignalRef },
 }
 
+impl Gate {
+    pub fn label(self) -> &'static str {
+        match self {
+            Gate::BitNAND { .. } => "NAND",
+            Gate::BitAND { .. } => "AND",
+            Gate::BitOR { .. } => "OR",
+            Gate::BitNOR { .. } => "NOR",
+            Gate::BitXOR { .. } => "XOR",
+            Gate::BitXNOR { .. } => "XNOR",
+            Gate::BitNot { .. } => "NOT",
+            Gate::BitNop { .. } => "NOP",
+        }
+    }
+
+    pub fn input_refs(self) -> [Option<SignalRef>; 2] {
+        match self {
+            Gate::BitNAND { a, b }
+            | Gate::BitAND { a, b }
+            | Gate::BitOR { a, b }
+            | Gate::BitNOR { a, b }
+            | Gate::BitXOR { a, b }
+            | Gate::BitXNOR { a, b } => [Some(a), Some(b)],
+            Gate::BitNot { src } | Gate::BitNop { src } => [Some(src), None],
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ComponentPlan {
+    pub grid_size: [u32; 2],
     pub gates: Vec<Gate>,
     pub inputs: Vec<ComponentPort>,
     pub outputs: Vec<ComponentPort>,
+    pub child_placements: Vec<ChildPlacement>,
 }
 
 impl ComponentPlan {
     pub fn new(gates: Vec<Gate>) -> Self {
         Self {
+            grid_size: default_grid_size(gates.len() as u32),
             gates,
             inputs: Vec::new(),
             outputs: Vec::new(),
+            child_placements: Vec::new(),
         }
     }
 
@@ -88,10 +135,22 @@ impl ComponentPlan {
         outputs: Vec<ComponentPort>,
     ) -> Self {
         Self {
+            grid_size: default_grid_size(gates.len() as u32),
             gates,
             inputs,
             outputs,
+            child_placements: Vec::new(),
         }
+    }
+
+    pub fn with_grid_size(mut self, grid_size: [u32; 2]) -> Self {
+        self.grid_size = [grid_size[0].max(1), grid_size[1].max(1)];
+        self
+    }
+
+    pub fn with_child_placements(mut self, child_placements: Vec<ChildPlacement>) -> Self {
+        self.child_placements = child_placements;
+        self
     }
 
     pub fn gate_count(&self) -> u32 {
@@ -105,6 +164,28 @@ impl ComponentPlan {
     fn output_port(&self, id: PortId) -> Option<&ComponentPort> {
         self.outputs.iter().find(|port| port.id == id)
     }
+}
+
+fn default_grid_size(count: u32) -> [u32; 2] {
+    let count = count.max(1);
+    let mut candidates = Vec::new();
+
+    for w_pow in 0..=8u32 {
+        for h_pow in 0..=8u32 {
+            let w = 1u32 << w_pow;
+            let h = 1u32 << h_pow;
+            if w.max(h) > 4 * w.min(h) || w * h < count {
+                continue;
+            }
+            candidates.push((w * h, w.abs_diff(h), w, h));
+        }
+    }
+
+    let (_, _, w, h) = candidates
+        .into_iter()
+        .min()
+        .expect("grid candidates should exist");
+    [w, h]
 }
 
 #[derive(Debug, Default, Clone)]
@@ -207,9 +288,18 @@ pub struct CompiledComponentInfo {
     pub outline: OutlinePlan,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GateStoreLocation {
+    pub buffer: crate::charge_buffer::BufferId,
+    pub bit: Bits,
+    pub word_byte_offset: u32,
+    pub bit_in_word: u8,
+}
+
 #[derive(Debug, Clone)]
 pub struct CompiledTree {
     pub components: HashMap<NodeId, CompiledComponentInfo>,
+    pub gate_store: HashMap<(NodeId, GateId), GateStoreLocation>,
     pub gpu_plan: GpuPlan,
 }
 
@@ -499,11 +589,32 @@ pub fn compile_component_tree(
     compile_component_rec(root, plans, &[], &usage, &mut compiler)?;
     lower_cross_component_edges(root, plans, &[], &by_id, &mut compiler)?;
     let gpu_plan = lower_gpu_plan(root, plans, &by_id, &compiler)?;
+    let gate_store = gate_store_map(&compiler);
 
     Ok(CompiledTree {
         components: compiler.components,
+        gate_store,
         gpu_plan,
     })
+}
+
+fn gate_store_map(compiler: &GateCompiler) -> HashMap<(NodeId, GateId), GateStoreLocation> {
+    compiler
+        .bits
+        .iter()
+        .map(|(&(node, gate), &bit_index)| {
+            let bit_in_word = (bit_index.1 .0 % 32) as u8;
+            (
+                (node, gate),
+                GateStoreLocation {
+                    buffer: bit_index.0,
+                    bit: bit_index.1,
+                    word_byte_offset: (bit_index.1 .0 >> 5) << 2,
+                    bit_in_word,
+                },
+            )
+        })
+        .collect()
 }
 
 fn lower_gpu_plan(

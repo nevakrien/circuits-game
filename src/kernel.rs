@@ -220,11 +220,20 @@ impl GateKernel {
         }
 
         if plan.cross_writes.worker_count > 0 {
+            let scratch = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("cross-write-scratch"),
+                size: write_buffer.size(),
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            encoder.copy_buffer_to_buffer(write_buffer, 0, &scratch, 0, write_buffer.size());
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("cross-write-bind-group"),
                 layout: &self.cross_write_layout,
                 entries: &[
-                    bind_buffer(0, write_buffer),
+                    bind_buffer(0, &scratch),
                     bind_buffer(1, write_buffer),
                     bind_buffer(2, &plan.cross_writes.worker_buffer),
                     bind_buffer(3, &plan.cross_writes.instruction_buffer),
