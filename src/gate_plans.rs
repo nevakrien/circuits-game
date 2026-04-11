@@ -2,6 +2,7 @@ use crate::charge_buffer::{
     BitCrossWorker, Bits, BitsIndex, ChargeAlloc, PreparedBitCross, WorkingMem,
 };
 use foldhash::{HashMap, HashSet};
+use slab::Slab;
 
 const MAX_KERNEL_INSTRUCTIONS: usize = 1 << 8;
 const MAX_KERNEL_WORKERS: usize = 1 << 8;
@@ -13,56 +14,172 @@ pub struct NodeId(pub u32);
 pub struct GateId(pub u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PlanId(pub usize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PortId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ChildId(pub u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AncestorDepth(pub u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum ScopeRef {
-    This,
-    Parent,
-    Child(ChildId),
-    Ancestor(AncestorDepth),
+pub struct PortLocation {
+    pub x: u16,
+    pub y: u16,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct GateRef {
-    pub scope: ScopeRef,
+impl PortLocation {
+    pub const BOTTOM_RIGHT: Self = Self {
+        x: u16::MAX,
+        y: u16::MAX,
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ComponentPort {
+    pub id: PortId,
     pub gate: GateId,
+    pub location: PortLocation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SignalRef {
+    ThisGate(GateId),
+    InputPort(PortId),
+    ChildOutput { child: ChildId, port: PortId },
+    AncestorOutput { depth: AncestorDepth, port: PortId },
 }
 
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Gate {
-    BitNAND { a: GateRef, b: GateRef } = 1,
-    BitAND { a: GateRef, b: GateRef },
-    BitOR { a: GateRef, b: GateRef },
-    BitNOR { a: GateRef, b: GateRef },
-    BitXOR { a: GateRef, b: GateRef },
-    BitXNOR { a: GateRef, b: GateRef },
-    BitNot { src: GateRef },
-    BitNop { src: GateRef },
+    BitNAND { a: SignalRef, b: SignalRef } = 1,
+    BitAND { a: SignalRef, b: SignalRef },
+    BitOR { a: SignalRef, b: SignalRef },
+    BitNOR { a: SignalRef, b: SignalRef },
+    BitXOR { a: SignalRef, b: SignalRef },
+    BitXNOR { a: SignalRef, b: SignalRef },
+    BitNot { src: SignalRef },
+    BitNop { src: SignalRef },
 }
 
 #[derive(Debug, Clone)]
-pub struct Component {
-    pub id: NodeId,
+pub struct ComponentPlan {
     pub gates: Vec<Gate>,
-    pub children: Vec<Component>,
+    pub inputs: Vec<ComponentPort>,
+    pub outputs: Vec<ComponentPort>,
 }
 
-impl Component {
-    pub fn new(gates: Vec<Gate>, children: Vec<Component>) -> Self {
+impl ComponentPlan {
+    pub fn new(gates: Vec<Gate>) -> Self {
         Self {
-            id: INVALID_NODE_ID,
             gates,
-            children,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        }
+    }
+
+    pub fn with_ports(
+        gates: Vec<Gate>,
+        inputs: Vec<ComponentPort>,
+        outputs: Vec<ComponentPort>,
+    ) -> Self {
+        Self {
+            gates,
+            inputs,
+            outputs,
         }
     }
 
     pub fn gate_count(&self) -> u32 {
         self.gates.len() as u32
+    }
+
+    fn input_port(&self, id: PortId) -> Option<&ComponentPort> {
+        self.inputs.iter().find(|port| port.id == id)
+    }
+
+    fn output_port(&self, id: PortId) -> Option<&ComponentPort> {
+        self.outputs.iter().find(|port| port.id == id)
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ComponentPlans {
+    plans: Slab<ComponentPlan>,
+}
+
+impl ComponentPlans {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, plan: ComponentPlan) -> PlanId {
+        PlanId(self.plans.insert(plan))
+    }
+
+    pub fn get(&self, id: PlanId) -> Option<&ComponentPlan> {
+        self.plans.get(id.0)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Component {
+    pub id: NodeId,
+    pub plan: PlanId,
+    pub children: Vec<Component>,
+    pub child_input_connections: Vec<ChildInputConnection>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ChildInputConnection {
+    pub child: ChildId,
+    pub input: PortId,
+    pub src: SignalRef,
+}
+
+impl Component {
+    pub fn new(plan: PlanId, children: Vec<Component>) -> Self {
+        Self {
+            id: INVALID_NODE_ID,
+            plan,
+            children,
+            child_input_connections: Vec::new(),
+        }
+    }
+
+    pub fn with_child_input_connections(
+        plan: PlanId,
+        children: Vec<Component>,
+        child_input_connections: Vec<ChildInputConnection>,
+    ) -> Self {
+        Self {
+            id: INVALID_NODE_ID,
+            plan,
+            children,
+            child_input_connections,
+        }
+    }
+
+    pub fn from_gates(
+        plans: &mut ComponentPlans,
+        gates: Vec<Gate>,
+        children: Vec<Component>,
+    ) -> Self {
+        let plan = plans.insert(ComponentPlan::new(gates));
+        Self::new(plan, children)
+    }
+
+    pub fn from_plan(
+        plans: &mut ComponentPlans,
+        plan: ComponentPlan,
+        children: Vec<Component>,
+    ) -> Self {
+        let plan = plans.insert(plan);
+        Self::new(plan, children)
     }
 }
 
@@ -165,31 +282,34 @@ pub struct GateCompiler {
 
 #[derive(Debug, Clone)]
 pub struct RefUsage {
-    pub read_by_parent: HashSet<GateId>,
-    pub written_by_parent: HashSet<GateId>,
-    pub read_by_children: HashMap<ChildId, HashSet<GateId>>,
-    pub written_by_children: HashMap<ChildId, HashSet<GateId>>,
+    pub input_ports_read: HashSet<PortId>,
+    pub output_ports_read_by_parent: HashSet<PortId>,
 }
 
 impl Default for RefUsage {
     fn default() -> Self {
         Self {
-            read_by_parent: HashSet::default(),
-            written_by_parent: HashSet::default(),
-            read_by_children: HashMap::default(),
-            written_by_children: HashMap::default(),
+            input_ports_read: HashSet::default(),
+            output_ports_read_by_parent: HashSet::default(),
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub enum CompileError {
+    MissingPlan(PlanId),
     MissingNode(NodeId),
     MissingCompiledInfo(NodeId),
     InvalidGateRef {
         from_node: NodeId,
         from_gate: GateId,
-        bad_ref: GateRef,
+        bad_ref: SignalRef,
+        reason: &'static str,
+    },
+    InvalidChildInputConnection {
+        node: NodeId,
+        child: ChildId,
+        input: PortId,
         reason: &'static str,
     },
     TargetGateOutOfRange {
@@ -203,6 +323,125 @@ pub enum CompileError {
         node: NodeId,
         gate: GateId,
     },
+    MissingInputPort {
+        node: NodeId,
+        port: PortId,
+    },
+    MissingOutputPort {
+        node: NodeId,
+        port: PortId,
+    },
+    DuplicatePortId {
+        node: NodeId,
+        port: PortId,
+        kind: &'static str,
+    },
+    DuplicateChildInputConnection {
+        node: NodeId,
+        child: ChildId,
+        input: PortId,
+    },
+}
+
+fn component_plan<'a>(
+    node: &Component,
+    plans: &'a ComponentPlans,
+) -> Result<&'a ComponentPlan, CompileError> {
+    plans
+        .get(node.plan)
+        .ok_or(CompileError::MissingPlan(node.plan))
+}
+
+fn validate_plan_ports(node: NodeId, plan: &ComponentPlan) -> Result<(), CompileError> {
+    let mut seen_inputs = HashSet::default();
+    for port in &plan.inputs {
+        if !seen_inputs.insert(port.id) {
+            return Err(CompileError::DuplicatePortId {
+                node,
+                port: port.id,
+                kind: "input",
+            });
+        }
+        if port.gate.0 >= plan.gate_count() {
+            return Err(CompileError::TargetGateOutOfRange {
+                from_node: node,
+                from_gate: port.gate,
+                target_node: node,
+                target_gate: port.gate,
+                target_gate_count: plan.gate_count(),
+            });
+        }
+    }
+
+    let mut seen_outputs = HashSet::default();
+    for port in &plan.outputs {
+        if !seen_outputs.insert(port.id) {
+            return Err(CompileError::DuplicatePortId {
+                node,
+                port: port.id,
+                kind: "output",
+            });
+        }
+        if port.gate.0 >= plan.gate_count() {
+            return Err(CompileError::TargetGateOutOfRange {
+                from_node: node,
+                from_gate: port.gate,
+                target_node: node,
+                target_gate: port.gate,
+                target_gate_count: plan.gate_count(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn child_ctx<'a>(
+    parent_stack: &'a [NodeId],
+    parent: NodeId,
+    child_ids: &'a [NodeId],
+    child_index_in_parent: Option<ChildId>,
+) -> CompileCtx<'a> {
+    CompileCtx {
+        current: parent,
+        parent_stack,
+        child_ids,
+        child_index_in_parent,
+    }
+}
+
+fn child_input_connection<'a>(
+    node: &'a Component,
+    child: ChildId,
+    input: PortId,
+) -> Option<&'a ChildInputConnection> {
+    node.child_input_connections
+        .iter()
+        .find(|connection| connection.child == child && connection.input == input)
+}
+
+fn child_index_in_parent(
+    node_id: NodeId,
+    parent_stack: &[NodeId],
+    by_id: &HashMap<NodeId, &Component>,
+) -> Result<Option<ChildId>, CompileError> {
+    if parent_stack.len() < 2 {
+        return Ok(None);
+    }
+
+    let parent_id = *parent_stack.last().expect("len checked above");
+    let grandparent_id = parent_stack[parent_stack.len() - 2];
+
+    debug_assert_eq!(parent_id, node_id);
+    let grandparent = by_id
+        .get(&grandparent_id)
+        .copied()
+        .ok_or(CompileError::MissingNode(grandparent_id))?;
+    Ok(grandparent
+        .children
+        .iter()
+        .position(|child| child.id == node_id)
+        .map(|i| ChildId(i as u32)))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -210,6 +449,7 @@ struct CompileCtx<'a> {
     current: NodeId,
     parent_stack: &'a [NodeId],
     child_ids: &'a [NodeId],
+    child_index_in_parent: Option<ChildId>,
 }
 
 pub fn assign_node_ids(root: &mut Component) {
@@ -225,13 +465,17 @@ pub fn assign_node_ids(root: &mut Component) {
     rec(root, &mut next);
 }
 
-pub fn validate_component_tree(root: &Component) -> Result<(), CompileError> {
+pub fn validate_component_tree(
+    root: &Component,
+    plans: &ComponentPlans,
+) -> Result<(), CompileError> {
     let by_id = collect_components(root);
-    validate_component_tree_with_index(root, &by_id)
+    validate_component_tree_with_index(root, plans, &by_id)
 }
 
 pub fn compile_component_tree(
     root: &mut Component,
+    plans: &ComponentPlans,
     total_bits_per_buffer: u32,
 ) -> Result<CompiledTree, CompileError> {
     if root.id == INVALID_NODE_ID {
@@ -239,9 +483,9 @@ pub fn compile_component_tree(
     }
 
     let by_id = collect_components(root);
-    validate_component_tree_with_index(root, &by_id)?;
+    validate_component_tree_with_index(root, plans, &by_id)?;
 
-    let usage = collect_ref_usage(root, &by_id)?;
+    let usage = collect_ref_usage(root, plans, &by_id)?;
     let mut compiler = GateCompiler {
         bits: HashMap::default(),
         alloc: ChargeAlloc::new(total_bits_per_buffer),
@@ -252,9 +496,9 @@ pub fn compile_component_tree(
         components: HashMap::default(),
     };
 
-    compile_component_rec(root, &[], &usage, &mut compiler)?;
-    lower_cross_component_edges(root, &[], &by_id, &mut compiler)?;
-    let gpu_plan = lower_gpu_plan(root, &by_id, &compiler)?;
+    compile_component_rec(root, plans, &[], &usage, &mut compiler)?;
+    lower_cross_component_edges(root, plans, &[], &by_id, &mut compiler)?;
+    let gpu_plan = lower_gpu_plan(root, plans, &by_id, &compiler)?;
 
     Ok(CompiledTree {
         components: compiler.components,
@@ -264,27 +508,31 @@ pub fn compile_component_tree(
 
 fn lower_gpu_plan(
     root: &Component,
+    plans: &ComponentPlans,
     by_id: &HashMap<NodeId, &Component>,
     compiler: &GateCompiler,
 ) -> Result<GpuPlan, CompileError> {
+    let root_plan = component_plan(root, plans)?;
     Ok(GpuPlan {
         bits_per_buffer: compiler.alloc.total_bits,
         words_per_buffer: compiler.alloc.total_bits.div_ceil(32),
-        output_words: root.gate_count().div_ceil(32),
-        basic_gates: lower_basic_gate_groups(root, &[], by_id, compiler)?,
+        output_words: root_plan.gate_count().div_ceil(32),
+        basic_gates: lower_basic_gate_groups(root, plans, &[], by_id, compiler)?,
         cross_writes: compiler.mem.make_bit_cross(),
-        output_writes: lower_output_write_groups(root, compiler)?,
+        output_writes: lower_output_write_groups(root, plans, compiler)?,
     })
 }
 
 fn lower_basic_gate_groups(
     root: &Component,
+    plans: &ComponentPlans,
     parent_stack: &[NodeId],
     by_id: &HashMap<NodeId, &Component>,
     compiler: &GateCompiler,
 ) -> Result<Vec<PreparedBasicGates>, CompileError> {
     fn rec(
         node: &Component,
+        plans: &ComponentPlans,
         parent_stack: &[NodeId],
         by_id: &HashMap<NodeId, &Component>,
         compiler: &GateCompiler,
@@ -294,13 +542,10 @@ fn lower_basic_gate_groups(
         >,
     ) -> Result<(), CompileError> {
         let child_ids: Vec<NodeId> = node.children.iter().map(|c| c.id).collect();
-        let ctx = CompileCtx {
-            current: node.id,
-            parent_stack,
-            child_ids: &child_ids,
-        };
+        let ctx = child_ctx(parent_stack, node.id, &child_ids, None);
+        let plan = component_plan(node, plans)?;
 
-        for (gate_i, gate) in node.gates.iter().copied().enumerate() {
+        for (gate_i, gate) in plan.gates.iter().copied().enumerate() {
             let gate_id = GateId(gate_i as u32);
             let dst = compiler.bits.get(&(node.id, gate_id)).copied().ok_or(
                 CompileError::MissingBitsForGate {
@@ -313,15 +558,15 @@ fn lower_basic_gate_groups(
             let src_a_ref = inputs
                 .next()
                 .expect("basic gates always have at least one input");
-            let src_a = resolve_gate_bits(node.id, gate_id, src_a_ref, &ctx, by_id, compiler)?;
+            let src_a = resolve_gate_bits(node, gate_id, src_a_ref, &ctx, plans, by_id, compiler)?;
             let src_b = match inputs.next() {
                 Some(src_b_ref) => {
-                    resolve_gate_bits(node.id, gate_id, src_b_ref, &ctx, by_id, compiler)?
+                    resolve_gate_bits(node, gate_id, src_b_ref, &ctx, plans, by_id, compiler)?
                 }
                 None => src_a,
             };
 
-            let tgt_word_byte_offset = (dst.1.0 >> 5) << 2;
+            let tgt_word_byte_offset = (dst.1 .0 >> 5) << 2;
             grouped
                 .entry(dst.0)
                 .or_default()
@@ -329,7 +574,7 @@ fn lower_basic_gate_groups(
                 .or_default()
                 .push(BasicGateInstruction {
                     op: BasicGateOp::from_gate(gate),
-                    dst_bit_in_word: Bits(dst.1.0 % 32),
+                    dst_bit_in_word: Bits(dst.1 .0 % 32),
                     src_a,
                     src_b,
                 });
@@ -339,8 +584,91 @@ fn lower_basic_gate_groups(
         next_stack.extend_from_slice(parent_stack);
         next_stack.push(node.id);
 
-        for child in &node.children {
-            rec(child, &next_stack, by_id, compiler, grouped)?;
+        for (child_i, child) in node.children.iter().enumerate() {
+            rec_with_child_index(
+                child,
+                plans,
+                &next_stack,
+                by_id,
+                compiler,
+                grouped,
+                ChildId(child_i as u32),
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn rec_with_child_index(
+        node: &Component,
+        plans: &ComponentPlans,
+        parent_stack: &[NodeId],
+        by_id: &HashMap<NodeId, &Component>,
+        compiler: &GateCompiler,
+        grouped: &mut HashMap<
+            crate::charge_buffer::BufferId,
+            HashMap<u32, Vec<BasicGateInstruction>>,
+        >,
+        child_index_in_parent: ChildId,
+    ) -> Result<(), CompileError> {
+        let child_ids: Vec<NodeId> = node.children.iter().map(|c| c.id).collect();
+        let ctx = child_ctx(
+            parent_stack,
+            node.id,
+            &child_ids,
+            Some(child_index_in_parent),
+        );
+        let plan = component_plan(node, plans)?;
+
+        for (gate_i, gate) in plan.gates.iter().copied().enumerate() {
+            let gate_id = GateId(gate_i as u32);
+            let dst = compiler.bits.get(&(node.id, gate_id)).copied().ok_or(
+                CompileError::MissingBitsForGate {
+                    node: node.id,
+                    gate: gate_id,
+                },
+            )?;
+
+            let mut inputs = gate_inputs(gate).into_iter();
+            let src_a_ref = inputs
+                .next()
+                .expect("basic gates always have at least one input");
+            let src_a = resolve_gate_bits(node, gate_id, src_a_ref, &ctx, plans, by_id, compiler)?;
+            let src_b = match inputs.next() {
+                Some(src_b_ref) => {
+                    resolve_gate_bits(node, gate_id, src_b_ref, &ctx, plans, by_id, compiler)?
+                }
+                None => src_a,
+            };
+
+            let tgt_word_byte_offset = (dst.1 .0 >> 5) << 2;
+            grouped
+                .entry(dst.0)
+                .or_default()
+                .entry(tgt_word_byte_offset)
+                .or_default()
+                .push(BasicGateInstruction {
+                    op: BasicGateOp::from_gate(gate),
+                    dst_bit_in_word: Bits(dst.1 .0 % 32),
+                    src_a,
+                    src_b,
+                });
+        }
+
+        let mut next_stack = Vec::with_capacity(parent_stack.len() + 1);
+        next_stack.extend_from_slice(parent_stack);
+        next_stack.push(node.id);
+
+        for (child_i, child) in node.children.iter().enumerate() {
+            rec_with_child_index(
+                child,
+                plans,
+                &next_stack,
+                by_id,
+                compiler,
+                grouped,
+                ChildId(child_i as u32),
+            )?;
         }
 
         Ok(())
@@ -350,7 +678,7 @@ fn lower_basic_gate_groups(
         crate::charge_buffer::BufferId,
         HashMap<u32, Vec<BasicGateInstruction>>,
     > = HashMap::default();
-    rec(root, parent_stack, by_id, compiler, &mut grouped)?;
+    rec(root, plans, parent_stack, by_id, compiler, &mut grouped)?;
 
     let mut buffer_ids: Vec<_> = grouped.keys().copied().collect();
     buffer_ids.sort();
@@ -428,11 +756,13 @@ fn lower_basic_gate_groups(
 
 fn lower_output_write_groups(
     root: &Component,
+    plans: &ComponentPlans,
     compiler: &GateCompiler,
 ) -> Result<Vec<PreparedOutputWrites>, CompileError> {
     let mut by_word: HashMap<u32, Vec<OutputWriteInstruction>> = HashMap::default();
+    let root_plan = component_plan(root, plans)?;
 
-    for (gate_i, _) in root.gates.iter().enumerate() {
+    for (gate_i, _) in root_plan.gates.iter().enumerate() {
         let gate_id = GateId(gate_i as u32);
         let src = compiler.bits.get(&(root.id, gate_id)).copied().ok_or(
             CompileError::MissingBitsForGate {
@@ -512,43 +842,170 @@ fn lower_output_write_groups(
 }
 
 fn resolve_gate_bits(
-    from_node: NodeId,
+    node: &Component,
     from_gate: GateId,
-    r: GateRef,
+    r: SignalRef,
     ctx: &CompileCtx<'_>,
+    plans: &ComponentPlans,
     by_id: &HashMap<NodeId, &Component>,
     compiler: &GateCompiler,
 ) -> Result<BitsIndex, CompileError> {
-    let target_node = resolve_scope(ctx, r.scope).ok_or(CompileError::InvalidGateRef {
-        from_node,
-        from_gate,
-        bad_ref: r,
-        reason: "scope does not exist from this location",
-    })?;
-
-    let target = by_id
-        .get(&target_node)
-        .copied()
-        .ok_or(CompileError::MissingNode(target_node))?;
-
-    if r.gate.0 >= target.gates.len() as u32 {
-        return Err(CompileError::TargetGateOutOfRange {
-            from_node,
-            from_gate,
-            target_node,
-            target_gate: r.gate,
-            target_gate_count: target.gates.len() as u32,
-        });
+    match r {
+        SignalRef::ThisGate(gate) => {
+            compiler
+                .bits
+                .get(&(node.id, gate))
+                .copied()
+                .ok_or(CompileError::MissingBitsForGate {
+                    node: node.id,
+                    gate,
+                })
+        }
+        SignalRef::InputPort(port) => {
+            resolve_input_port_bits(node, from_gate, port, ctx, plans, by_id, compiler)
+        }
+        SignalRef::ChildOutput { child, port } => {
+            let target_node = ctx.child_ids.get(child.0 as usize).copied().ok_or(
+                CompileError::InvalidGateRef {
+                    from_node: node.id,
+                    from_gate,
+                    bad_ref: r,
+                    reason: "child does not exist from this location",
+                },
+            )?;
+            let target = by_id
+                .get(&target_node)
+                .copied()
+                .ok_or(CompileError::MissingNode(target_node))?;
+            let target_plan = component_plan(target, plans)?;
+            let output = target_plan
+                .output_port(port)
+                .ok_or(CompileError::MissingOutputPort {
+                    node: target_node,
+                    port,
+                })?;
+            compiler
+                .bits
+                .get(&(target_node, output.gate))
+                .copied()
+                .ok_or(CompileError::MissingBitsForGate {
+                    node: target_node,
+                    gate: output.gate,
+                })
+        }
+        SignalRef::AncestorOutput { depth, port } => {
+            let depth = depth.0 as usize;
+            if depth == 0 || depth > ctx.parent_stack.len() {
+                return Err(CompileError::InvalidGateRef {
+                    from_node: node.id,
+                    from_gate,
+                    bad_ref: r,
+                    reason: "ancestor does not exist from this location",
+                });
+            }
+            let target_node = ctx.parent_stack[ctx.parent_stack.len() - depth];
+            let target = by_id
+                .get(&target_node)
+                .copied()
+                .ok_or(CompileError::MissingNode(target_node))?;
+            let target_plan = component_plan(target, plans)?;
+            let output = target_plan
+                .output_port(port)
+                .ok_or(CompileError::MissingOutputPort {
+                    node: target_node,
+                    port,
+                })?;
+            compiler
+                .bits
+                .get(&(target_node, output.gate))
+                .copied()
+                .ok_or(CompileError::MissingBitsForGate {
+                    node: target_node,
+                    gate: output.gate,
+                })
+        }
     }
+}
 
-    compiler
-        .bits
-        .get(&(target_node, r.gate))
+fn resolve_input_port_bits(
+    node: &Component,
+    from_gate: GateId,
+    port: PortId,
+    ctx: &CompileCtx<'_>,
+    plans: &ComponentPlans,
+    by_id: &HashMap<NodeId, &Component>,
+    compiler: &GateCompiler,
+) -> Result<BitsIndex, CompileError> {
+    let parent_id = match ctx.parent_stack.last().copied() {
+        Some(parent_id) => parent_id,
+        None => {
+            let plan = component_plan(node, plans)?;
+            let input = plan
+                .input_port(port)
+                .ok_or(CompileError::MissingInputPort {
+                    node: node.id,
+                    port,
+                })?;
+            return compiler.bits.get(&(node.id, input.gate)).copied().ok_or(
+                CompileError::MissingBitsForGate {
+                    node: node.id,
+                    gate: input.gate,
+                },
+            );
+        }
+    };
+
+    let child_index = ctx
+        .child_index_in_parent
+        .ok_or(CompileError::InvalidGateRef {
+            from_node: node.id,
+            from_gate,
+            bad_ref: SignalRef::InputPort(port),
+            reason: "component input ports require a parent child slot",
+        })?;
+
+    let parent = by_id
+        .get(&parent_id)
         .copied()
-        .ok_or(CompileError::MissingBitsForGate {
-            node: target_node,
-            gate: r.gate,
-        })
+        .ok_or(CompileError::MissingNode(parent_id))?;
+
+    let Some(connection) = child_input_connection(parent, child_index, port) else {
+        let plan = component_plan(node, plans)?;
+        let input = plan
+            .input_port(port)
+            .ok_or(CompileError::MissingInputPort {
+                node: node.id,
+                port,
+            })?;
+        // TODO(UI): surface disconnected component inputs so the player can fix them.
+        return compiler.bits.get(&(node.id, input.gate)).copied().ok_or(
+            CompileError::MissingBitsForGate {
+                node: node.id,
+                gate: input.gate,
+            },
+        );
+    };
+
+    let parent_child_ids: Vec<NodeId> = parent.children.iter().map(|c| c.id).collect();
+    let parent_ctx = child_ctx(
+        &ctx.parent_stack[..ctx.parent_stack.len() - 1],
+        parent.id,
+        &parent_child_ids,
+        child_index_in_parent(
+            parent.id,
+            &ctx.parent_stack[..ctx.parent_stack.len() - 1],
+            by_id,
+        )?,
+    );
+    resolve_gate_bits(
+        parent,
+        from_gate,
+        connection.src,
+        &parent_ctx,
+        plans,
+        by_id,
+        compiler,
+    )
 }
 
 impl BasicGateOp {
@@ -581,28 +1038,85 @@ fn collect_components<'a>(root: &'a Component) -> HashMap<NodeId, &'a Component>
 
 fn validate_component_tree_with_index(
     root: &Component,
+    plans: &ComponentPlans,
     by_id: &HashMap<NodeId, &Component>,
 ) -> Result<(), CompileError> {
     fn rec(
         node: &Component,
+        plans: &ComponentPlans,
         parent_stack: &mut Vec<NodeId>,
         by_id: &HashMap<NodeId, &Component>,
     ) -> Result<(), CompileError> {
-        let child_ids: Vec<NodeId> = node.children.iter().map(|c| c.id).collect();
-        let ctx = CompileCtx {
-            current: node.id,
-            parent_stack,
-            child_ids: &child_ids,
-        };
+        rec_with_child_index(node, plans, parent_stack, by_id, None)
+    }
 
-        for (gate_i, gate) in node.gates.iter().copied().enumerate() {
+    fn rec_with_child_index(
+        node: &Component,
+        plans: &ComponentPlans,
+        parent_stack: &mut Vec<NodeId>,
+        by_id: &HashMap<NodeId, &Component>,
+        child_index: Option<ChildId>,
+    ) -> Result<(), CompileError> {
+        let child_ids: Vec<NodeId> = node.children.iter().map(|c| c.id).collect();
+        let ctx = child_ctx(parent_stack, node.id, &child_ids, child_index);
+        let plan = component_plan(node, plans)?;
+        validate_plan_ports(node.id, plan)?;
+
+        let mut seen_connections = HashSet::default();
+        for connection in &node.child_input_connections {
+            if !seen_connections.insert((connection.child, connection.input)) {
+                return Err(CompileError::DuplicateChildInputConnection {
+                    node: node.id,
+                    child: connection.child,
+                    input: connection.input,
+                });
+            }
+
+            let child_node = child_ids.get(connection.child.0 as usize).copied().ok_or(
+                CompileError::InvalidChildInputConnection {
+                    node: node.id,
+                    child: connection.child,
+                    input: connection.input,
+                    reason: "child does not exist",
+                },
+            )?;
+            let child = by_id
+                .get(&child_node)
+                .copied()
+                .ok_or(CompileError::MissingNode(child_node))?;
+            let child_plan = component_plan(child, plans)?;
+            child_plan.input_port(connection.input).ok_or(
+                CompileError::InvalidChildInputConnection {
+                    node: node.id,
+                    child: connection.child,
+                    input: connection.input,
+                    reason: "child input port does not exist",
+                },
+            )?;
+            validate_gate_ref(
+                node.id,
+                GateId(u32::MAX),
+                connection.src,
+                &ctx,
+                plans,
+                by_id,
+            )?;
+        }
+
+        for (gate_i, gate) in plan.gates.iter().copied().enumerate() {
             let gate_id = GateId(gate_i as u32);
-            validate_gate(node.id, gate_id, gate, &ctx, by_id)?;
+            validate_gate(node.id, gate_id, gate, &ctx, plans, by_id)?;
         }
 
         parent_stack.push(node.id);
-        for child in &node.children {
-            rec(child, parent_stack, by_id)?;
+        for (child_i, child) in node.children.iter().enumerate() {
+            rec_with_child_index(
+                child,
+                plans,
+                parent_stack,
+                by_id,
+                Some(ChildId(child_i as u32)),
+            )?;
         }
         parent_stack.pop();
 
@@ -610,7 +1124,7 @@ fn validate_component_tree_with_index(
     }
 
     let mut stack = Vec::new();
-    rec(root, &mut stack, by_id)
+    rec(root, plans, &mut stack, by_id)
 }
 
 fn validate_gate(
@@ -618,6 +1132,7 @@ fn validate_gate(
     gate_id: GateId,
     gate: Gate,
     ctx: &CompileCtx<'_>,
+    plans: &ComponentPlans,
     by_id: &HashMap<NodeId, &Component>,
 ) -> Result<(), CompileError> {
     match gate {
@@ -627,11 +1142,11 @@ fn validate_gate(
         | Gate::BitNOR { a, b }
         | Gate::BitXOR { a, b }
         | Gate::BitXNOR { a, b } => {
-            validate_gate_ref(node_id, gate_id, a, ctx, by_id)?;
-            validate_gate_ref(node_id, gate_id, b, ctx, by_id)?;
+            validate_gate_ref(node_id, gate_id, a, ctx, plans, by_id)?;
+            validate_gate_ref(node_id, gate_id, b, ctx, plans, by_id)?;
         }
         Gate::BitNot { src } | Gate::BitNop { src } => {
-            validate_gate_ref(node_id, gate_id, src, ctx, by_id)?;
+            validate_gate_ref(node_id, gate_id, src, ctx, plans, by_id)?;
         }
     }
     Ok(())
@@ -640,46 +1155,87 @@ fn validate_gate(
 fn validate_gate_ref(
     from_node: NodeId,
     from_gate: GateId,
-    r: GateRef,
+    r: SignalRef,
     ctx: &CompileCtx<'_>,
+    plans: &ComponentPlans,
     by_id: &HashMap<NodeId, &Component>,
 ) -> Result<(), CompileError> {
-    let target_node = resolve_scope(ctx, r.scope).ok_or(CompileError::InvalidGateRef {
-        from_node,
-        from_gate,
-        bad_ref: r,
-        reason: "scope does not exist from this location",
-    })?;
-
-    let target = by_id
-        .get(&target_node)
-        .copied()
-        .ok_or(CompileError::MissingNode(target_node))?;
-
-    if r.gate.0 >= target.gates.len() as u32 {
-        return Err(CompileError::TargetGateOutOfRange {
-            from_node,
-            from_gate,
-            target_node,
-            target_gate: r.gate,
-            target_gate_count: target.gates.len() as u32,
-        });
-    }
-
-    Ok(())
-}
-
-fn resolve_scope(ctx: &CompileCtx<'_>, scope: ScopeRef) -> Option<NodeId> {
-    match scope {
-        ScopeRef::This => Some(ctx.current),
-        ScopeRef::Parent => ctx.parent_stack.last().copied(),
-        ScopeRef::Child(child_id) => ctx.child_ids.get(child_id.0 as usize).copied(),
-        ScopeRef::Ancestor(depth) => {
+    match r {
+        SignalRef::ThisGate(gate) => {
+            let node = by_id
+                .get(&ctx.current)
+                .copied()
+                .ok_or(CompileError::MissingNode(ctx.current))?;
+            let plan = component_plan(node, plans)?;
+            if gate.0 >= plan.gate_count() {
+                return Err(CompileError::TargetGateOutOfRange {
+                    from_node,
+                    from_gate,
+                    target_node: ctx.current,
+                    target_gate: gate,
+                    target_gate_count: plan.gate_count(),
+                });
+            }
+            Ok(())
+        }
+        SignalRef::InputPort(port) => {
+            let node = by_id
+                .get(&ctx.current)
+                .copied()
+                .ok_or(CompileError::MissingNode(ctx.current))?;
+            let plan = component_plan(node, plans)?;
+            plan.input_port(port)
+                .ok_or(CompileError::MissingInputPort {
+                    node: ctx.current,
+                    port,
+                })?;
+            Ok(())
+        }
+        SignalRef::ChildOutput { child, port } => {
+            let target_node = ctx.child_ids.get(child.0 as usize).copied().ok_or(
+                CompileError::InvalidGateRef {
+                    from_node,
+                    from_gate,
+                    bad_ref: r,
+                    reason: "child does not exist from this location",
+                },
+            )?;
+            let target = by_id
+                .get(&target_node)
+                .copied()
+                .ok_or(CompileError::MissingNode(target_node))?;
+            let target_plan = component_plan(target, plans)?;
+            target_plan
+                .output_port(port)
+                .ok_or(CompileError::MissingOutputPort {
+                    node: target_node,
+                    port,
+                })?;
+            Ok(())
+        }
+        SignalRef::AncestorOutput { depth, port } => {
             let depth = depth.0 as usize;
             if depth == 0 || depth > ctx.parent_stack.len() {
-                None
+                Err(CompileError::InvalidGateRef {
+                    from_node,
+                    from_gate,
+                    bad_ref: r,
+                    reason: "ancestor does not exist from this location",
+                })
             } else {
-                Some(ctx.parent_stack[ctx.parent_stack.len() - depth])
+                let target_node = ctx.parent_stack[ctx.parent_stack.len() - depth];
+                let target = by_id
+                    .get(&target_node)
+                    .copied()
+                    .ok_or(CompileError::MissingNode(target_node))?;
+                let target_plan = component_plan(target, plans)?;
+                target_plan
+                    .output_port(port)
+                    .ok_or(CompileError::MissingOutputPort {
+                        node: target_node,
+                        port,
+                    })?;
+                Ok(())
             }
         }
     }
@@ -687,85 +1243,115 @@ fn resolve_scope(ctx: &CompileCtx<'_>, scope: ScopeRef) -> Option<NodeId> {
 
 fn collect_ref_usage(
     root: &Component,
+    plans: &ComponentPlans,
     by_id: &HashMap<NodeId, &Component>,
 ) -> Result<HashMap<NodeId, RefUsage>, CompileError> {
     fn rec(
         node: &Component,
+        plans: &ComponentPlans,
         parent_stack: &mut Vec<NodeId>,
         by_id: &HashMap<NodeId, &Component>,
         usage: &mut HashMap<NodeId, RefUsage>,
     ) -> Result<(), CompileError> {
-        let child_ids: Vec<NodeId> = node.children.iter().map(|c| c.id).collect();
-        let ctx = CompileCtx {
-            current: node.id,
-            parent_stack,
-            child_ids: &child_ids,
-        };
+        rec_with_child_index(node, plans, parent_stack, by_id, usage, None)
+    }
 
-        for (gate_i, gate) in node.gates.iter().copied().enumerate() {
+    fn rec_with_child_index(
+        node: &Component,
+        plans: &ComponentPlans,
+        parent_stack: &mut Vec<NodeId>,
+        by_id: &HashMap<NodeId, &Component>,
+        usage: &mut HashMap<NodeId, RefUsage>,
+        child_index: Option<ChildId>,
+    ) -> Result<(), CompileError> {
+        let child_ids: Vec<NodeId> = node.children.iter().map(|c| c.id).collect();
+        let ctx = child_ctx(parent_stack, node.id, &child_ids, child_index);
+        let plan = component_plan(node, plans)?;
+
+        for (gate_i, gate) in plan.gates.iter().copied().enumerate() {
             let from_gate = GateId(gate_i as u32);
 
             for r in gate_inputs(gate) {
-                let target_node =
-                    resolve_scope(&ctx, r.scope).ok_or(CompileError::InvalidGateRef {
-                        from_node: node.id,
-                        from_gate,
-                        bad_ref: r,
-                        reason: "scope does not exist from this location",
-                    })?;
+                validate_gate_ref(node.id, from_gate, r, &ctx, plans, by_id)?;
 
-                let target = by_id
-                    .get(&target_node)
-                    .copied()
-                    .ok_or(CompileError::MissingNode(target_node))?;
-
-                if r.gate.0 >= target.gates.len() as u32 {
-                    return Err(CompileError::TargetGateOutOfRange {
-                        from_node: node.id,
-                        from_gate,
-                        target_node,
-                        target_gate: r.gate,
-                        target_gate_count: target.gates.len() as u32,
-                    });
-                }
-
-                match r.scope {
-                    ScopeRef::This => {}
-                    ScopeRef::Parent | ScopeRef::Ancestor(_) => {
+                match r {
+                    SignalRef::ThisGate(_) => {}
+                    SignalRef::InputPort(port) => {
                         usage
                             .entry(node.id)
                             .or_default()
-                            .read_by_parent
-                            .insert(from_gate);
-                        usage
-                            .entry(target_node)
-                            .or_default()
-                            .written_by_children
-                            .entry(ChildId(0))
-                            .or_default()
-                            .insert(r.gate);
+                            .input_ports_read
+                            .insert(port);
                     }
-                    ScopeRef::Child(child_id) => {
-                        usage
-                            .entry(node.id)
-                            .or_default()
-                            .written_by_children
-                            .entry(child_id)
-                            .or_default()
-                            .insert(r.gate);
+                    SignalRef::ChildOutput { child, port } => {
+                        let target_node = child_ids[child.0 as usize];
                         usage
                             .entry(target_node)
                             .or_default()
-                            .read_by_parent
-                            .insert(r.gate);
+                            .output_ports_read_by_parent
+                            .insert(port);
+                    }
+                    SignalRef::AncestorOutput { depth, port } => {
+                        let depth = depth.0 as usize;
+                        let target_node = parent_stack[parent_stack.len() - depth];
+                        usage
+                            .entry(target_node)
+                            .or_default()
+                            .output_ports_read_by_parent
+                            .insert(port);
                     }
                 }
             }
         }
 
+        for connection in &node.child_input_connections {
+            validate_gate_ref(
+                node.id,
+                GateId(u32::MAX),
+                connection.src,
+                &ctx,
+                plans,
+                by_id,
+            )?;
+            match connection.src {
+                SignalRef::ThisGate(_) => {}
+                SignalRef::InputPort(port) => {
+                    usage
+                        .entry(node.id)
+                        .or_default()
+                        .input_ports_read
+                        .insert(port);
+                }
+                SignalRef::ChildOutput { child, port } => {
+                    let target_node = child_ids[child.0 as usize];
+                    usage
+                        .entry(target_node)
+                        .or_default()
+                        .output_ports_read_by_parent
+                        .insert(port);
+                }
+                SignalRef::AncestorOutput { depth, port } => {
+                    let depth = depth.0 as usize;
+                    let target_node = parent_stack[parent_stack.len() - depth];
+                    usage
+                        .entry(target_node)
+                        .or_default()
+                        .output_ports_read_by_parent
+                        .insert(port);
+                }
+            }
+        }
+
         parent_stack.push(node.id);
-        for child in &node.children {
-            rec(child, parent_stack, by_id, usage)?;
+        for (child_i, child) in node.children.iter().enumerate() {
+            rec_with_child_index(
+                child,
+                plans,
+                parent_stack,
+                by_id,
+                usage,
+                Some(ChildId(child_i as u32)),
+            )?;
         }
         parent_stack.pop();
 
@@ -774,30 +1360,28 @@ fn collect_ref_usage(
 
     let mut usage: HashMap<NodeId, RefUsage> = HashMap::default();
     let mut stack = Vec::new();
-    rec(root, &mut stack, by_id, &mut usage)?;
+    rec(root, plans, &mut stack, by_id, &mut usage)?;
     Ok(usage)
 }
 
 fn compile_component_rec(
     node: &Component,
+    plans: &ComponentPlans,
     parent_stack: &[NodeId],
     usage: &HashMap<NodeId, RefUsage>,
     compiler: &mut GateCompiler,
 ) -> Result<(), CompileError> {
     let child_ids: Vec<NodeId> = node.children.iter().map(|c| c.id).collect();
-    let _ctx = CompileCtx {
-        current: node.id,
-        parent_stack,
-        child_ids: &child_ids,
-    };
+    let _ctx = child_ctx(parent_stack, node.id, &child_ids, None);
+    let plan = component_plan(node, plans)?;
 
-    let outline = decide_outline_plan(node, usage.get(&node.id));
+    let outline = decide_outline_plan(plan.gate_count(), usage.get(&node.id));
 
-    let mut self_bits = Vec::with_capacity(node.gates.len());
+    let mut self_bits = Vec::with_capacity(plan.gates.len());
 
     match outline.layout {
         CompileLayout::Inline => {
-            for gate_i in 0..node.gates.len() {
+            for gate_i in 0..plan.gates.len() {
                 let gate_id = GateId(gate_i as u32);
                 let bit = compiler.alloc.alloc_bit();
                 compiler.bits.insert((node.id, gate_id), bit);
@@ -805,11 +1389,11 @@ fn compile_component_rec(
             }
         }
         CompileLayout::Outline => {
-            let total_slots = node.gate_count() + outline.input_count + outline.output_count;
+            let total_slots = plan.gate_count() + outline.input_count + outline.output_count;
             for slot_i in 0..total_slots {
                 let word = compiler.alloc.alloc_word();
                 let bit = BitsIndex(word.0, Bits(word.1 * 8));
-                if slot_i < node.gates.len() as u32 {
+                if slot_i < plan.gates.len() as u32 {
                     let gate_id = GateId(slot_i);
                     compiler.bits.insert((node.id, gate_id), bit);
                     self_bits.push(bit);
@@ -833,7 +1417,7 @@ fn compile_component_rec(
     next_stack.push(node.id);
 
     for child in &node.children {
-        compile_component_rec(child, &next_stack, usage, compiler)?;
+        compile_component_rec(child, plans, &next_stack, usage, compiler)?;
     }
 
     Ok(())
@@ -841,53 +1425,56 @@ fn compile_component_rec(
 
 fn lower_cross_component_edges(
     node: &Component,
+    plans: &ComponentPlans,
     parent_stack: &[NodeId],
     by_id: &HashMap<NodeId, &Component>,
     compiler: &mut GateCompiler,
 ) -> Result<(), CompileError> {
     let child_ids: Vec<NodeId> = node.children.iter().map(|c| c.id).collect();
-    let ctx = CompileCtx {
-        current: node.id,
-        parent_stack,
-        child_ids: &child_ids,
-    };
+    let ctx = child_ctx(parent_stack, node.id, &child_ids, None);
 
-    for (gate_i, gate) in node.gates.iter().copied().enumerate() {
-        let dst_gate = GateId(gate_i as u32);
-
-        let dst = compiler.bits.get(&(node.id, dst_gate)).copied().ok_or(
-            CompileError::MissingBitsForGate {
+    for connection in &node.child_input_connections {
+        let child_node = child_ids.get(connection.child.0 as usize).copied().ok_or(
+            CompileError::InvalidChildInputConnection {
                 node: node.id,
-                gate: dst_gate,
+                child: connection.child,
+                input: connection.input,
+                reason: "child does not exist",
             },
         )?;
-
-        for src_ref in gate_inputs(gate) {
-            let target_node =
-                resolve_scope(&ctx, src_ref.scope).ok_or(CompileError::InvalidGateRef {
-                    from_node: node.id,
-                    from_gate: dst_gate,
-                    bad_ref: src_ref,
-                    reason: "scope does not exist from this location",
+        let child = by_id
+            .get(&child_node)
+            .copied()
+            .ok_or(CompileError::MissingNode(child_node))?;
+        let child_plan = component_plan(child, plans)?;
+        let input =
+            child_plan
+                .input_port(connection.input)
+                .ok_or(CompileError::MissingInputPort {
+                    node: child_node,
+                    port: connection.input,
                 })?;
 
-            let _target_component = by_id
-                .get(&target_node)
-                .copied()
-                .ok_or(CompileError::MissingNode(target_node))?;
+        let src = resolve_gate_bits(
+            node,
+            input.gate,
+            connection.src,
+            &ctx,
+            plans,
+            by_id,
+            compiler,
+        )?;
+        let dst = compiler
+            .bits
+            .get(&(child_node, input.gate))
+            .copied()
+            .ok_or(CompileError::MissingBitsForGate {
+                node: child_node,
+                gate: input.gate,
+            })?;
 
-            let src = compiler
-                .bits
-                .get(&(target_node, src_ref.gate))
-                .copied()
-                .ok_or(CompileError::MissingBitsForGate {
-                    node: target_node,
-                    gate: src_ref.gate,
-                })?;
-
-            if src.0 != dst.0 {
-                let _ = compiler.mem.queue_bit_write(src, dst);
-            }
+        if src.0 != dst.0 || src.1 != dst.1 {
+            let _ = compiler.mem.queue_bit_write(src, dst);
         }
     }
 
@@ -896,20 +1483,20 @@ fn lower_cross_component_edges(
     next_stack.push(node.id);
 
     for child in &node.children {
-        lower_cross_component_edges(child, &next_stack, by_id, compiler)?;
+        lower_cross_component_edges(child, plans, &next_stack, by_id, compiler)?;
     }
 
     Ok(())
 }
 
-fn decide_outline_plan(node: &Component, usage: Option<&RefUsage>) -> OutlinePlan {
+fn decide_outline_plan(gate_count: u32, usage: Option<&RefUsage>) -> OutlinePlan {
     let usage = usage.cloned().unwrap_or_default();
 
-    let input_count = usage.read_by_parent.len() as u32;
-    let output_count = usage.written_by_parent.len() as u32;
+    let input_count = usage.input_ports_read.len() as u32;
+    let output_count = usage.output_ports_read_by_parent.len() as u32;
 
-    let inline_cost_bits = node.gate_count();
-    let outlined_cost_bits_worst = node.gate_count().saturating_mul(32)
+    let inline_cost_bits = gate_count;
+    let outlined_cost_bits_worst = gate_count.saturating_mul(32)
         + input_count.saturating_mul(32)
         + output_count.saturating_mul(32);
 
@@ -945,11 +1532,11 @@ fn gate_inputs(gate: Gate) -> SmallGateInputs {
 
 #[derive(Debug, Clone, Copy)]
 struct SmallGateInputs {
-    refs: [Option<GateRef>; 2],
+    refs: [Option<SignalRef>; 2],
 }
 
 impl IntoIterator for SmallGateInputs {
-    type Item = GateRef;
+    type Item = SignalRef;
     type IntoIter = SmallGateInputsIter;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -961,12 +1548,12 @@ impl IntoIterator for SmallGateInputs {
 }
 
 struct SmallGateInputsIter {
-    refs: [Option<GateRef>; 2],
+    refs: [Option<SignalRef>; 2],
     i: usize,
 }
 
 impl Iterator for SmallGateInputsIter {
-    type Item = GateRef;
+    type Item = SignalRef;
 
     fn next(&mut self) -> Option<Self::Item> {
         while self.i < self.refs.len() {
@@ -982,9 +1569,10 @@ impl Iterator for SmallGateInputsIter {
 
 pub fn compile_gates(
     root: &mut Component,
+    plans: &ComponentPlans,
     total_bits_per_buffer: u32,
 ) -> Result<CompiledTree, CompileError> {
-    compile_component_tree(root, total_bits_per_buffer)
+    compile_component_tree(root, plans, total_bits_per_buffer)
 }
 
 // TODO:
@@ -999,36 +1587,35 @@ mod tests {
     use super::*;
     use crate::charge_buffer::{BufferId, WordIndex};
 
-    fn this_ref(gate: u32) -> GateRef {
-        GateRef {
-            scope: ScopeRef::This,
-            gate: GateId(gate),
+    const INPUT_A: PortId = PortId(10);
+    const OUTPUT_Z: PortId = PortId(20);
+
+    fn this_ref(gate: u32) -> SignalRef {
+        SignalRef::ThisGate(GateId(gate))
+    }
+
+    fn input_ref(port: PortId) -> SignalRef {
+        SignalRef::InputPort(port)
+    }
+
+    fn child_output_ref(child: u32, port: PortId) -> SignalRef {
+        SignalRef::ChildOutput {
+            child: ChildId(child),
+            port,
         }
     }
 
-    fn parent_ref(gate: u32) -> GateRef {
-        GateRef {
-            scope: ScopeRef::Parent,
+    fn port(id: PortId, gate: u32, x: u16, y: u16) -> ComponentPort {
+        ComponentPort {
+            id,
             gate: GateId(gate),
-        }
-    }
-
-    fn child_ref(child: u32, gate: u32) -> GateRef {
-        GateRef {
-            scope: ScopeRef::Child(ChildId(child)),
-            gate: GateId(gate),
-        }
-    }
-
-    fn ancestor_ref(depth: u32, gate: u32) -> GateRef {
-        GateRef {
-            scope: ScopeRef::Ancestor(AncestorDepth(depth)),
-            gate: GateId(gate),
+            location: PortLocation { x, y },
         }
     }
 
     fn compile_with_state(
         root: &mut Component,
+        plans: &ComponentPlans,
         total_bits_per_buffer: u32,
     ) -> Result<GateCompiler, CompileError> {
         if root.id == INVALID_NODE_ID {
@@ -1036,9 +1623,9 @@ mod tests {
         }
 
         let by_id = collect_components(root);
-        validate_component_tree_with_index(root, &by_id)?;
+        validate_component_tree_with_index(root, plans, &by_id)?;
 
-        let usage = collect_ref_usage(root, &by_id)?;
+        let usage = collect_ref_usage(root, plans, &by_id)?;
         let mut compiler = GateCompiler {
             bits: HashMap::default(),
             alloc: ChargeAlloc::new(total_bits_per_buffer),
@@ -1049,99 +1636,41 @@ mod tests {
             components: HashMap::default(),
         };
 
-        compile_component_rec(root, &[], &usage, &mut compiler)?;
-        lower_cross_component_edges(root, &[], &by_id, &mut compiler)?;
+        compile_component_rec(root, plans, &[], &usage, &mut compiler)?;
+        lower_cross_component_edges(root, plans, &[], &by_id, &mut compiler)?;
         Ok(compiler)
     }
 
-    fn make_large_inline_component(gate_count: u32) -> Component {
+    fn make_large_inline_component(plans: &mut ComponentPlans, gate_count: u32) -> Component {
         let gates = (0..gate_count)
             .map(|gate| Gate::BitNop {
                 src: this_ref(gate),
             })
             .collect();
-        Component::new(gates, vec![])
+        Component::from_gates(plans, gates, vec![])
     }
 
-    fn make_deep_inline_tree(depth: u32) -> Component {
-        if depth == 0 {
-            return Component::new(vec![Gate::BitNop { src: this_ref(0) }], vec![]);
-        }
-
-        Component::new(
-            vec![Gate::BitNop { src: this_ref(0) }],
-            vec![make_deep_inline_tree_with_parent_refs(depth - 1)],
-        )
-    }
-
-    fn make_deep_inline_tree_with_parent_refs(depth: u32) -> Component {
-        if depth == 0 {
-            return Component::new(vec![Gate::BitNop { src: parent_ref(0) }], vec![]);
-        }
-
-        Component::new(
-            vec![Gate::BitNop { src: parent_ref(0) }],
-            vec![make_deep_inline_tree_with_parent_refs(depth - 1)],
-        )
-    }
-
-    fn make_deep_cyclic_tree() -> Component {
-        let root_gates = (0..32)
-            .map(|gate| {
-                if gate == 31 {
-                    Gate::BitNop {
-                        src: child_ref(0, 0),
-                    }
-                } else {
-                    Gate::BitNop {
-                        src: this_ref(gate),
-                    }
-                }
-            })
-            .collect();
-
-        let child_gates = (0..32)
-            .map(|gate| {
-                if gate == 13 {
-                    Gate::BitNop {
-                        src: child_ref(0, 0),
-                    }
-                } else {
-                    Gate::BitNop {
-                        src: this_ref(gate),
-                    }
-                }
-            })
-            .collect();
-
-        let grandchild_gates = (0..14)
-            .map(|gate| {
-                if gate == 13 {
-                    Gate::BitNop {
-                        src: ancestor_ref(2, 5),
-                    }
-                } else {
-                    Gate::BitNop {
-                        src: this_ref(gate),
-                    }
-                }
-            })
-            .collect();
-
-        Component::new(
-            root_gates,
-            vec![Component::new(
-                child_gates,
-                vec![Component::new(grandchild_gates, vec![])],
-            )],
-        )
+    fn make_port_child(plans: &mut ComponentPlans) -> Component {
+        let plan = ComponentPlan::with_ports(
+            vec![
+                Gate::BitNop {
+                    src: input_ref(INPUT_A),
+                },
+                Gate::BitNot { src: this_ref(0) },
+            ],
+            vec![port(INPUT_A, 0, 0, u16::MAX)],
+            vec![port(OUTPUT_Z, 1, u16::MAX, u16::MAX)],
+        );
+        Component::from_plan(plans, plan, vec![])
     }
 
     #[test]
     fn oversized_inline_component_spills_across_buffers_without_out_of_bounds_bits() {
-        let mut root = make_large_inline_component(40);
+        let mut plans = ComponentPlans::new();
+        let mut root = make_large_inline_component(&mut plans, 40);
 
-        let compiled = compile_component_tree(&mut root, 32).expect("component should compile");
+        let compiled =
+            compile_component_tree(&mut root, &plans, 32).expect("component should compile");
         let info = compiled
             .components
             .get(&root.id)
@@ -1149,159 +1678,102 @@ mod tests {
 
         assert_eq!(info.outline.layout, CompileLayout::Inline);
         assert_eq!(info.self_bits.len(), 40);
-        assert!(info.self_bits.iter().all(|bit| bit.1.0 < 32));
-
-        let used_buffers: HashSet<BufferId> = info.self_bits.iter().map(|bit| bit.0).collect();
-        assert!(used_buffers.len() > 1);
-
-        let unique_bits: HashSet<BitsIndex> = info.self_bits.iter().copied().collect();
-        assert_eq!(unique_bits.len(), info.self_bits.len());
-    }
-
-    #[test]
-    fn deep_tree_can_inline_everything_without_cross_buffer_stitching() {
-        let mut root = make_deep_inline_tree(20);
-
-        let compiler = compile_with_state(&mut root, 64).expect("deep tree should compile");
-
-        assert_eq!(compiler.components.len(), 21);
+        assert!(info.self_bits.iter().all(|bit| bit.1 .0 < 32));
         assert!(
-            compiler
-                .components
-                .values()
-                .all(|info| info.outline.layout == CompileLayout::Inline)
+            info.self_bits
+                .iter()
+                .map(|bit| bit.0)
+                .collect::<HashSet<_>>()
+                .len()
+                > 1
         );
-        assert!(compiler.mem.bit_cross.is_empty());
-        assert!(compiler.bits.values().all(|bit| bit.0 == BufferId(0)));
-        assert!(compiler.bits.values().all(|bit| bit.1.0 < 64));
     }
 
     #[test]
-    fn cross_buffer_parent_child_edges_link_source_bits_to_expected_targets() {
-        let root_gates = (0..32)
-            .map(|gate| Gate::BitNop {
-                src: this_ref(gate),
-            })
-            .collect();
+    fn child_input_connections_queue_cross_writes_into_existing_input_gate_bits() {
+        let mut plans = ComponentPlans::new();
+        let child = make_port_child(&mut plans);
+        let root_plan = ComponentPlan::with_ports(
+            (0..32)
+                .map(|gate| Gate::BitNop {
+                    src: this_ref(gate),
+                })
+                .collect(),
+            vec![],
+            vec![port(OUTPUT_Z, 5, 10, 10)],
+        );
+        let mut root = Component::with_child_input_connections(
+            plans.insert(root_plan),
+            vec![child],
+            vec![ChildInputConnection {
+                child: ChildId(0),
+                input: INPUT_A,
+                src: this_ref(5),
+            }],
+        );
 
-        let child_gates = (0..14)
-            .map(|gate| {
-                if gate == 13 {
-                    Gate::BitNop { src: parent_ref(5) }
-                } else {
-                    Gate::BitNop {
-                        src: this_ref(gate),
-                    }
-                }
-            })
-            .collect();
-
-        let mut root = Component::new(root_gates, vec![Component::new(child_gates, vec![])]);
-        let compiler = compile_with_state(&mut root, 32).expect("tree should compile");
-
+        let compiler = compile_with_state(&mut root, &plans, 32).expect("tree should compile");
         let root_id = root.id;
         let child_id = root.children[0].id;
-        let src = compiler
-            .bits
-            .get(&(root_id, GateId(5)))
-            .copied()
-            .expect("source gate should have bits");
-        let dst = compiler
-            .bits
-            .get(&(child_id, GateId(13)))
-            .copied()
-            .expect("target gate should have bits");
+        let src = compiler.bits[&(root_id, GateId(5))];
+        let dst = compiler.bits[&(child_id, GateId(0))];
 
         assert_eq!(src, BitsIndex(BufferId(0), Bits(5)));
-        assert_eq!(dst, BitsIndex(BufferId(1), Bits(13)));
+        assert_eq!(dst, BitsIndex(BufferId(1), Bits(0)));
 
         let queued = compiler
             .mem
             .bit_cross
             .get(&(BufferId(0), WordIndex(BufferId(1), 0)))
-            .expect("expected cross-buffer edge to be queued on the target word");
-
-        assert!(queued.contains(&(Bits(5), 13)));
+            .expect("expected cross-buffer child input write");
+        assert!(queued.contains(&(Bits(5), 0)));
     }
 
     #[test]
-    fn deep_cyclic_child_parent_edges_queue_expected_cross_buffer_links() {
-        let mut root = make_deep_cyclic_tree();
-        let compiler = compile_with_state(&mut root, 32).expect("cyclic tree should compile");
-
-        let root_id = root.id;
-        let child_id = root.children[0].id;
-        let grandchild_id = root.children[0].children[0].id;
-
-        assert_eq!(
-            compiler.bits.get(&(root_id, GateId(31))).copied(),
-            Some(BitsIndex(BufferId(0), Bits(31)))
-        );
-        assert_eq!(
-            compiler.bits.get(&(child_id, GateId(0))).copied(),
-            Some(BitsIndex(BufferId(1), Bits(0)))
-        );
-        assert_eq!(
-            compiler.bits.get(&(child_id, GateId(13))).copied(),
-            Some(BitsIndex(BufferId(1), Bits(13)))
-        );
-        assert_eq!(
-            compiler.bits.get(&(grandchild_id, GateId(0))).copied(),
-            Some(BitsIndex(BufferId(2), Bits(0)))
-        );
-        assert_eq!(
-            compiler.bits.get(&(grandchild_id, GateId(13))).copied(),
-            Some(BitsIndex(BufferId(2), Bits(13)))
+    fn missing_child_input_connection_is_left_detached() {
+        let mut plans = ComponentPlans::new();
+        let child = make_port_child(&mut plans);
+        let mut root = Component::from_gates(
+            &mut plans,
+            (0..32)
+                .map(|gate| Gate::BitNop {
+                    src: this_ref(gate),
+                })
+                .collect(),
+            vec![child],
         );
 
-        let child_to_root = compiler
-            .mem
-            .bit_cross
-            .get(&(BufferId(1), WordIndex(BufferId(0), 0)))
-            .expect("child output should stitch into the root target word");
-        assert!(child_to_root.contains(&(Bits(0), 31)));
-
-        let grandchild_to_child = compiler
-            .mem
-            .bit_cross
-            .get(&(BufferId(2), WordIndex(BufferId(1), 0)))
-            .expect("grandchild output should stitch into the child target word");
-        assert!(grandchild_to_child.contains(&(Bits(0), 13)));
-
-        let root_to_grandchild = compiler
-            .mem
-            .bit_cross
-            .get(&(BufferId(0), WordIndex(BufferId(2), 0)))
-            .expect("root output should stitch into the grandchild target word");
-        assert!(root_to_grandchild.contains(&(Bits(5), 13)));
+        let compiler = compile_with_state(&mut root, &plans, 32).expect("tree should compile");
+        assert!(compiler.mem.bit_cross.is_empty());
     }
 
     #[test]
-    fn gpu_plan_includes_basic_cross_and_output_write_passes() {
-        let root_gates = (0..32)
-            .map(|gate| Gate::BitNop {
-                src: this_ref(gate),
-            })
-            .collect();
+    fn child_output_refs_use_stable_port_ids_not_output_order() {
+        let mut plans = ComponentPlans::new();
+        let child = Component::from_plan(
+            &mut plans,
+            ComponentPlan::with_ports(
+                vec![
+                    Gate::BitNop { src: this_ref(0) },
+                    Gate::BitNot { src: this_ref(0) },
+                ],
+                vec![],
+                vec![
+                    port(PortId(2), 0, 1, 1),
+                    port(OUTPUT_Z, 1, u16::MAX, u16::MAX),
+                ],
+            ),
+            vec![],
+        );
+        let root_plan = ComponentPlan::new(vec![Gate::BitNop {
+            src: child_output_ref(0, OUTPUT_Z),
+        }]);
+        let mut root = Component::from_plan(&mut plans, root_plan, vec![child]);
 
-        let child_gates = (0..14)
-            .map(|gate| {
-                if gate == 13 {
-                    Gate::BitNop { src: parent_ref(5) }
-                } else {
-                    Gate::BitNop {
-                        src: this_ref(gate),
-                    }
-                }
-            })
-            .collect();
-
-        let mut root = Component::new(root_gates, vec![Component::new(child_gates, vec![])]);
-        let compiled = compile_component_tree(&mut root, 32).expect("tree should compile");
-
-        assert!(!compiled.gpu_plan.basic_gates.is_empty());
-        assert!(!compiled.gpu_plan.cross_writes.is_empty());
-        assert!(!compiled.gpu_plan.output_writes.is_empty());
+        let compiled = compile_component_tree(&mut root, &plans, 64).expect("tree should compile");
+        let instruction = &compiled.gpu_plan.basic_gates[0].instructions[0];
+        let child_output_bit = compiled.components[&root.children[0].id].self_bits[1];
+        assert_eq!(instruction.src_a, child_output_bit);
     }
 
     #[test]
@@ -1335,64 +1807,12 @@ mod tests {
             },
         ];
 
-        let mut root = Component::new(gates, vec![]);
-        let compiled = compile_component_tree(&mut root, 64).expect("component should compile");
+        let mut plans = ComponentPlans::new();
+        let mut root = Component::from_gates(&mut plans, gates, vec![]);
+        let compiled =
+            compile_component_tree(&mut root, &plans, 64).expect("component should compile");
 
         assert_eq!(compiled.gpu_plan.basic_gates.len(), 1);
-
-        let main = &compiled.gpu_plan.basic_gates[0];
-        assert_eq!(main.tgt_buffer, BufferId(0));
-        assert_eq!(
-            main.workers,
-            vec![BasicGateWorker {
-                tgt_word_byte_offset: 0,
-                instruction_start: 0,
-                instruction_len: 8,
-            }]
-        );
-        assert_eq!(main.instructions.len(), 8);
-        assert_eq!(main.instructions[0].op, BasicGateOp::BitNop);
-        assert_eq!(main.instructions[1].op, BasicGateOp::BitNot);
-        assert_eq!(main.instructions[2].op, BasicGateOp::BitAND);
-        assert_eq!(main.instructions[3].op, BasicGateOp::BitOR);
-        assert_eq!(main.instructions[4].op, BasicGateOp::BitNAND);
-        assert_eq!(main.instructions[5].op, BasicGateOp::BitNOR);
-        assert_eq!(main.instructions[6].op, BasicGateOp::BitXOR);
-        assert_eq!(main.instructions[7].op, BasicGateOp::BitXNOR);
-
-        assert_eq!(compiled.gpu_plan.output_writes.len(), 1);
-        assert_eq!(
-            compiled.gpu_plan.output_writes[0].workers,
-            vec![BitCrossWorker {
-                tgt_word_byte_offset: 0,
-                instruction_start: 0,
-                instruction_len: 8,
-            }]
-        );
-    }
-
-    #[test]
-    fn output_writes_split_root_outputs_by_word() {
-        let mut root = make_large_inline_component(35);
-        let compiled = compile_component_tree(&mut root, 32).expect("component should compile");
-
-        assert_eq!(compiled.gpu_plan.output_writes.len(), 1);
-        assert_eq!(compiled.gpu_plan.output_writes[0].workers.len(), 2);
-        assert_eq!(
-            compiled.gpu_plan.output_writes[0].workers,
-            vec![
-                BitCrossWorker {
-                    tgt_word_byte_offset: 0,
-                    instruction_start: 0,
-                    instruction_len: 32,
-                },
-                BitCrossWorker {
-                    tgt_word_byte_offset: 4,
-                    instruction_start: 32,
-                    instruction_len: 3,
-                },
-            ]
-        );
-        assert_eq!(compiled.gpu_plan.output_writes[0].instructions.len(), 35);
+        assert_eq!(compiled.gpu_plan.output_writes[0].instructions.len(), 8);
     }
 }

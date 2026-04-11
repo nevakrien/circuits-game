@@ -494,25 +494,25 @@ fn absolute_word_index(words_per_buffer: u32, buffer: BufferId, word_in_buffer: 
 mod tests {
     use super::*;
     use crate::{
-        gate_plans::{compile_component_tree, Component, Gate, GateId, GateRef, ScopeRef},
+        gate_plans::{
+            compile_component_tree, ChildId, ChildInputConnection, Component, ComponentPlan,
+            ComponentPlans, ComponentPort, Gate, GateId, PortId, PortLocation, SignalRef,
+        },
         setup,
     };
     use wgpu::util::DeviceExt;
 
-    fn this_ref(gate: u32) -> GateRef {
-        GateRef {
-            scope: ScopeRef::This,
-            gate: GateId(gate),
-        }
+    fn this_ref(gate: u32) -> SignalRef {
+        SignalRef::ThisGate(GateId(gate))
     }
 
-    fn make_large_inline_component(gate_count: u32) -> Component {
+    fn make_large_inline_component(plans: &mut ComponentPlans, gate_count: u32) -> Component {
         let gates = (0..gate_count)
             .map(|gate| Gate::BitNop {
                 src: this_ref(gate),
             })
             .collect();
-        Component::new(gates, vec![])
+        Component::from_gates(plans, gates, vec![])
     }
 
     fn read_buffer_words(
@@ -561,30 +561,38 @@ mod tests {
 
     #[test]
     fn flattening_converts_plan_to_absolute_word_and_bit_indices() {
+        let mut plans = ComponentPlans::new();
+        let input_a = PortId(10);
         let root_gates = (0..32)
             .map(|gate| Gate::BitNop {
                 src: this_ref(gate),
             })
             .collect();
-        let child_gates = (0..14)
-            .map(|gate| {
-                if gate == 13 {
-                    Gate::BitNop {
-                        src: GateRef {
-                            scope: ScopeRef::Parent,
-                            gate: GateId(5),
-                        },
-                    }
-                } else {
-                    Gate::BitNop {
-                        src: this_ref(gate),
-                    }
-                }
-            })
-            .collect();
-
-        let mut root = Component::new(root_gates, vec![Component::new(child_gates, vec![])]);
-        let compiled = compile_component_tree(&mut root, 32).expect("tree should compile");
+        let child = Component::from_plan(
+            &mut plans,
+            ComponentPlan::with_ports(
+                vec![Gate::BitNop {
+                    src: SignalRef::InputPort(input_a),
+                }],
+                vec![ComponentPort {
+                    id: input_a,
+                    gate: GateId(0),
+                    location: PortLocation { x: 0, y: u16::MAX },
+                }],
+                vec![],
+            ),
+            vec![],
+        );
+        let mut root = Component::with_child_input_connections(
+            plans.insert(ComponentPlan::new(root_gates)),
+            vec![child],
+            vec![ChildInputConnection {
+                child: ChildId(0),
+                input: input_a,
+                src: this_ref(5),
+            }],
+        );
+        let compiled = compile_component_tree(&mut root, &plans, 32).expect("tree should compile");
 
         let (basic_gate_workers, basic_gate_instructions) = flatten_basic_gates(&compiled.gpu_plan);
         let (cross_write_workers, cross_write_instructions) =
@@ -596,7 +604,7 @@ mod tests {
         assert!(!basic_gate_instructions.is_empty());
         assert_eq!(cross_write_workers[0].tgt_word_index, 1);
         assert_eq!(cross_write_instructions[0].src_bit_index, 5);
-        assert_eq!(cross_write_instructions[0].tgt_bit_in_word, 13);
+        assert_eq!(cross_write_instructions[0].tgt_bit_in_word, 0);
         assert_eq!(output_write_workers[0].tgt_word_index, 0);
         assert_eq!(output_write_instructions[31].tgt_bit_in_word, 31);
     }
@@ -617,9 +625,10 @@ mod tests {
     fn gpu_kernel_handles_outputs_spread_across_multiple_small_buffers() {
         let bits_per_buffer = 32;
         let gate_count = 160;
-        let mut root = make_large_inline_component(gate_count);
-        let compiled =
-            compile_component_tree(&mut root, bits_per_buffer).expect("component should compile");
+        let mut plans = ComponentPlans::new();
+        let mut root = make_large_inline_component(&mut plans, gate_count);
+        let compiled = compile_component_tree(&mut root, &plans, bits_per_buffer)
+            .expect("component should compile");
 
         let used_buffers: std::collections::BTreeSet<_> = compiled
             .gpu_plan

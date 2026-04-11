@@ -505,6 +505,7 @@ dependencies = [
  "pollster",
  "rfd",
  "serde",
+ "slab",
 ]
 
 [[package]]
