@@ -29,6 +29,10 @@ const INPUT_B: PortId = PortId(11);
 const OUTPUT_Y: PortId = PortId(20);
 const OUTPUT_Z: PortId = PortId(21);
 const BITS_PER_BUFFER: u32 = 64;
+const LABEL_A: &str = "A";
+const LABEL_B: &str = "B";
+const LABEL_SUM: &str = "sum";
+const LABEL_CARRY: &str = "carry";
 fn main() {
     pollster::block_on(run());
 }
@@ -664,10 +668,13 @@ fn build_demo_circuit() -> (Component, ComponentPlans) {
                 },
                 Gate::BitNot { src: this_ref(0) },
             ],
-            vec![port(INPUT_A, 0, 0, 1), port(INPUT_B, 1, 0, 2)],
             vec![
-                port(OUTPUT_Y, 2, u16::MAX, 1),
-                port(OUTPUT_Z, 4, u16::MAX, 2),
+                port_named(INPUT_A, 0, 0, 1, LABEL_A),
+                port_named(INPUT_B, 1, 0, 2, LABEL_B),
+            ],
+            vec![
+                port_named(OUTPUT_Y, 2, u16::MAX, 1, LABEL_SUM),
+                port_named(OUTPUT_Z, 4, u16::MAX, 2, LABEL_CARRY),
             ],
         )
         .with_grid_size([3, 2]),
@@ -700,8 +707,8 @@ fn build_demo_circuit() -> (Component, ComponentPlans) {
                 ],
                 vec![],
                 vec![
-                    port(OUTPUT_Y, 3, u16::MAX, 1),
-                    port(OUTPUT_Z, 6, u16::MAX, 3),
+                    port_named(OUTPUT_Y, 3, u16::MAX, 1, LABEL_SUM),
+                    port_named(OUTPUT_Z, 6, u16::MAX, 3, LABEL_CARRY),
                 ],
             )
             .with_grid_size([5, 5])
@@ -740,10 +747,11 @@ fn child_output_ref(child: u32, port: PortId) -> SignalRef {
     }
 }
 
-fn port(id: PortId, gate: u32, x: u16, y: u16) -> ComponentPort {
+fn port_named(id: PortId, gate: u32, x: u16, y: u16, label: &'static str) -> ComponentPort {
     ComponentPort {
         id,
         gate: GateId(gate),
         location: PortLocation { x, y },
+        label: Some(label),
     }
 }

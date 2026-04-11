@@ -143,7 +143,7 @@ fn build_focused_scene_with_index(
             id: port.id,
             anchor: grid_anchor_for_port(grid_rect, grid_dims, port.location),
             location: port.location,
-            label: format!("in {}", port.id.0),
+            label: port.label.unwrap_or_default().to_owned(),
         })
         .collect();
     let output_ports: Vec<_> = plan
@@ -153,7 +153,7 @@ fn build_focused_scene_with_index(
             id: port.id,
             anchor: grid_anchor_for_port(grid_rect, grid_dims, port.location),
             location: port.location,
-            label: format!("out {}", port.id.0),
+            label: port.label.unwrap_or_default().to_owned(),
         })
         .collect();
 
@@ -198,7 +198,7 @@ fn build_focused_scene_with_index(
                     id: port.id,
                     anchor: child_port_anchor(rect, child_plan.grid_size, port.location),
                     location: port.location,
-                    label: format!("in {}", port.id.0),
+                    label: port.label.unwrap_or_default().to_owned(),
                 })
                 .collect();
             let outputs = child_plan
@@ -208,7 +208,7 @@ fn build_focused_scene_with_index(
                     id: port.id,
                     anchor: child_port_anchor(rect, child_plan.grid_size, port.location),
                     location: port.location,
-                    label: format!("out {}", port.id.0),
+                    label: port.label.unwrap_or_default().to_owned(),
                 })
                 .collect();
             let scene = build_focused_scene_with_index(
@@ -248,7 +248,7 @@ fn build_focused_scene_with_index(
                         grid_rect.left() - 28.0,
                         grid_rect.top() + 20.0 + i as f32 * 32.0,
                     ),
-                    label: format!("ancestor {} out {}", parent.id.0, port.id.0),
+                    label: port.label.unwrap_or_default().to_owned(),
                 })
                 .collect::<Vec<_>>()
         })
@@ -463,7 +463,6 @@ struct ScenePaintOptions {
     show_component_ports: bool,
     show_ancestor_ports: bool,
     show_child_ports: bool,
-    show_child_port_labels: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -506,7 +505,6 @@ impl ScenePaintOptions {
             show_component_ports: true,
             show_ancestor_ports: true,
             show_child_ports: true,
-            show_child_port_labels: false,
         }
     }
 
@@ -516,7 +514,6 @@ impl ScenePaintOptions {
             show_component_ports: false,
             show_ancestor_ports: false,
             show_child_ports: true,
-            show_child_port_labels: false,
         }
     }
 }
@@ -580,22 +577,10 @@ fn paint_scene(
     if options.show_child_ports {
         for child in &scene.children {
             for port in &child.inputs {
-                paint_port(
-                    painter,
-                    port,
-                    CHILD_INPUT_COLOR,
-                    camera,
-                    options.show_child_port_labels,
-                );
+                paint_port(painter, port, CHILD_INPUT_COLOR, camera, true);
             }
             for port in &child.outputs {
-                paint_port(
-                    painter,
-                    port,
-                    CHILD_OUTPUT_COLOR,
-                    camera,
-                    options.show_child_port_labels,
-                );
+                paint_port(painter, port, CHILD_OUTPUT_COLOR, camera, true);
             }
         }
     }
@@ -718,7 +703,7 @@ fn paint_port(
     let anchor = camera.pos(port.anchor);
     painter.circle_filled(anchor, PORT_RADIUS * camera.scale.clamp(0.7, 1.4), color);
     let font_size = 12.0 * camera.scale;
-    if show_label && font_size >= 8.0 {
+    if show_label && !port.label.is_empty() && font_size >= 8.0 {
         let (label_offset, align) = port_label_layout(port.location, camera.scale);
         painter.text(
             anchor + label_offset,
@@ -746,7 +731,7 @@ fn paint_external_port(painter: &Painter, port: &ExternalPort, color: Color32, c
     let anchor = camera.pos(port.anchor);
     painter.circle_filled(anchor, PORT_RADIUS * camera.scale.clamp(0.7, 1.4), color);
     let font_size = 12.0 * camera.scale;
-    if font_size >= 8.0 {
+    if !port.label.is_empty() && font_size >= 8.0 {
         painter.text(
             anchor + Vec2::new(10.0 * camera.scale, 0.0),
             Align2::LEFT_CENTER,

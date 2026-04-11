@@ -43,6 +43,7 @@ pub struct ComponentPort {
     pub id: PortId,
     pub gate: GateId,
     pub location: PortLocation,
+    pub label: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -600,13 +601,13 @@ fn gate_store_map(compiler: &GateCompiler) -> HashMap<(NodeId, GateId), GateStor
         .bits
         .iter()
         .map(|(&(node, gate), &bit_index)| {
-            let bit_in_word = (bit_index.1.0 % 32) as u8;
+            let bit_in_word = (bit_index.1 .0 % 32) as u8;
             (
                 (node, gate),
                 GateStoreLocation {
                     buffer: bit_index.0,
                     bit: bit_index.1,
-                    word_byte_offset: (bit_index.1.0 >> 5) << 2,
+                    word_byte_offset: (bit_index.1 .0 >> 5) << 2,
                     bit_in_word,
                 },
             )
@@ -674,7 +675,7 @@ fn lower_basic_gate_groups(
                 None => src_a,
             };
 
-            let tgt_word_byte_offset = (dst.1.0 >> 5) << 2;
+            let tgt_word_byte_offset = (dst.1 .0 >> 5) << 2;
             grouped
                 .entry(dst.0)
                 .or_default()
@@ -682,7 +683,7 @@ fn lower_basic_gate_groups(
                 .or_default()
                 .push(BasicGateInstruction {
                     op: BasicGateOp::from_gate(gate),
-                    dst_bit_in_word: Bits(dst.1.0 % 32),
+                    dst_bit_in_word: Bits(dst.1 .0 % 32),
                     src_a,
                     src_b,
                 });
@@ -749,7 +750,7 @@ fn lower_basic_gate_groups(
                 None => src_a,
             };
 
-            let tgt_word_byte_offset = (dst.1.0 >> 5) << 2;
+            let tgt_word_byte_offset = (dst.1 .0 >> 5) << 2;
             grouped
                 .entry(dst.0)
                 .or_default()
@@ -757,7 +758,7 @@ fn lower_basic_gate_groups(
                 .or_default()
                 .push(BasicGateInstruction {
                     op: BasicGateOp::from_gate(gate),
-                    dst_bit_in_word: Bits(dst.1.0 % 32),
+                    dst_bit_in_word: Bits(dst.1 .0 % 32),
                     src_a,
                     src_b,
                 });
@@ -1718,6 +1719,7 @@ mod tests {
             id,
             gate: GateId(gate),
             location: PortLocation { x, y },
+            label: None,
         }
     }
 
@@ -1786,7 +1788,7 @@ mod tests {
 
         assert_eq!(info.outline.layout, CompileLayout::Inline);
         assert_eq!(info.self_bits.len(), 40);
-        assert!(info.self_bits.iter().all(|bit| bit.1.0 < 32));
+        assert!(info.self_bits.iter().all(|bit| bit.1 .0 < 32));
         assert!(
             info.self_bits
                 .iter()
