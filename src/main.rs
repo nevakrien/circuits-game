@@ -1,4 +1,7 @@
-use std::sync::mpsc;
+use std::{
+    sync::mpsc,
+    time::{Duration, Instant},
+};
 
 use circuits_game::{
     gate_plans::{
@@ -8,6 +11,10 @@ use circuits_game::{
     },
     kernel::{GateKernel, UploadedGpuPlan},
     setup,
+    ui_config::{
+        DEFAULT_TICK_RATE, FAST_RATE_FACTOR, MAX_FRAME_STEP_BUDGET, PAUSED_VISUAL_RATE_FACTOR,
+        STEP_RATE_FACTOR,
+    },
     visual_ui::{
         build_focused_scene, child_ids_of, parent_stack_to, show_focused_scene, FocusedScene,
         SceneAction, ViewportState,
@@ -23,7 +30,6 @@ const INPUT_B: PortId = PortId(11);
 const OUTPUT_Y: PortId = PortId(20);
 const OUTPUT_Z: PortId = PortId(21);
 const BITS_PER_BUFFER: u32 = 64;
-
 fn main() {
     pollster::block_on(run());
 }
@@ -44,6 +50,7 @@ async fn run() {
     let mut runtime = DemoRuntime::new(device, queue, root, plans).expect("demo runtime should build");
     let mut read_words = runtime.read_words(device, queue);
     let mut viewer = ViewerState::new(&runtime).expect("viewer should build initial scene");
+    let animation_started_at = Instant::now();
 
     let egui_ctx = egui::Context::default();
     let mut egui_state = egui_winit::State::new(
@@ -76,18 +83,19 @@ async fn run() {
                 }
                 WindowEvent::RedrawRequested => {
                     let raw_input = egui_state.take_egui_input(&window);
-                    let mut step_once = viewer.apply_hotkeys(&raw_input);
-                    let should_step = match viewer.simulation_mode {
-                        SimulationMode::Running => true,
-                        SimulationMode::Paused => step_once,
-                    };
-                    if should_step {
+                    let step_once = viewer.apply_hotkeys(&raw_input);
+                    let now = Instant::now();
+                    let scheduled_steps = viewer.scheduled_steps(now);
+                    let total_steps = scheduled_steps.saturating_add(u32::from(step_once));
+                    for _ in 0..total_steps {
                         runtime.step(device, queue);
+                    }
+                    if total_steps > 0 {
                         read_words = runtime.read_words(device, queue);
-                        step_once = false;
                     }
 
                     let full_output = egui_ctx.run(raw_input, |ctx| {
+                        viewer.apply_continuous_input(ctx);
                         egui::TopBottomPanel::top("top-bar").show(ctx, |ui| {
                             ui.horizontal(|ui| {
                                 ui.heading("Circuit Viewer");
@@ -109,7 +117,16 @@ async fn run() {
                                     )
                                     .clicked()
                                 {
-                                    viewer.simulation_mode = SimulationMode::Running;
+                                    viewer.set_simulation_mode(SimulationMode::Running);
+                                }
+                                if ui
+                                    .selectable_label(
+                                        matches!(viewer.simulation_mode, SimulationMode::Stepping),
+                                        "Step",
+                                    )
+                                    .clicked()
+                                {
+                                    viewer.set_simulation_mode(SimulationMode::Stepping);
                                 }
                                 if ui
                                     .selectable_label(
@@ -118,11 +135,37 @@ async fn run() {
                                     )
                                     .clicked()
                                 {
-                                    viewer.simulation_mode = SimulationMode::Paused;
+                                    viewer.set_simulation_mode(SimulationMode::Paused);
                                 }
-                                if ui.button("Step").clicked() {
-                                    step_once = true;
+                                if ui.button("Step Once").clicked() {
+                                    viewer.request_single_step();
                                 }
+                                if ui
+                                    .selectable_label(
+                                        matches!(viewer.simulation_mode, SimulationMode::FastForward),
+                                        "Fast",
+                                    )
+                                    .clicked()
+                                {
+                                    viewer.set_simulation_mode(SimulationMode::FastForward);
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Tick speed:");
+                                ui.add(
+                                    egui::Slider::new(&mut viewer.tick_rate, 1..=25)
+                                        .clamping(egui::SliderClamping::Always),
+                                );
+                                ui.monospace(format!("run {:.1}x", 1.0));
+                                ui.separator();
+                                ui.monospace(format!("step {:.2}x", STEP_RATE_FACTOR));
+                                ui.separator();
+                                ui.monospace(format!("fast {:.2}x", FAST_RATE_FACTOR));
+                                ui.separator();
+                                ui.monospace(format!(
+                                    "effective {:.1} ticks/s",
+                                    viewer.effective_tick_rate_hz(viewer.simulation_mode)
+                                ));
                             });
                             ui.horizontal(|ui| {
                                 ui.label("Focus:");
@@ -141,7 +184,7 @@ async fn run() {
                                 }
                             });
                             ui.label("Drag to pan, use arrow keys to move, ctrl/cmd+wheel or trackpad pinch to zoom, click child blocks to drill into them.");
-                            ui.label("Hotkeys: R run, P pause, Space single-step. This view shows one component at a time so nested components stay compressed.");
+                            ui.label("Hotkeys: R run, T slow-step, F fast, P pause, Space single-step. Pause freezes the simulation state but keeps charge flow animated on screen.");
                         });
 
                         egui::CentralPanel::default().show(ctx, |ui| {
@@ -149,7 +192,8 @@ async fn run() {
                                 ui,
                                 &viewer.scene,
                                 &read_words,
-                                runtime.tick as f64,
+                                animation_started_at.elapsed().as_secs_f64(),
+                                viewer.visual_pulse_rate_hz(),
                                 &mut viewer.viewport,
                             ) {
                                 match action {
@@ -384,11 +428,17 @@ struct ViewerState {
     scene: FocusedScene,
     viewport: ViewportState,
     simulation_mode: SimulationMode,
+    tick_rate: u32,
+    last_frame_at: Instant,
+    step_accumulator: Duration,
+    pending_single_steps: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SimulationMode {
     Running,
+    Stepping,
+    FastForward,
     Paused,
 }
 
@@ -408,8 +458,63 @@ impl ViewerState {
             child_ids: child_ids_of(&runtime.root, focus_node),
             scene,
             viewport: ViewportState::default(),
-            simulation_mode: SimulationMode::Running,
+            simulation_mode: SimulationMode::Paused,
+            tick_rate: DEFAULT_TICK_RATE,
+            last_frame_at: Instant::now(),
+            step_accumulator: Duration::ZERO,
+            pending_single_steps: 0,
         })
+    }
+
+    fn set_simulation_mode(&mut self, mode: SimulationMode) {
+        if self.simulation_mode != mode {
+            self.simulation_mode = mode;
+            self.step_accumulator = Duration::ZERO;
+        }
+    }
+
+    fn request_single_step(&mut self) {
+        self.pending_single_steps = self.pending_single_steps.saturating_add(1);
+    }
+
+    fn effective_tick_rate_hz(&self, mode: SimulationMode) -> f32 {
+        let factor = match mode {
+            SimulationMode::Running => 1.0,
+            SimulationMode::Stepping => STEP_RATE_FACTOR,
+            SimulationMode::FastForward => FAST_RATE_FACTOR,
+            SimulationMode::Paused => 0.0,
+        };
+        self.tick_rate as f32 * factor
+    }
+
+    fn visual_pulse_rate_hz(&self) -> f32 {
+        let rate = match self.simulation_mode {
+            SimulationMode::Paused => self.tick_rate as f32 * PAUSED_VISUAL_RATE_FACTOR,
+            mode => self.effective_tick_rate_hz(mode),
+        };
+        rate.max(0.1)
+    }
+
+    fn scheduled_steps(&mut self, now: Instant) -> u32 {
+        let frame_dt = now.saturating_duration_since(self.last_frame_at);
+        self.last_frame_at = now;
+        let frame_dt = frame_dt.min(Duration::from_millis(250));
+        self.step_accumulator += frame_dt;
+
+        let interval = rate_to_interval(self.effective_tick_rate_hz(self.simulation_mode));
+        let mut steps = 0;
+        if !interval.is_zero() {
+            while self.step_accumulator >= interval && steps < MAX_FRAME_STEP_BUDGET {
+                self.step_accumulator -= interval;
+                steps += 1;
+            }
+        } else {
+            self.step_accumulator = Duration::ZERO;
+        }
+
+        let pending = self.pending_single_steps;
+        self.pending_single_steps = 0;
+        steps.saturating_add(pending)
     }
 
     fn reset_camera(&mut self) {
@@ -429,8 +534,37 @@ impl ViewerState {
         Ok(())
     }
 
+    fn apply_continuous_input(&mut self, ctx: &egui::Context) {
+        let dt = ctx.input(|input| input.stable_dt).min(0.1);
+        if dt <= 0.0 {
+            return;
+        }
+        let (left, right, up, down, fast_pan) = ctx.input(|input| {
+            (
+                input.key_down(egui::Key::ArrowLeft) || input.key_down(egui::Key::A),
+                input.key_down(egui::Key::ArrowRight) || input.key_down(egui::Key::D),
+                input.key_down(egui::Key::ArrowUp) || input.key_down(egui::Key::W),
+                input.key_down(egui::Key::ArrowDown) || input.key_down(egui::Key::S),
+                input.modifiers.shift,
+            )
+        });
+        let speed = if fast_pan { 720.0 } else { 420.0 };
+        let distance = speed * dt;
+        if left {
+            self.viewport.pan.x += distance;
+        }
+        if right {
+            self.viewport.pan.x -= distance;
+        }
+        if up {
+            self.viewport.pan.y += distance;
+        }
+        if down {
+            self.viewport.pan.y -= distance;
+        }
+    }
+
     fn apply_hotkeys(&mut self, raw_input: &egui::RawInput) -> bool {
-        let pan_step = if raw_input.modifiers.shift { 72.0 } else { 28.0 };
         let mut step_once = false;
         for event in &raw_input.events {
             let egui::Event::Key {
@@ -446,17 +580,23 @@ impl ViewerState {
                 continue;
             }
             match key {
-                egui::Key::ArrowLeft => self.viewport.pan.x += pan_step,
-                egui::Key::ArrowRight => self.viewport.pan.x -= pan_step,
-                egui::Key::ArrowUp => self.viewport.pan.y += pan_step,
-                egui::Key::ArrowDown => self.viewport.pan.y -= pan_step,
-                egui::Key::R if !repeat => self.simulation_mode = SimulationMode::Running,
-                egui::Key::P if !repeat => self.simulation_mode = SimulationMode::Paused,
+                egui::Key::R if !repeat => self.set_simulation_mode(SimulationMode::Running),
+                egui::Key::T if !repeat => self.set_simulation_mode(SimulationMode::Stepping),
+                egui::Key::F if !repeat => self.set_simulation_mode(SimulationMode::FastForward),
+                egui::Key::P if !repeat => self.set_simulation_mode(SimulationMode::Paused),
                 egui::Key::Space if !repeat => step_once = true,
                 _ => {}
             }
         }
         step_once
+    }
+}
+
+fn rate_to_interval(rate_hz: f32) -> Duration {
+    if rate_hz <= 0.0 {
+        Duration::ZERO
+    } else {
+        Duration::from_secs_f64(1.0 / rate_hz as f64)
     }
 }
 
@@ -468,7 +608,6 @@ fn seed_demo_words(
     let mut words = vec![0u32; storage_words as usize];
 
     set_gate_seed(gate_store, &mut words, words_per_buffer, GateId(0), true);
-    set_gate_seed(gate_store, &mut words, words_per_buffer, GateId(1), false);
     words
 }
 
@@ -507,19 +646,22 @@ fn build_demo_circuit() -> (Component, ComponentPlans) {
                 Gate::BitNop {
                     src: input_ref(INPUT_B),
                 },
-                Gate::BitAND {
-                    a: this_ref(0),
-                    b: this_ref(1),
-                },
                 Gate::BitXOR {
                     a: this_ref(0),
                     b: this_ref(1),
                 },
+                Gate::BitAND {
+                    a: this_ref(0),
+                    b: this_ref(1),
+                },
+                Gate::BitNot {
+                    src: this_ref(0),
+                },
             ],
             vec![port(INPUT_A, 0, 0, 1), port(INPUT_B, 1, 0, 2)],
-            vec![port(OUTPUT_Y, 2, u16::MAX, 1), port(OUTPUT_Z, 3, u16::MAX, 2)],
+            vec![port(OUTPUT_Y, 2, u16::MAX, 1), port(OUTPUT_Z, 4, u16::MAX, 2)],
         )
-        .with_grid_size([2, 2]),
+        .with_grid_size([3, 2]),
         vec![],
     );
 
@@ -527,8 +669,12 @@ fn build_demo_circuit() -> (Component, ComponentPlans) {
         plans.insert(
             ComponentPlan::with_ports(
                 vec![
+                    Gate::BitNot { src: this_ref(0) },
                     Gate::BitNop { src: this_ref(0) },
-                    Gate::BitNop { src: this_ref(1) },
+                    Gate::BitXOR {
+                        a: this_ref(0),
+                        b: this_ref(1),
+                    },
                     Gate::BitNop {
                         src: child_output_ref(0, OUTPUT_Y),
                     },
@@ -538,21 +684,19 @@ fn build_demo_circuit() -> (Component, ComponentPlans) {
                     Gate::BitNop {
                         src: child_output_ref(0, OUTPUT_Z),
                     },
+                    Gate::BitOR {
+                        a: this_ref(2),
+                        b: this_ref(5),
+                    },
                 ],
                 vec![],
-                vec![port(OUTPUT_Z, 4, u16::MAX, u16::MAX)],
+                vec![
+                    port(OUTPUT_Y, 3, u16::MAX, 1),
+                    port(OUTPUT_Z, 6, u16::MAX, 3),
+                ],
             )
-            .with_grid_size([4, 4])
-            .with_child_placements(vec![ChildPlacement {
-                min: PortLocation {
-                    x: u16::MAX / 2,
-                    y: 0,
-                },
-                max: PortLocation {
-                    x: u16::MAX,
-                    y: u16::MAX / 2,
-                },
-            }]),
+            .with_grid_size([5, 5])
+            .with_child_placements(vec![ChildPlacement::normalized([0.56, 0.44], [0.94, 0.90])]),
         ),
         vec![child],
         vec![

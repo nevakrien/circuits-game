@@ -8,25 +8,13 @@ use crate::gate_plans::{
     ChildId, ChildPlacement, CompileError, Component, ComponentPlans, Gate, GateId,
     GateStoreLocation, NodeId, PortId, PortLocation, SignalRef,
 };
-
-const PANEL_BG: Color32 = Color32::from_rgb(15, 18, 25);
-const GRID_BG: Color32 = Color32::from_rgb(21, 26, 35);
-const GRID_LINE: Color32 = Color32::from_rgb(53, 64, 83);
-const GATE_OFF: Color32 = Color32::from_rgb(50, 59, 74);
-const GATE_ON: Color32 = Color32::from_rgb(53, 179, 118);
-const GATE_STROKE: Color32 = Color32::from_rgb(118, 132, 156);
-const GATE_PORT_FILL: Color32 = Color32::from_rgb(244, 191, 117);
-const GATE_PORT_STROKE: Color32 = Color32::from_rgb(255, 234, 196);
-const PORT_COLOR: Color32 = Color32::from_rgb(115, 173, 255);
-const CHILD_COLOR: Color32 = Color32::from_rgb(237, 169, 97);
-const ANCESTOR_COLOR: Color32 = Color32::from_rgb(205, 138, 255);
-
-const PAD: f32 = 24.0;
-const CELL: f32 = 88.0;
-const GRID_STROKE: f32 = 1.0;
-const PORT_RADIUS: f32 = 5.0;
-const CHILD_BG: Color32 = Color32::from_rgb(36, 43, 57);
-const CHILD_ZOOM_PREVIEW: f32 = 1.6;
+use crate::ui_config::{
+    ANCESTOR_COLOR, CELL, CHILD_BG, CHILD_INPUT_COLOR, CHILD_OUTPUT_COLOR, CHILD_PORT_INSET,
+    CHILD_ZOOM_PREVIEW, GATE_INPUT_FILL, GATE_INPUT_STROKE, GATE_OFF, GATE_ON, GATE_OUTPUT_FILL,
+    GATE_OUTPUT_STROKE, GATE_STROKE, GRID_BG, GRID_LINE, GRID_STROKE, INPUT_PORT_COLOR,
+    MAX_PULSE_CYCLES_PER_SECOND, MIN_PULSE_CYCLES_PER_SECOND, OUTPUT_PORT_COLOR, PAD, PANEL_BG,
+    PORT_RADIUS, PULSE_CYCLES_PER_TICK,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ViewportState {
@@ -392,6 +380,7 @@ pub fn show_focused_scene(
     scene: &FocusedScene,
     read_words: &[u32],
     time: f64,
+    pulse_rate_hz: f32,
     viewport: &mut ViewportState,
 ) -> Option<SceneAction> {
     let available = ui.available_size_before_wrap();
@@ -399,7 +388,7 @@ pub fn show_focused_scene(
     let painter = ui.painter_at(rect);
 
     if response.dragged_by(PointerButton::Middle) || response.dragged_by(PointerButton::Primary) {
-        viewport.pan += response.drag_delta();
+        viewport.pan += ui.ctx().input(|input| input.pointer.delta());
     }
     if response.hovered() {
         let zoom_delta = ui.ctx().input(|input| input.zoom_delta());
@@ -464,15 +453,16 @@ pub fn show_focused_scene(
             scene,
             read_words,
             time,
+            pulse_rate_hz,
             &screen,
             viewport.zoom,
         );
     }
     for port in &scene.input_ports {
-        paint_port(&painter, port, PORT_COLOR, &screen, viewport.zoom);
+        paint_port(&painter, port, INPUT_PORT_COLOR, &screen, viewport.zoom);
     }
     for port in &scene.output_ports {
-        paint_port(&painter, port, PORT_COLOR, &screen, viewport.zoom);
+        paint_port(&painter, port, OUTPUT_PORT_COLOR, &screen, viewport.zoom);
     }
     for port in &scene.ancestor_ports {
         paint_external_port(&painter, port, ANCESTOR_COLOR, &screen, viewport.zoom);
@@ -480,10 +470,10 @@ pub fn show_focused_scene(
 
     for child in &scene.children {
         for port in &child.inputs {
-            paint_port(&painter, port, CHILD_COLOR, &screen, viewport.zoom);
+            paint_port(&painter, port, CHILD_INPUT_COLOR, &screen, viewport.zoom);
         }
         for port in &child.outputs {
-            paint_port(&painter, port, CHILD_COLOR, &screen, viewport.zoom);
+            paint_port(&painter, port, CHILD_OUTPUT_COLOR, &screen, viewport.zoom);
         }
     }
 
@@ -545,10 +535,10 @@ fn paint_gate<F: Fn(Rect) -> Rect>(
 
     for input in gate.gate.input_refs().into_iter().flatten().enumerate() {
         let anchor = screen(gate_anchor(gate.rect, gate.gate, Some(input.0)));
-        paint_gate_port_marker(painter, anchor, zoom);
+        paint_gate_input_marker(painter, anchor, zoom);
     }
     let output_anchor = screen(gate_anchor(gate.rect, gate.gate, None));
-    paint_gate_port_marker(painter, output_anchor, zoom);
+    paint_gate_output_marker(painter, output_anchor, zoom);
 }
 
 fn paint_child<F: Fn(Rect) -> Rect>(
@@ -562,7 +552,7 @@ fn paint_child<F: Fn(Rect) -> Rect>(
         rect,
         10.0,
         CHILD_BG,
-        Stroke::new(1.5, CHILD_COLOR),
+        Stroke::new(1.5, CHILD_INPUT_COLOR),
         StrokeKind::Outside,
     );
     painter.text(
@@ -611,10 +601,16 @@ fn paint_port<F: Fn(Pos2) -> Pos2>(
     );
 }
 
-fn paint_gate_port_marker(painter: &Painter, anchor: Pos2, zoom: f32) {
+fn paint_gate_input_marker(painter: &Painter, anchor: Pos2, zoom: f32) {
     let radius = 5.5 * zoom.clamp(0.75, 1.35);
-    painter.circle_filled(anchor, radius, GATE_PORT_FILL);
-    painter.circle_stroke(anchor, radius, Stroke::new(1.4, GATE_PORT_STROKE));
+    painter.circle_filled(anchor, radius, GATE_INPUT_FILL);
+    painter.circle_stroke(anchor, radius, Stroke::new(1.4, GATE_INPUT_STROKE));
+}
+
+fn paint_gate_output_marker(painter: &Painter, anchor: Pos2, zoom: f32) {
+    let radius = 5.5 * zoom.clamp(0.75, 1.35);
+    painter.circle_filled(anchor, radius, GATE_OUTPUT_FILL);
+    painter.circle_stroke(anchor, radius, Stroke::new(1.4, GATE_OUTPUT_STROKE));
 }
 
 fn paint_external_port<F: Fn(Pos2) -> Pos2>(
@@ -641,6 +637,7 @@ fn paint_wire<F: Fn(Pos2) -> Pos2>(
     scene: &FocusedScene,
     read_words: &[u32],
     time: f64,
+    pulse_rate_hz: f32,
     screen: &F,
     zoom: f32,
 ) {
@@ -660,8 +657,9 @@ fn paint_wire<F: Fn(Pos2) -> Pos2>(
     ));
     if active {
         let count = ((polyline_length(&points) / 90.0).ceil() as usize).max(2);
+        let pulse_cycles = pulse_cycles_per_second(pulse_rate_hz);
         for i in 0..count {
-            let phase = ((time as f32 * 0.28) + i as f32 / count as f32).fract();
+            let phase = ((time as f32 * pulse_cycles) + i as f32 / count as f32).fract();
             painter.circle_filled(
                 point_along_polyline(&points, phase),
                 4.0 * zoom.clamp(0.7, 1.3),
@@ -669,6 +667,11 @@ fn paint_wire<F: Fn(Pos2) -> Pos2>(
             );
         }
     }
+}
+
+fn pulse_cycles_per_second(pulse_rate_hz: f32) -> f32 {
+    (pulse_rate_hz * PULSE_CYCLES_PER_TICK)
+        .clamp(MIN_PULSE_CYCLES_PER_SECOND, MAX_PULSE_CYCLES_PER_SECOND)
 }
 
 fn grid_anchor_for_port(grid_rect: Rect, location: PortLocation) -> Pos2 {
@@ -689,14 +692,30 @@ fn grid_anchor_for_port(grid_rect: Rect, location: PortLocation) -> Pos2 {
 }
 
 fn child_port_anchor(child_rect: Rect, location: PortLocation) -> Pos2 {
-    grid_anchor_for_port(child_rect, location)
+    let mut anchor = grid_anchor_for_port(child_rect, location);
+    if location.x == 0 {
+        anchor.x += CHILD_PORT_INSET;
+    } else if location.x == u16::MAX {
+        anchor.x -= CHILD_PORT_INSET;
+    }
+    if location.y == 0 {
+        anchor.y += CHILD_PORT_INSET;
+    } else if location.y == u16::MAX {
+        anchor.y -= CHILD_PORT_INSET;
+    }
+    anchor
 }
 
 fn child_rect_from_placement(grid_rect: Rect, placement: ChildPlacement) -> Rect {
-    Rect::from_min_max(
-        grid_anchor_for_port(grid_rect, placement.min),
-        grid_anchor_for_port(grid_rect, placement.max),
-    )
+    let min = Pos2::new(
+        grid_rect.left() + grid_rect.width() * placement.min[0].clamp(0.0, 1.0),
+        grid_rect.top() + grid_rect.height() * placement.min[1].clamp(0.0, 1.0),
+    );
+    let max = Pos2::new(
+        grid_rect.left() + grid_rect.width() * placement.max[0].clamp(0.0, 1.0),
+        grid_rect.top() + grid_rect.height() * placement.max[1].clamp(0.0, 1.0),
+    );
+    Rect::from_min_max(min, max)
 }
 
 fn child_preview_gates(rect: Rect, plan: &crate::gate_plans::ComponentPlan) -> Vec<PlacedGate> {

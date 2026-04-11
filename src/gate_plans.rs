@@ -45,20 +45,21 @@ pub struct ComponentPort {
     pub location: PortLocation,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ChildPlacement {
-    pub min: PortLocation,
-    pub max: PortLocation,
+    pub min: [f32; 2],
+    pub max: [f32; 2],
 }
 
 impl ChildPlacement {
     pub const ONE_CELL: Self = Self {
-        min: PortLocation { x: 0, y: 0 },
-        max: PortLocation {
-            x: u16::MAX / 4,
-            y: u16::MAX / 4,
-        },
+        min: [0.0, 0.0],
+        max: [0.25, 0.25],
     };
+
+    pub const fn normalized(min: [f32; 2], max: [f32; 2]) -> Self {
+        Self { min, max }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
