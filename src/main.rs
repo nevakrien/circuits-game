@@ -5,9 +5,8 @@ use std::{
 
 use circuits_game::{
     gate_plans::{
-        compile_component_tree, ChildId, ChildInputConnection, ChildPlacement, Component,
-        ComponentPlan, ComponentPlans, ComponentPort, Gate, GateId, PortId, PortLocation,
-        SignalRef,
+        ChildId, ChildInputConnection, ChildPlacement, Component, ComponentPlan, ComponentPlans,
+        ComponentPort, Gate, GateId, PortId, PortLocation, SignalRef, compile_component_tree,
     },
     kernel::{GateKernel, UploadedGpuPlan},
     setup,
@@ -16,8 +15,8 @@ use circuits_game::{
         STEP_RATE_FACTOR,
     },
     visual_ui::{
-        build_focused_scene, child_ids_of, parent_stack_to, show_focused_scene, FocusedScene,
-        SceneAction, ViewportState,
+        FocusedScene, SceneAction, ViewportState, build_focused_scene, child_ids_of,
+        parent_stack_to, show_focused_scene,
     },
 };
 use egui_wgpu::wgpu;
@@ -47,7 +46,8 @@ async fn run() {
     let queue = &gpu.queue;
 
     let (root, plans) = build_demo_circuit();
-    let mut runtime = DemoRuntime::new(device, queue, root, plans).expect("demo runtime should build");
+    let mut runtime =
+        DemoRuntime::new(device, queue, root, plans).expect("demo runtime should build");
     let mut read_words = runtime.read_words(device, queue);
     let mut viewer = ViewerState::new(&runtime).expect("viewer should build initial scene");
     let animation_started_at = Instant::now();
@@ -61,11 +61,8 @@ async fn run() {
         window.theme(),
         None,
     );
-    let mut egui_renderer = egui_wgpu::Renderer::new(
-        device,
-        config.format,
-        egui_wgpu::RendererOptions::default(),
-    );
+    let mut egui_renderer =
+        egui_wgpu::Renderer::new(device, config.format, egui_wgpu::RendererOptions::default());
     window.request_redraw();
 
     let _ = event_loop.run(|event, target| match event {
@@ -296,7 +293,10 @@ struct DemoRuntime {
     storage_words: u32,
     root: Component,
     plans: ComponentPlans,
-    gate_store: foldhash::HashMap<(circuits_game::gate_plans::NodeId, GateId), circuits_game::gate_plans::GateStoreLocation>,
+    gate_store: foldhash::HashMap<
+        (circuits_game::gate_plans::NodeId, GateId),
+        circuits_game::gate_plans::GateStoreLocation,
+    >,
     words_per_buffer: u32,
     tick: u64,
 }
@@ -333,7 +333,8 @@ impl DemoRuntime {
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
         });
-        let write_buffer = GateKernel::create_io_buffer(device, storage_words, "viewer-read-buffer-1");
+        let write_buffer =
+            GateKernel::create_io_buffer(device, storage_words, "viewer-read-buffer-1");
         let output_buffer = GateKernel::create_io_buffer(
             device,
             compiled.gpu_plan.output_words,
@@ -601,7 +602,10 @@ fn rate_to_interval(rate_hz: f32) -> Duration {
 }
 
 fn seed_demo_words(
-    gate_store: &foldhash::HashMap<(circuits_game::gate_plans::NodeId, GateId), circuits_game::gate_plans::GateStoreLocation>,
+    gate_store: &foldhash::HashMap<
+        (circuits_game::gate_plans::NodeId, GateId),
+        circuits_game::gate_plans::GateStoreLocation,
+    >,
     words_per_buffer: u32,
     storage_words: u32,
 ) -> Vec<u32> {
@@ -612,15 +616,19 @@ fn seed_demo_words(
 }
 
 fn set_gate_seed(
-    gate_store: &foldhash::HashMap<(circuits_game::gate_plans::NodeId, GateId), circuits_game::gate_plans::GateStoreLocation>,
+    gate_store: &foldhash::HashMap<
+        (circuits_game::gate_plans::NodeId, GateId),
+        circuits_game::gate_plans::GateStoreLocation,
+    >,
     words: &mut [u32],
     words_per_buffer: u32,
     gate: GateId,
     value: bool,
 ) {
-    let Some((&(node, _gate), store)) = gate_store.iter().find(|((node, candidate), _)| {
-        node.0 == 0 && *candidate == gate
-    }) else {
+    let Some((&(node, _gate), store)) = gate_store
+        .iter()
+        .find(|((node, candidate), _)| node.0 == 0 && *candidate == gate)
+    else {
         return;
     };
     let _ = node;
@@ -654,12 +662,13 @@ fn build_demo_circuit() -> (Component, ComponentPlans) {
                     a: this_ref(0),
                     b: this_ref(1),
                 },
-                Gate::BitNot {
-                    src: this_ref(0),
-                },
+                Gate::BitNot { src: this_ref(0) },
             ],
             vec![port(INPUT_A, 0, 0, 1), port(INPUT_B, 1, 0, 2)],
-            vec![port(OUTPUT_Y, 2, u16::MAX, 1), port(OUTPUT_Z, 4, u16::MAX, 2)],
+            vec![
+                port(OUTPUT_Y, 2, u16::MAX, 1),
+                port(OUTPUT_Z, 4, u16::MAX, 2),
+            ],
         )
         .with_grid_size([3, 2]),
         vec![],
@@ -696,7 +705,7 @@ fn build_demo_circuit() -> (Component, ComponentPlans) {
                 ],
             )
             .with_grid_size([5, 5])
-            .with_child_placements(vec![ChildPlacement::normalized([0.56, 0.44], [0.94, 0.90])]),
+            .with_child_placements(vec![ChildPlacement::at([2, 2])]),
         ),
         vec![child],
         vec![

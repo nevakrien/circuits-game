@@ -47,18 +47,14 @@ pub struct ComponentPort {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ChildPlacement {
-    pub min: [f32; 2],
-    pub max: [f32; 2],
+    pub min: [u32; 2],
 }
 
 impl ChildPlacement {
-    pub const ONE_CELL: Self = Self {
-        min: [0.0, 0.0],
-        max: [0.25, 0.25],
-    };
+    pub const ONE_CELL: Self = Self { min: [0, 0] };
 
-    pub const fn normalized(min: [f32; 2], max: [f32; 2]) -> Self {
-        Self { min, max }
+    pub const fn at(min: [u32; 2]) -> Self {
+        Self { min }
     }
 }
 
@@ -604,13 +600,13 @@ fn gate_store_map(compiler: &GateCompiler) -> HashMap<(NodeId, GateId), GateStor
         .bits
         .iter()
         .map(|(&(node, gate), &bit_index)| {
-            let bit_in_word = (bit_index.1 .0 % 32) as u8;
+            let bit_in_word = (bit_index.1.0 % 32) as u8;
             (
                 (node, gate),
                 GateStoreLocation {
                     buffer: bit_index.0,
                     bit: bit_index.1,
-                    word_byte_offset: (bit_index.1 .0 >> 5) << 2,
+                    word_byte_offset: (bit_index.1.0 >> 5) << 2,
                     bit_in_word,
                 },
             )
@@ -678,7 +674,7 @@ fn lower_basic_gate_groups(
                 None => src_a,
             };
 
-            let tgt_word_byte_offset = (dst.1 .0 >> 5) << 2;
+            let tgt_word_byte_offset = (dst.1.0 >> 5) << 2;
             grouped
                 .entry(dst.0)
                 .or_default()
@@ -686,7 +682,7 @@ fn lower_basic_gate_groups(
                 .or_default()
                 .push(BasicGateInstruction {
                     op: BasicGateOp::from_gate(gate),
-                    dst_bit_in_word: Bits(dst.1 .0 % 32),
+                    dst_bit_in_word: Bits(dst.1.0 % 32),
                     src_a,
                     src_b,
                 });
@@ -753,7 +749,7 @@ fn lower_basic_gate_groups(
                 None => src_a,
             };
 
-            let tgt_word_byte_offset = (dst.1 .0 >> 5) << 2;
+            let tgt_word_byte_offset = (dst.1.0 >> 5) << 2;
             grouped
                 .entry(dst.0)
                 .or_default()
@@ -761,7 +757,7 @@ fn lower_basic_gate_groups(
                 .or_default()
                 .push(BasicGateInstruction {
                     op: BasicGateOp::from_gate(gate),
-                    dst_bit_in_word: Bits(dst.1 .0 % 32),
+                    dst_bit_in_word: Bits(dst.1.0 % 32),
                     src_a,
                     src_b,
                 });
@@ -1790,7 +1786,7 @@ mod tests {
 
         assert_eq!(info.outline.layout, CompileLayout::Inline);
         assert_eq!(info.self_bits.len(), 40);
-        assert!(info.self_bits.iter().all(|bit| bit.1 .0 < 32));
+        assert!(info.self_bits.iter().all(|bit| bit.1.0 < 32));
         assert!(
             info.self_bits
                 .iter()

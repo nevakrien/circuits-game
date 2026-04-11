@@ -52,6 +52,7 @@ pub struct FocusedScene {
 pub struct PlacedPort {
     pub id: PortId,
     pub anchor: Pos2,
+    pub location: PortLocation,
     pub label: String,
 }
 
@@ -69,7 +70,7 @@ pub struct PlacedChild {
     pub rect: Rect,
     pub inputs: Vec<PlacedPort>,
     pub outputs: Vec<PlacedPort>,
-    pub preview_gates: Vec<PlacedGate>,
+    pub scene: Box<FocusedScene>,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +113,17 @@ pub fn build_focused_scene(
     words_per_buffer: u32,
 ) -> Result<FocusedScene, CompileError> {
     let by_id = collect_components(root);
+    build_focused_scene_with_index(root, plans, focused, gate_store, words_per_buffer, &by_id)
+}
+
+fn build_focused_scene_with_index(
+    root: &Component,
+    plans: &ComponentPlans,
+    focused: NodeId,
+    gate_store: &HashMap<(NodeId, GateId), GateStoreLocation>,
+    words_per_buffer: u32,
+    by_id: &HashMap<NodeId, &Component>,
+) -> Result<FocusedScene, CompileError> {
     let focus = by_id
         .get(&focused)
         .copied()
@@ -129,7 +141,8 @@ pub fn build_focused_scene(
         .iter()
         .map(|port| PlacedPort {
             id: port.id,
-            anchor: grid_anchor_for_port(grid_rect, port.location),
+            anchor: grid_anchor_for_port(grid_rect, grid_dims, port.location),
+            location: port.location,
             label: format!("in {}", port.id.0),
         })
         .collect();
@@ -138,7 +151,8 @@ pub fn build_focused_scene(
         .iter()
         .map(|port| PlacedPort {
             id: port.id,
-            anchor: grid_anchor_for_port(grid_rect, port.location),
+            anchor: grid_anchor_for_port(grid_rect, grid_dims, port.location),
+            location: port.location,
             label: format!("out {}", port.id.0),
         })
         .collect();
@@ -165,21 +179,25 @@ pub fn build_focused_scene(
         .children
         .iter()
         .enumerate()
-        .filter_map(|(child_i, child)| {
+        .map(|(child_i, child)| {
             let child_id = ChildId(child_i as u32);
-            let child_plan = plans.get(child.plan)?;
+            let child_plan = plans
+                .get(child.plan)
+                .ok_or(CompileError::MissingPlan(child.plan))?;
             let placement = plan
                 .child_placements
                 .get(child_i)
                 .copied()
                 .unwrap_or(ChildPlacement::ONE_CELL);
-            let rect = child_rect_from_placement(grid_rect, placement);
+            let rect =
+                child_rect_from_placement(grid_rect, grid_dims, child_plan.grid_size, placement);
             let inputs = child_plan
                 .inputs
                 .iter()
                 .map(|port| PlacedPort {
                     id: port.id,
-                    anchor: child_port_anchor(rect, port.location),
+                    anchor: child_port_anchor(rect, child_plan.grid_size, port.location),
+                    location: port.location,
                     label: format!("in {}", port.id.0),
                 })
                 .collect();
@@ -188,21 +206,29 @@ pub fn build_focused_scene(
                 .iter()
                 .map(|port| PlacedPort {
                     id: port.id,
-                    anchor: child_port_anchor(rect, port.location),
+                    anchor: child_port_anchor(rect, child_plan.grid_size, port.location),
+                    location: port.location,
                     label: format!("out {}", port.id.0),
                 })
                 .collect();
-            let preview_gates = child_preview_gates(rect, child_plan);
-            Some(PlacedChild {
+            let scene = build_focused_scene_with_index(
+                root,
+                plans,
+                child.id,
+                gate_store,
+                words_per_buffer,
+                by_id,
+            )?;
+            Ok(PlacedChild {
                 id: child_id,
                 node: child.id,
                 rect,
                 inputs,
                 outputs,
-                preview_gates,
+                scene: Box::new(scene),
             })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
 
     let parent_stack = parent_stack_to(root, focused).unwrap_or_default();
     let ancestor_ports = parent_stack
@@ -405,38 +431,20 @@ pub fn show_focused_scene(
         StrokeKind::Outside,
     );
 
-    let screen = |p: Pos2| rect.min + viewport.pan + p.to_vec2() * viewport.zoom;
-    let screen_rect = |r: Rect| Rect::from_min_max(screen(r.min), screen(r.max));
-
-    paint_grid(
+    let camera = Camera::new(Pos2::ZERO, rect.min + viewport.pan, viewport.zoom);
+    paint_scene(
         &painter,
-        screen_rect(scene.grid_rect),
-        scene.grid_dims,
-        viewport.zoom,
-    );
-    painter.text(
-        screen(Pos2::new(PAD, 8.0)),
-        Align2::LEFT_TOP,
-        &scene.title,
-        FontId::proportional(20.0 * viewport.zoom.clamp(0.8, 1.2)),
-        Color32::WHITE,
+        scene,
+        read_words,
+        time,
+        pulse_rate_hz,
+        &camera,
+        ScenePaintOptions::top_level(),
     );
 
-    for gate in &scene.gates {
-        paint_gate(
-            &painter,
-            gate,
-            scene,
-            read_words,
-            &screen,
-            &screen_rect,
-            viewport.zoom,
-        );
-    }
     let mut action = None;
     for child in &scene.children {
-        paint_child(&painter, child, &screen_rect, viewport.zoom);
-        let child_hit = screen_rect(child.rect);
+        let child_hit = camera.rect(child.rect);
         let response = ui.interact(
             child_hit,
             ui.make_persistent_id((scene.node.0, child.node.0, "child-rect")),
@@ -446,41 +454,155 @@ pub fn show_focused_scene(
             action = Some(SceneAction::FocusChild(child.node));
         }
     }
+    action
+}
+
+#[derive(Clone, Copy)]
+struct ScenePaintOptions {
+    show_title: bool,
+    show_component_ports: bool,
+    show_ancestor_ports: bool,
+    show_child_ports: bool,
+    show_child_port_labels: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Camera {
+    source_min: Pos2,
+    screen_min: Pos2,
+    scale: f32,
+}
+
+impl Camera {
+    fn new(source_min: Pos2, screen_min: Pos2, scale: f32) -> Self {
+        Self {
+            source_min,
+            screen_min,
+            scale,
+        }
+    }
+
+    fn fit(source: Rect, target: Rect) -> Self {
+        let scale = (target.width() / source.width().max(f32::EPSILON))
+            .min(target.height() / source.height().max(f32::EPSILON));
+        let fitted_size = source.size() * scale;
+        let screen_min = target.center() - fitted_size * 0.5;
+        Self::new(source.min, screen_min, scale)
+    }
+
+    fn pos(&self, pos: Pos2) -> Pos2 {
+        self.screen_min + (pos - self.source_min) * self.scale
+    }
+
+    fn rect(&self, rect: Rect) -> Rect {
+        Rect::from_min_max(self.pos(rect.min), self.pos(rect.max))
+    }
+}
+
+impl ScenePaintOptions {
+    fn top_level() -> Self {
+        Self {
+            show_title: true,
+            show_component_ports: true,
+            show_ancestor_ports: true,
+            show_child_ports: true,
+            show_child_port_labels: false,
+        }
+    }
+
+    fn nested() -> Self {
+        Self {
+            show_title: false,
+            show_component_ports: false,
+            show_ancestor_ports: false,
+            show_child_ports: true,
+            show_child_port_labels: false,
+        }
+    }
+}
+
+fn paint_scene(
+    painter: &Painter,
+    scene: &FocusedScene,
+    read_words: &[u32],
+    time: f64,
+    pulse_rate_hz: f32,
+    camera: &Camera,
+    options: ScenePaintOptions,
+) {
+    paint_grid(painter, scene.grid_rect, scene.grid_dims, camera);
+
+    if options.show_title {
+        painter.text(
+            camera.pos(Pos2::new(PAD, 8.0)),
+            Align2::LEFT_TOP,
+            &scene.title,
+            FontId::proportional(20.0 * camera.scale.clamp(0.8, 1.2)),
+            Color32::WHITE,
+        );
+    }
+
+    for gate in &scene.gates {
+        paint_gate(painter, gate, scene, read_words, camera);
+    }
+
+    for child in &scene.children {
+        paint_child(painter, child, read_words, time, pulse_rate_hz, camera);
+    }
+
     for wire in &scene.wires {
         paint_wire(
-            &painter,
+            painter,
             wire,
             scene,
             read_words,
             time,
             pulse_rate_hz,
-            &screen,
-            viewport.zoom,
+            camera,
         );
     }
-    for port in &scene.input_ports {
-        paint_port(&painter, port, INPUT_PORT_COLOR, &screen, viewport.zoom);
-    }
-    for port in &scene.output_ports {
-        paint_port(&painter, port, OUTPUT_PORT_COLOR, &screen, viewport.zoom);
-    }
-    for port in &scene.ancestor_ports {
-        paint_external_port(&painter, port, ANCESTOR_COLOR, &screen, viewport.zoom);
-    }
 
-    for child in &scene.children {
-        for port in &child.inputs {
-            paint_port(&painter, port, CHILD_INPUT_COLOR, &screen, viewport.zoom);
+    if options.show_component_ports {
+        for port in &scene.input_ports {
+            paint_port(painter, port, INPUT_PORT_COLOR, camera, true);
         }
-        for port in &child.outputs {
-            paint_port(&painter, port, CHILD_OUTPUT_COLOR, &screen, viewport.zoom);
+        for port in &scene.output_ports {
+            paint_port(painter, port, OUTPUT_PORT_COLOR, camera, true);
         }
     }
 
-    action
+    if options.show_ancestor_ports {
+        for port in &scene.ancestor_ports {
+            paint_external_port(painter, port, ANCESTOR_COLOR, camera);
+        }
+    }
+
+    if options.show_child_ports {
+        for child in &scene.children {
+            for port in &child.inputs {
+                paint_port(
+                    painter,
+                    port,
+                    CHILD_INPUT_COLOR,
+                    camera,
+                    options.show_child_port_labels,
+                );
+            }
+            for port in &child.outputs {
+                paint_port(
+                    painter,
+                    port,
+                    CHILD_OUTPUT_COLOR,
+                    camera,
+                    options.show_child_port_labels,
+                );
+            }
+        }
+    }
 }
 
-fn paint_grid(painter: &Painter, rect: Rect, dims: [u32; 2], zoom: f32) {
+fn paint_grid(painter: &Painter, grid_rect: Rect, dims: [u32; 2], camera: &Camera) {
+    let rect = camera.rect(grid_rect);
     painter.rect(
         rect,
         8.0,
@@ -489,14 +611,24 @@ fn paint_grid(painter: &Painter, rect: Rect, dims: [u32; 2], zoom: f32) {
         StrokeKind::Outside,
     );
     for x in 1..dims[0] {
-        let x = rect.left() + x as f32 * CELL * zoom;
+        let x = camera
+            .pos(Pos2::new(
+                grid_rect.left() + x as f32 * CELL,
+                grid_rect.top(),
+            ))
+            .x;
         painter.line_segment(
             [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
             Stroke::new(GRID_STROKE, GRID_LINE),
         );
     }
     for y in 1..dims[1] {
-        let y = rect.top() + y as f32 * CELL * zoom;
+        let y = camera
+            .pos(Pos2::new(
+                grid_rect.left(),
+                grid_rect.top() + y as f32 * CELL,
+            ))
+            .y;
         painter.line_segment(
             [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
             Stroke::new(GRID_STROKE, GRID_LINE),
@@ -504,16 +636,14 @@ fn paint_grid(painter: &Painter, rect: Rect, dims: [u32; 2], zoom: f32) {
     }
 }
 
-fn paint_gate<F: Fn(Rect) -> Rect>(
+fn paint_gate(
     painter: &Painter,
     gate: &PlacedGate,
     scene: &FocusedScene,
     read_words: &[u32],
-    screen: &impl Fn(Pos2) -> Pos2,
-    screen_rect: &F,
-    zoom: f32,
+    camera: &Camera,
 ) {
-    let rect = screen_rect(gate.rect.shrink(10.0));
+    let rect = camera.rect(gate.rect.shrink(10.0));
     let is_on = scene
         .gate_store
         .get(&(scene.node, gate.id))
@@ -525,29 +655,34 @@ fn paint_gate<F: Fn(Rect) -> Rect>(
         Stroke::new(1.5, GATE_STROKE),
         StrokeKind::Outside,
     );
-    painter.text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        gate.gate.label(),
-        FontId::proportional(15.0 * zoom.clamp(0.8, 1.1)),
-        Color32::WHITE,
-    );
+    let gate_font_size = (15.0 * camera.scale).clamp(6.0, 16.0);
+    if rect.width() >= gate_font_size * 1.9 && rect.height() >= gate_font_size * 1.4 {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            gate.gate.label(),
+            FontId::proportional(gate_font_size),
+            Color32::WHITE,
+        );
+    }
 
     for input in gate.gate.input_refs().into_iter().flatten().enumerate() {
-        let anchor = screen(gate_anchor(gate.rect, gate.gate, Some(input.0)));
-        paint_gate_input_marker(painter, anchor, zoom);
+        let anchor = camera.pos(gate_anchor(gate.rect, gate.gate, Some(input.0)));
+        paint_gate_input_marker(painter, anchor, camera.scale);
     }
-    let output_anchor = screen(gate_anchor(gate.rect, gate.gate, None));
-    paint_gate_output_marker(painter, output_anchor, zoom);
+    let output_anchor = camera.pos(gate_anchor(gate.rect, gate.gate, None));
+    paint_gate_output_marker(painter, output_anchor, camera.scale);
 }
 
-fn paint_child<F: Fn(Rect) -> Rect>(
+fn paint_child(
     painter: &Painter,
     child: &PlacedChild,
-    screen_rect: &F,
-    zoom: f32,
+    read_words: &[u32],
+    time: f64,
+    pulse_rate_hz: f32,
+    camera: &Camera,
 ) {
-    let rect = screen_rect(child.rect.shrink(6.0));
+    let rect = camera.rect(child.rect);
     painter.rect(
         rect,
         10.0,
@@ -555,50 +690,44 @@ fn paint_child<F: Fn(Rect) -> Rect>(
         Stroke::new(1.5, CHILD_INPUT_COLOR),
         StrokeKind::Outside,
     );
-    painter.text(
-        rect.min + Vec2::new(8.0, 8.0),
-        Align2::LEFT_TOP,
-        format!("child {}", child.node.0),
-        FontId::proportional(14.0 * zoom.clamp(0.8, 1.1)),
-        Color32::WHITE,
-    );
-    if zoom >= CHILD_ZOOM_PREVIEW {
-        for gate in &child.preview_gates {
-            let gate_rect = screen_rect(gate.rect.shrink(6.0));
-            painter.rect(
-                gate_rect,
-                6.0,
-                Color32::from_rgb(61, 70, 88),
-                Stroke::new(1.0, Color32::from_rgb(130, 143, 164)),
-                StrokeKind::Outside,
-            );
-            painter.text(
-                gate_rect.center(),
-                Align2::CENTER_CENTER,
-                gate.gate.label(),
-                FontId::proportional(10.0 * zoom.clamp(0.7, 1.0)),
-                Color32::WHITE,
-            );
-        }
+    if camera.scale < CHILD_ZOOM_PREVIEW {
+        return;
     }
+
+    let clip_painter = painter.with_clip_rect(rect);
+    let nested_camera = Camera::fit(child.scene.grid_rect, rect);
+
+    paint_scene(
+        &clip_painter,
+        &child.scene,
+        read_words,
+        time,
+        pulse_rate_hz,
+        &nested_camera,
+        ScenePaintOptions::nested(),
+    );
 }
 
-fn paint_port<F: Fn(Pos2) -> Pos2>(
+fn paint_port(
     painter: &Painter,
     port: &PlacedPort,
     color: Color32,
-    screen: &F,
-    zoom: f32,
+    camera: &Camera,
+    show_label: bool,
 ) {
-    let anchor = screen(port.anchor);
-    painter.circle_filled(anchor, PORT_RADIUS * zoom.clamp(0.7, 1.4), color);
-    painter.text(
-        anchor + Vec2::new(8.0 * zoom, -8.0 * zoom),
-        Align2::LEFT_BOTTOM,
-        &port.label,
-        FontId::monospace(12.0 * zoom.clamp(0.8, 1.0)),
-        Color32::from_rgb(220, 227, 238),
-    );
+    let anchor = camera.pos(port.anchor);
+    painter.circle_filled(anchor, PORT_RADIUS * camera.scale.clamp(0.7, 1.4), color);
+    let font_size = 12.0 * camera.scale;
+    if show_label && font_size >= 8.0 {
+        let (label_offset, align) = port_label_layout(port.location, camera.scale);
+        painter.text(
+            anchor + label_offset,
+            align,
+            &port.label,
+            FontId::monospace(font_size.min(12.0)),
+            Color32::from_rgb(220, 227, 238),
+        );
+    }
 }
 
 fn paint_gate_input_marker(painter: &Painter, anchor: Pos2, zoom: f32) {
@@ -613,33 +742,29 @@ fn paint_gate_output_marker(painter: &Painter, anchor: Pos2, zoom: f32) {
     painter.circle_stroke(anchor, radius, Stroke::new(1.4, GATE_OUTPUT_STROKE));
 }
 
-fn paint_external_port<F: Fn(Pos2) -> Pos2>(
-    painter: &Painter,
-    port: &ExternalPort,
-    color: Color32,
-    screen: &F,
-    zoom: f32,
-) {
-    let anchor = screen(port.anchor);
-    painter.circle_filled(anchor, PORT_RADIUS * zoom.clamp(0.7, 1.4), color);
-    painter.text(
-        anchor + Vec2::new(10.0 * zoom, 0.0),
-        Align2::LEFT_CENTER,
-        &port.label,
-        FontId::monospace(12.0 * zoom.clamp(0.8, 1.0)),
-        Color32::from_rgb(216, 224, 235),
-    );
+fn paint_external_port(painter: &Painter, port: &ExternalPort, color: Color32, camera: &Camera) {
+    let anchor = camera.pos(port.anchor);
+    painter.circle_filled(anchor, PORT_RADIUS * camera.scale.clamp(0.7, 1.4), color);
+    let font_size = 12.0 * camera.scale;
+    if font_size >= 8.0 {
+        painter.text(
+            anchor + Vec2::new(10.0 * camera.scale, 0.0),
+            Align2::LEFT_CENTER,
+            &port.label,
+            FontId::monospace(font_size.min(12.0)),
+            Color32::from_rgb(216, 224, 235),
+        );
+    }
 }
 
-fn paint_wire<F: Fn(Pos2) -> Pos2>(
+fn paint_wire(
     painter: &Painter,
     wire: &VisualWire,
     scene: &FocusedScene,
     read_words: &[u32],
     time: f64,
     pulse_rate_hz: f32,
-    screen: &F,
-    zoom: f32,
+    camera: &Camera,
 ) {
     let active = wire
         .source_gate
@@ -650,10 +775,10 @@ fn paint_wire<F: Fn(Pos2) -> Pos2>(
     } else {
         Color32::from_rgba_unmultiplied(wire.color.r(), wire.color.g(), wire.color.b(), 70)
     };
-    let points: Vec<_> = wire.points.iter().map(|point| screen(*point)).collect();
+    let points: Vec<_> = wire.points.iter().map(|point| camera.pos(*point)).collect();
     painter.add(Shape::line(
         points.clone(),
-        Stroke::new(2.0 * zoom.clamp(0.7, 1.3), color),
+        Stroke::new(2.0 * camera.scale.clamp(0.7, 1.3), color),
     ));
     if active {
         let count = ((polyline_length(&points) / 90.0).ceil() as usize).max(2);
@@ -662,7 +787,7 @@ fn paint_wire<F: Fn(Pos2) -> Pos2>(
             let phase = ((time as f32 * pulse_cycles) + i as f32 / count as f32).fract();
             painter.circle_filled(
                 point_along_polyline(&points, phase),
-                4.0 * zoom.clamp(0.7, 1.3),
+                4.0 * camera.scale.clamp(0.7, 1.3),
                 color,
             );
         }
@@ -674,25 +799,17 @@ fn pulse_cycles_per_second(pulse_rate_hz: f32) -> f32 {
         .clamp(MIN_PULSE_CYCLES_PER_SECOND, MAX_PULSE_CYCLES_PER_SECOND)
 }
 
-fn grid_anchor_for_port(grid_rect: Rect, location: PortLocation) -> Pos2 {
-    let fx = if location.x == u16::MAX {
-        1.0
-    } else {
-        location.x as f32 / u16::MAX as f32
-    };
-    let fy = if location.y == u16::MAX {
-        1.0
-    } else {
-        location.y as f32 / u16::MAX as f32
-    };
+fn grid_anchor_for_port(grid_rect: Rect, grid_dims: [u32; 2], location: PortLocation) -> Pos2 {
+    let fx = port_axis_fraction(location.x, grid_dims[0]);
+    let fy = port_axis_fraction(location.y, grid_dims[1]);
     Pos2::new(
         grid_rect.left() + grid_rect.width() * fx,
         grid_rect.top() + grid_rect.height() * fy,
     )
 }
 
-fn child_port_anchor(child_rect: Rect, location: PortLocation) -> Pos2 {
-    let mut anchor = grid_anchor_for_port(child_rect, location);
+fn child_port_anchor(child_rect: Rect, grid_dims: [u32; 2], location: PortLocation) -> Pos2 {
+    let mut anchor = grid_anchor_for_port(child_rect, grid_dims, location);
     if location.x == 0 {
         anchor.x += CHILD_PORT_INSET;
     } else if location.x == u16::MAX {
@@ -706,38 +823,53 @@ fn child_port_anchor(child_rect: Rect, location: PortLocation) -> Pos2 {
     anchor
 }
 
-fn child_rect_from_placement(grid_rect: Rect, placement: ChildPlacement) -> Rect {
-    let min = Pos2::new(
-        grid_rect.left() + grid_rect.width() * placement.min[0].clamp(0.0, 1.0),
-        grid_rect.top() + grid_rect.height() * placement.min[1].clamp(0.0, 1.0),
-    );
-    let max = Pos2::new(
-        grid_rect.left() + grid_rect.width() * placement.max[0].clamp(0.0, 1.0),
-        grid_rect.top() + grid_rect.height() * placement.max[1].clamp(0.0, 1.0),
-    );
-    Rect::from_min_max(min, max)
+fn port_axis_fraction(value: u16, dim: u32) -> f32 {
+    if value == u16::MAX {
+        return 1.0;
+    }
+
+    let dim = dim.max(1);
+    if value as u32 <= dim {
+        return value as f32 / dim as f32;
+    }
+
+    value as f32 / u16::MAX as f32
 }
 
-fn child_preview_gates(rect: Rect, plan: &crate::gate_plans::ComponentPlan) -> Vec<PlacedGate> {
-    let grid = plan.grid_size;
-    let child_cell_w = rect.width() / grid[0].max(1) as f32;
-    let child_cell_h = rect.height() / grid[1].max(1) as f32;
-    plan.gates
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(index, gate)| {
-            let index = index as u32;
-            let gx = index % grid[0];
-            let gy = index / grid[0];
-            let min = rect.min + Vec2::new(gx as f32 * child_cell_w, gy as f32 * child_cell_h);
-            PlacedGate {
-                id: GateId(index),
-                gate,
-                rect: Rect::from_min_size(min, Vec2::new(child_cell_w, child_cell_h)),
-            }
-        })
-        .collect()
+fn child_rect_from_placement(
+    grid_rect: Rect,
+    grid_dims: [u32; 2],
+    child_dims: [u32; 2],
+    placement: ChildPlacement,
+) -> Rect {
+    const CHILD_FOOTPRINT_FILL: f32 = 0.88;
+
+    let width = child_dims[0].max(1).min(grid_dims[0].max(1));
+    let height = child_dims[1].max(1).min(grid_dims[1].max(1));
+    let max_x = grid_dims[0].saturating_sub(width);
+    let max_y = grid_dims[1].saturating_sub(height);
+    let min_x = placement.min[0].min(max_x);
+    let min_y = placement.min[1].min(max_y);
+    let min = grid_rect.min + Vec2::new(min_x as f32 * CELL, min_y as f32 * CELL);
+    let footprint = Rect::from_min_size(min, Vec2::new(width as f32 * CELL, height as f32 * CELL));
+    let scaled_size = footprint.size() * CHILD_FOOTPRINT_FILL;
+    Rect::from_center_size(footprint.center(), scaled_size)
+}
+
+fn port_label_layout(location: PortLocation, zoom: f32) -> (Vec2, Align2) {
+    let dx = 8.0 * zoom;
+    let dy = 8.0 * zoom;
+    if location.x == 0 {
+        (Vec2::new(dx, 0.0), Align2::LEFT_CENTER)
+    } else if location.x == u16::MAX {
+        (Vec2::new(-dx, 0.0), Align2::RIGHT_CENTER)
+    } else if location.y == 0 {
+        (Vec2::new(0.0, dy), Align2::CENTER_TOP)
+    } else if location.y == u16::MAX {
+        (Vec2::new(0.0, -dy), Align2::CENTER_BOTTOM)
+    } else {
+        (Vec2::new(dx, -dy), Align2::LEFT_BOTTOM)
+    }
 }
 
 fn gate_anchor(rect: Rect, gate: Gate, input: Option<usize>) -> Pos2 {
