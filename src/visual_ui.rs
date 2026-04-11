@@ -3,6 +3,7 @@ use egui::{
     Ui, Vec2,
 };
 use foldhash::HashMap;
+use std::sync::Arc;
 
 use crate::gate_plans::{
     ChildId, ChildPlacement, CompileError, Component, ComponentPlans, Gate, GateId,
@@ -38,7 +39,7 @@ pub struct FocusedScene {
     pub title: String,
     pub bounds: Rect,
     pub words_per_buffer: u32,
-    pub gate_store: HashMap<(NodeId, GateId), GateStoreLocation>,
+    pub gate_store: Arc<HashMap<(NodeId, GateId), GateStoreLocation>>,
     pub grid_rect: Rect,
     pub grid_dims: [u32; 2],
     pub input_ports: Vec<PlacedPort>,
@@ -113,20 +114,29 @@ pub fn build_focused_scene(
     root: &Component,
     plans: &ComponentPlans,
     focused: NodeId,
-    gate_store: &HashMap<(NodeId, GateId), GateStoreLocation>,
+    gate_store: Arc<HashMap<(NodeId, GateId), GateStoreLocation>>,
     words_per_buffer: u32,
 ) -> Result<FocusedScene, CompileError> {
     let by_id = collect_components(root);
-    build_focused_scene_with_index(root, plans, focused, gate_store, words_per_buffer, &by_id)
+    build_focused_scene_with_index(
+        root,
+        plans,
+        focused,
+        gate_store,
+        words_per_buffer,
+        &by_id,
+        1,
+    )
 }
 
 fn build_focused_scene_with_index(
     root: &Component,
     plans: &ComponentPlans,
     focused: NodeId,
-    gate_store: &HashMap<(NodeId, GateId), GateStoreLocation>,
+    gate_store: Arc<HashMap<(NodeId, GateId), GateStoreLocation>>,
     words_per_buffer: u32,
     by_id: &HashMap<NodeId, &Component>,
+    preview_depth: usize,
 ) -> Result<FocusedScene, CompileError> {
     let focus = by_id
         .get(&focused)
@@ -192,62 +202,71 @@ fn build_focused_scene_with_index(
         })
         .collect::<Vec<_>>();
 
-    let children = focus
-        .children
-        .iter()
-        .enumerate()
-        .map(|(child_i, child)| {
-            let child_id = ChildId(child_i as u32);
-            let child_plan = plans
-                .get(child.plan)
-                .ok_or(CompileError::MissingPlan(child.plan))?;
-            let placement = plan
-                .child_placements
-                .get(child_i)
-                .copied()
-                .unwrap_or(ChildPlacement::ONE_CELL);
-            let rect =
-                child_rect_from_placement(grid_rect, grid_dims, child_plan.grid_size, placement);
-            let inputs = child_plan
-                .inputs
-                .iter()
-                .map(|port| PlacedPort {
-                    id: port.id,
-                    source_gate: (child.id, port.gate),
-                    anchor: child_port_anchor(rect, child_plan.grid_size, port.location),
-                    location: port.location,
-                    label: port.label.unwrap_or_default().to_owned(),
+    let children = if preview_depth == 0 {
+        Vec::new()
+    } else {
+        focus
+            .children
+            .iter()
+            .enumerate()
+            .map(|(child_i, child)| {
+                let child_id = ChildId(child_i as u32);
+                let child_plan = plans
+                    .get(child.plan)
+                    .ok_or(CompileError::MissingPlan(child.plan))?;
+                let placement = plan
+                    .child_placements
+                    .get(child_i)
+                    .copied()
+                    .unwrap_or(ChildPlacement::ONE_CELL);
+                let rect = child_rect_from_placement(
+                    grid_rect,
+                    grid_dims,
+                    child_plan.grid_size,
+                    placement,
+                );
+                let inputs = child_plan
+                    .inputs
+                    .iter()
+                    .map(|port| PlacedPort {
+                        id: port.id,
+                        source_gate: (child.id, port.gate),
+                        anchor: child_port_anchor(rect, child_plan.grid_size, port.location),
+                        location: port.location,
+                        label: port.label.unwrap_or_default().to_owned(),
+                    })
+                    .collect();
+                let outputs = child_plan
+                    .outputs
+                    .iter()
+                    .map(|port| PlacedPort {
+                        id: port.id,
+                        source_gate: (child.id, port.gate),
+                        anchor: child_port_anchor(rect, child_plan.grid_size, port.location),
+                        location: port.location,
+                        label: port.label.unwrap_or_default().to_owned(),
+                    })
+                    .collect();
+                let scene = build_focused_scene_with_index(
+                    root,
+                    plans,
+                    child.id,
+                    gate_store.clone(),
+                    words_per_buffer,
+                    by_id,
+                    preview_depth - 1,
+                )?;
+                Ok(PlacedChild {
+                    id: child_id,
+                    node: child.id,
+                    rect,
+                    inputs,
+                    outputs,
+                    scene: Box::new(scene),
                 })
-                .collect();
-            let outputs = child_plan
-                .outputs
-                .iter()
-                .map(|port| PlacedPort {
-                    id: port.id,
-                    source_gate: (child.id, port.gate),
-                    anchor: child_port_anchor(rect, child_plan.grid_size, port.location),
-                    location: port.location,
-                    label: port.label.unwrap_or_default().to_owned(),
-                })
-                .collect();
-            let scene = build_focused_scene_with_index(
-                root,
-                plans,
-                child.id,
-                gate_store,
-                words_per_buffer,
-                by_id,
-            )?;
-            Ok(PlacedChild {
-                id: child_id,
-                node: child.id,
-                rect,
-                inputs,
-                outputs,
-                scene: Box::new(scene),
             })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()?
+    };
 
     let ancestor_ports = parent_stack
         .last()
@@ -367,7 +386,7 @@ fn build_focused_scene_with_index(
         title: format!("Component {}", focused.0),
         bounds,
         words_per_buffer,
-        gate_store: gate_store.clone(),
+        gate_store,
         grid_rect,
         grid_dims,
         input_ports,
@@ -677,7 +696,7 @@ fn paint_gate(
     let is_on = scene
         .gate_store
         .get(&(scene.node, gate.id))
-        .is_some_and(|store| gate_value(read_manager, *store));
+        .is_some_and(|store| gate_write_value(read_manager, *store));
     painter.rect(
         rect,
         10.0,
@@ -932,8 +951,14 @@ fn child_rect_from_placement(
 ) -> Rect {
     const CHILD_FOOTPRINT_FILL: f32 = 0.88;
 
-    let width = child_dims[0].max(1).min(grid_dims[0].max(1));
-    let height = child_dims[1].max(1).min(grid_dims[1].max(1));
+    let [width, height] = if child_dims[0] >= grid_dims[0] || child_dims[1] >= grid_dims[1] {
+        [(grid_dims[0] / 2).max(1), (grid_dims[1] / 2).max(1)]
+    } else {
+        [
+            child_dims[0].max(1).min(grid_dims[0].max(1)),
+            child_dims[1].max(1).min(grid_dims[1].max(1)),
+        ]
+    };
     let max_x = grid_dims[0].saturating_sub(width);
     let max_y = grid_dims[1].saturating_sub(height);
     let min_x = placement.min[0].min(max_x);
@@ -1174,7 +1199,13 @@ fn collect_components<'a>(root: &'a Component) -> HashMap<NodeId, &'a Component>
 
 fn gate_value(read_manager: &ReadManager, store: GateStoreLocation) -> bool {
     read_manager
-        .get_bit(store.buffer.0, store.bit.0)
+        .get_read_bit(store.buffer.0, store.bit.0)
+        .unwrap_or(false)
+}
+
+fn gate_write_value(read_manager: &ReadManager, store: GateStoreLocation) -> bool {
+    read_manager
+        .get_write_bit(store.buffer.0, store.bit.0)
         .unwrap_or(false)
 }
 

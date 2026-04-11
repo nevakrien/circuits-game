@@ -1,5 +1,5 @@
 use std::{
-    sync::mpsc,
+    sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
 
@@ -15,7 +15,10 @@ use circuits_game::{
         DEFAULT_TICK_RATE, FAST_RATE_FACTOR, MAX_FRAME_STEP_BUDGET, PAUSED_VISUAL_RATE_FACTOR,
         STEP_RATE_FACTOR,
     },
-    visual_ui::{FocusedScene, SceneAction, ViewportState, build_focused_scene, child_ids_of, parent_stack_to, show_focused_scene},
+    visual_ui::{
+        FocusedScene, SceneAction, ViewportState, build_focused_scene, child_ids_of,
+        parent_stack_to, show_focused_scene,
+    },
 };
 use egui_wgpu::wgpu;
 use egui_winit::winit;
@@ -31,6 +34,37 @@ const LABEL_A: &str = "A";
 const LABEL_B: &str = "B";
 const LABEL_SUM: &str = "sum";
 const LABEL_CARRY: &str = "carry";
+const STRESS_GATES_PER_COMPONENT: u32 = 8_192;
+const STRESS_BRANCH_FACTOR: usize = 4;
+const STRESS_DEPTH: u32 = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DemoSceneKind {
+    Starter,
+    Stress,
+}
+
+impl DemoSceneKind {
+    const ALL: [Self; 2] = [Self::Starter, Self::Stress];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Starter => "Starter",
+            Self::Stress => "Stress",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DemoSceneSpec {
+    kind: DemoSceneKind,
+    label: &'static str,
+    component_count: u64,
+    gate_count: u64,
+    nesting_depth: u32,
+    root: Component,
+    plans: ComponentPlans,
+}
 fn main() {
     pollster::block_on(run());
 }
@@ -47,9 +81,8 @@ async fn run() {
     let device = &gpu.device;
     let queue = &gpu.queue;
 
-    let (root, plans) = build_demo_circuit();
-    let mut runtime =
-        DemoRuntime::new(device, queue, root, plans).expect("demo runtime should build");
+    let mut runtime = DemoRuntime::new(device, queue, build_demo_circuit(DemoSceneKind::Starter))
+        .expect("demo runtime should build");
     let mut viewer = ViewerState::new(&runtime).expect("viewer should build initial scene");
     runtime.refresh_read_manager(device, queue, &mut viewer.read_manager);
     let animation_started_at = Instant::now();
@@ -83,6 +116,7 @@ async fn run() {
                 WindowEvent::RedrawRequested => {
                     let raw_input = egui_state.take_egui_input(&window);
                     let step_once = viewer.apply_hotkeys(&raw_input);
+                    let mut requested_scene = None;
                     let now = Instant::now();
                     let scheduled_steps = viewer.scheduled_steps(now);
                     let total_steps = scheduled_steps.saturating_add(u32::from(step_once));
@@ -100,11 +134,31 @@ async fn run() {
                                 ui.heading("Circuit Viewer");
                                 ui.separator();
                                 ui.monospace(format!(
-                                    "read buffer {} | node {} | {} child components | {} wires",
+                                    "{} | read buffer {} | {} logical buffers | node {} | {} child components | {} wires",
+                                    runtime.scene_label,
                                     runtime.current_read,
+                                    runtime.buffer_count,
                                     viewer.focus_node.0,
                                     viewer.child_ids.len(),
                                     viewer.scene.wires.len()
+                                ));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Scene:");
+                                for kind in DemoSceneKind::ALL {
+                                    if ui
+                                        .selectable_label(runtime.scene_kind == kind, kind.label())
+                                        .clicked()
+                                    {
+                                        requested_scene = Some(kind);
+                                    }
+                                }
+                                ui.separator();
+                                ui.monospace(format!(
+                                    "{} comps | {} gates | depth {}",
+                                    runtime.component_count,
+                                    runtime.gate_count,
+                                    runtime.nesting_depth
                                 ));
                             });
                             ui.horizontal(|ui| {
@@ -285,6 +339,14 @@ async fn run() {
                     queue.submit(Some(encoder.finish()));
                     frame.present();
 
+                    if let Some(kind) = requested_scene {
+                        runtime = DemoRuntime::new(device, queue, build_demo_circuit(kind))
+                            .expect("requested demo scene should build");
+                        viewer = ViewerState::new(&runtime)
+                            .expect("viewer should rebuild for requested scene");
+                        runtime.refresh_read_manager(device, queue, &mut viewer.read_manager);
+                    }
+
                     if !response.repaint {
                         window.request_redraw();
                     }
@@ -297,6 +359,12 @@ async fn run() {
 }
 
 struct DemoRuntime {
+    scene_kind: DemoSceneKind,
+    scene_label: &'static str,
+    component_count: u64,
+    gate_count: u64,
+    nesting_depth: u32,
+    buffer_count: u32,
     kernel: GateKernel,
     uploaded: UploadedGpuPlan,
     charge_buffers: [wgpu::Buffer; 2],
@@ -304,9 +372,11 @@ struct DemoRuntime {
     current_read: usize,
     root: Component,
     plans: ComponentPlans,
-    gate_store: foldhash::HashMap<
-        (circuits_game::gate_plans::NodeId, GateId),
-        circuits_game::gate_plans::GateStoreLocation,
+    gate_store: Arc<
+        foldhash::HashMap<
+            (circuits_game::gate_plans::NodeId, GateId),
+            circuits_game::gate_plans::GateStoreLocation,
+        >,
     >,
     words_per_buffer: u32,
     tick: u64,
@@ -316,9 +386,17 @@ impl DemoRuntime {
     fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        mut root: Component,
-        plans: ComponentPlans,
+        scene: DemoSceneSpec,
     ) -> Result<Self, String> {
+        let DemoSceneSpec {
+            kind,
+            label,
+            component_count,
+            gate_count,
+            nesting_depth,
+            mut root,
+            plans,
+        } = scene;
         let compiled = compile_component_tree(&mut root, &plans, BITS_PER_BUFFER)
             .map_err(|error| format!("failed to compile demo circuit: {error:?}"))?;
         let buffer_count = compiled
@@ -360,9 +438,15 @@ impl DemoRuntime {
             charge_buffers: [read_buffer, write_buffer],
             output_buffer,
             current_read: 0,
+            scene_kind: kind,
+            scene_label: label,
+            component_count,
+            gate_count,
+            nesting_depth,
+            buffer_count,
             root,
             plans,
-            gate_store: compiled.gate_store,
+            gate_store: Arc::new(compiled.gate_store),
             words_per_buffer: compiled.gpu_plan.words_per_buffer,
             tick: 0,
         })
@@ -402,68 +486,117 @@ impl DemoRuntime {
         let ranges = read_manager.required_ranges().to_vec();
         let total_words: u32 = ranges.iter().map(|range| range.word_len).sum();
         if total_words == 0 {
-            read_manager.load_ranges(std::iter::empty());
+            read_manager.load_ranges(std::iter::empty(), std::iter::empty());
             return;
         }
 
-        let size = total_words as u64 * std::mem::size_of::<u32>() as u64;
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("viewer-readback"),
-            size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
+        let preview_write = (self.current_read + 1) % self.charge_buffers.len();
+        let mut preview_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("viewer-preview-step"),
         });
-
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("viewer-readback-copy"),
-        });
-        let mut dst_word_offset = 0u64;
-        for range in &ranges {
-            let src_word_offset =
-                (range.buffer * self.words_per_buffer + range.start_word) as u64;
-            let byte_len = range.word_len as u64 * std::mem::size_of::<u32>() as u64;
-            encoder.copy_buffer_to_buffer(
-                &self.charge_buffers[self.current_read],
-                src_word_offset * std::mem::size_of::<u32>() as u64,
-                &readback,
-                dst_word_offset * std::mem::size_of::<u32>() as u64,
-                byte_len,
-            );
-            dst_word_offset += range.word_len as u64;
-        }
-        queue.submit(Some(encoder.finish()));
-
-        let slice = readback.slice(..);
-        let (sender, receiver) = mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = sender.send(result);
-        });
+        self.kernel.encode(
+            device,
+            &mut preview_encoder,
+            &self.uploaded,
+            &self.charge_buffers[self.current_read],
+            &self.charge_buffers[preview_write],
+            &self.output_buffer,
+        );
+        queue.submit(Some(preview_encoder.finish()));
         let _ = device.poll(wgpu::PollType::Wait {
             submission_index: None,
             timeout: None,
         });
-        receiver
-            .recv()
-            .expect("readback channel should receive a result")
-            .expect("readback buffer should map successfully");
 
-        let loaded_ranges = {
-            let mapped = slice.get_mapped_range();
-            let words = bytemuck::cast_slice::<u8, u32>(&mapped);
-            let mut start = 0usize;
-            ranges
-                .into_iter()
-                .map(|range| {
-                    let end = start + range.word_len as usize;
-                    let values = words[start..end].to_vec().into_boxed_slice();
-                    start = end;
-                    (range, values)
-                })
-                .collect::<Vec<_>>()
-        };
-        readback.unmap();
-        read_manager.load_ranges(loaded_ranges);
+        let loaded_read_ranges = read_back_buffer_ranges(
+            device,
+            queue,
+            &self.charge_buffers[self.current_read],
+            &ranges,
+            self.words_per_buffer,
+            "viewer-readback-read",
+            "viewer-readback-read-copy",
+        );
+        let loaded_write_ranges = read_back_buffer_ranges(
+            device,
+            queue,
+            &self.charge_buffers[preview_write],
+            &ranges,
+            self.words_per_buffer,
+            "viewer-readback-write",
+            "viewer-readback-write-copy",
+        );
+        read_manager.load_ranges(loaded_read_ranges, loaded_write_ranges);
     }
+}
+
+fn read_back_buffer_ranges(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    source: &wgpu::Buffer,
+    ranges: &[circuits_game::readback::VisibleBufferRange],
+    words_per_buffer: u32,
+    readback_label: &str,
+    copy_label: &str,
+) -> Vec<(circuits_game::readback::VisibleBufferRange, Box<[u32]>)> {
+    let total_words: u32 = ranges.iter().map(|range| range.word_len).sum();
+    let size = total_words as u64 * std::mem::size_of::<u32>() as u64;
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(readback_label),
+        size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some(copy_label),
+    });
+    let mut dst_word_offset = 0u64;
+    for range in ranges {
+        let src_word_offset = (range.buffer * words_per_buffer + range.start_word) as u64;
+        let byte_len = range.word_len as u64 * std::mem::size_of::<u32>() as u64;
+        encoder.copy_buffer_to_buffer(
+            source,
+            src_word_offset * std::mem::size_of::<u32>() as u64,
+            &readback,
+            dst_word_offset * std::mem::size_of::<u32>() as u64,
+            byte_len,
+        );
+        dst_word_offset += range.word_len as u64;
+    }
+    queue.submit(Some(encoder.finish()));
+
+    let slice = readback.slice(..);
+    let (sender, receiver) = mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
+    });
+    let _ = device.poll(wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    });
+    receiver
+        .recv()
+        .expect("readback channel should receive a result")
+        .expect("readback buffer should map successfully");
+
+    let loaded_ranges = {
+        let mapped = slice.get_mapped_range();
+        let words = bytemuck::cast_slice::<u8, u32>(&mapped);
+        let mut start = 0usize;
+        ranges
+            .iter()
+            .copied()
+            .map(|range| {
+                let end = start + range.word_len as usize;
+                let values = words[start..end].to_vec().into_boxed_slice();
+                start = end;
+                (range, values)
+            })
+            .collect::<Vec<_>>()
+    };
+    readback.unmap();
+    loaded_ranges
 }
 
 struct ViewerState {
@@ -494,7 +627,7 @@ impl ViewerState {
             &runtime.root,
             &runtime.plans,
             focus_node,
-            &runtime.gate_store,
+            runtime.gate_store.clone(),
             runtime.words_per_buffer,
         )
         .map_err(|error| format!("failed to build initial focused scene: {error:?}"))?;
@@ -573,7 +706,7 @@ impl ViewerState {
             &runtime.root,
             &runtime.plans,
             self.focus_node,
-            &runtime.gate_store,
+            runtime.gate_store.clone(),
             runtime.words_per_buffer,
         )
         .map_err(|error| format!("failed to rebuild focused scene: {error:?}"))?;
@@ -689,7 +822,14 @@ fn set_gate_seed(
     }
 }
 
-fn build_demo_circuit() -> (Component, ComponentPlans) {
+fn build_demo_circuit(kind: DemoSceneKind) -> DemoSceneSpec {
+    match kind {
+        DemoSceneKind::Starter => build_starter_demo_circuit(),
+        DemoSceneKind::Stress => build_stress_demo_circuit(),
+    }
+}
+
+fn build_starter_demo_circuit() -> DemoSceneSpec {
     let mut plans = ComponentPlans::new();
     let child = Component::from_plan(
         &mut plans,
@@ -772,7 +912,105 @@ fn build_demo_circuit() -> (Component, ComponentPlans) {
         ],
     );
 
-    (root, plans)
+    DemoSceneSpec {
+        kind: DemoSceneKind::Starter,
+        label: "Starter demo",
+        component_count: 2,
+        gate_count: 12,
+        nesting_depth: 2,
+        root,
+        plans,
+    }
+}
+
+fn build_stress_demo_circuit() -> DemoSceneSpec {
+    let mut plans = ComponentPlans::new();
+    let leaf_plan = plans.insert(
+        ComponentPlan::new(build_stress_gates(STRESS_GATES_PER_COMPONENT))
+            .with_grid_size([128, 64]),
+    );
+    let branch_plan = plans.insert(
+        ComponentPlan::new(build_stress_gates(STRESS_GATES_PER_COMPONENT))
+            .with_grid_size([256, 160])
+            .with_child_placements(vec![
+                ChildPlacement::at([0, 0]),
+                ChildPlacement::at([128, 0]),
+                ChildPlacement::at([0, 80]),
+                ChildPlacement::at([128, 80]),
+            ]),
+    );
+    let root = build_stress_component_tree(branch_plan, leaf_plan, STRESS_DEPTH);
+
+    DemoSceneSpec {
+        kind: DemoSceneKind::Stress,
+        label: "Stress demo",
+        component_count: geometric_series_total(STRESS_BRANCH_FACTOR as u64, STRESS_DEPTH),
+        gate_count: geometric_series_total(STRESS_BRANCH_FACTOR as u64, STRESS_DEPTH)
+            * STRESS_GATES_PER_COMPONENT as u64,
+        nesting_depth: STRESS_DEPTH + 1,
+        root,
+        plans,
+    }
+}
+
+fn build_stress_component_tree(
+    branch_plan: circuits_game::gate_plans::PlanId,
+    leaf_plan: circuits_game::gate_plans::PlanId,
+    depth: u32,
+) -> Component {
+    if depth == 0 {
+        return Component::new(leaf_plan, Vec::new());
+    }
+
+    let children = (0..STRESS_BRANCH_FACTOR)
+        .map(|_| build_stress_component_tree(branch_plan, leaf_plan, depth - 1))
+        .collect();
+    Component::new(branch_plan, children)
+}
+
+fn build_stress_gates(gate_count: u32) -> Vec<Gate> {
+    let mut gates = Vec::with_capacity(gate_count as usize);
+    gates.push(Gate::BitNot { src: this_ref(0) });
+    for gate in 1..gate_count {
+        let prev = gate - 1;
+        let tap = gate.saturating_sub(37);
+        let diag = gate.saturating_sub(113);
+        gates.push(match gate % 6 {
+            0 => Gate::BitNop {
+                src: this_ref(prev),
+            },
+            1 => Gate::BitNot {
+                src: this_ref(prev),
+            },
+            2 => Gate::BitXOR {
+                a: this_ref(prev),
+                b: this_ref(tap),
+            },
+            3 => Gate::BitAND {
+                a: this_ref(prev),
+                b: this_ref(diag),
+            },
+            4 => Gate::BitOR {
+                a: this_ref(prev),
+                b: this_ref(tap),
+            },
+            _ => Gate::BitXNOR {
+                a: this_ref(prev),
+                b: this_ref(diag),
+            },
+        });
+    }
+    gates
+}
+
+fn geometric_series_total(branch_factor: u64, depth: u32) -> u64 {
+    let mut total = 0u64;
+    let mut layer = 1u64;
+    for _ in 0..=depth {
+        total += layer;
+        layer *= branch_factor;
+    }
+    total
 }
 
 fn this_ref(gate: u32) -> SignalRef {

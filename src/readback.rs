@@ -18,13 +18,19 @@ struct LoadedBufferRange {
 }
 
 #[derive(Debug, Clone, Default)]
+struct LoadedBuffers {
+    ranges: Vec<LoadedBufferRange>,
+    by_buffer: HashMap<u32, Range<usize>>,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct ReadManager {
     words_per_buffer: u32,
     required_words: HashSet<u32>,
     required_ranges: Vec<VisibleBufferRange>,
     plan_dirty: bool,
-    loaded_ranges: Vec<LoadedBufferRange>,
-    loaded_by_buffer: HashMap<u32, Range<usize>>,
+    read_buffers: LoadedBuffers,
+    write_buffers: LoadedBuffers,
 }
 
 impl ReadManager {
@@ -40,8 +46,8 @@ impl ReadManager {
             required_words: HashSet::default(),
             required_ranges: Vec::new(),
             plan_dirty: false,
-            loaded_ranges: Vec::new(),
-            loaded_by_buffer: HashMap::default(),
+            read_buffers: LoadedBuffers::default(),
+            write_buffers: LoadedBuffers::default(),
         }
     }
 
@@ -64,37 +70,19 @@ impl ReadManager {
 
     pub fn load_ranges(
         &mut self,
-        ranges: impl IntoIterator<Item = (VisibleBufferRange, Box<[u32]>)>,
+        read_ranges: impl IntoIterator<Item = (VisibleBufferRange, Box<[u32]>)>,
+        write_ranges: impl IntoIterator<Item = (VisibleBufferRange, Box<[u32]>)>,
     ) {
-        self.loaded_ranges = ranges
-            .into_iter()
-            .map(|(range, words)| LoadedBufferRange {
-                buffer: range.buffer,
-                start_word: range.start_word,
-                words,
-            })
-            .collect();
-        self.loaded_ranges
-            .sort_by_key(|range| (range.buffer, range.start_word));
-
-        self.loaded_by_buffer.clear();
-        let mut start = 0usize;
-        while start < self.loaded_ranges.len() {
-            let buffer = self.loaded_ranges[start].buffer;
-            let mut end = start + 1;
-            while end < self.loaded_ranges.len() && self.loaded_ranges[end].buffer == buffer {
-                end += 1;
-            }
-            self.loaded_by_buffer.insert(buffer, start..end);
-            start = end;
-        }
+        self.read_buffers.load_ranges(read_ranges);
+        self.write_buffers.load_ranges(write_ranges);
     }
 
-    pub fn get_bit(&self, buffer: u32, bit: u32) -> Option<bool> {
-        let word_in_buffer = bit / 32;
-        let bit_in_word = bit % 32;
-        self.word(buffer, word_in_buffer)
-            .map(|word| ((word >> bit_in_word) & 1) != 0)
+    pub fn get_read_bit(&self, buffer: u32, bit: u32) -> Option<bool> {
+        self.read_buffers.get_bit(buffer, bit)
+    }
+
+    pub fn get_write_bit(&self, buffer: u32, bit: u32) -> Option<bool> {
+        self.write_buffers.get_bit(buffer, bit)
     }
 
     fn require_scene(&mut self, scene: &FocusedScene) {
@@ -125,10 +113,44 @@ impl ReadManager {
             self.require_scene(&child.scene);
         }
     }
+}
+
+impl LoadedBuffers {
+    fn load_ranges(&mut self, ranges: impl IntoIterator<Item = (VisibleBufferRange, Box<[u32]>)>) {
+        self.ranges = ranges
+            .into_iter()
+            .map(|(range, words)| LoadedBufferRange {
+                buffer: range.buffer,
+                start_word: range.start_word,
+                words,
+            })
+            .collect();
+        self.ranges
+            .sort_by_key(|range| (range.buffer, range.start_word));
+
+        self.by_buffer.clear();
+        let mut start = 0usize;
+        while start < self.ranges.len() {
+            let buffer = self.ranges[start].buffer;
+            let mut end = start + 1;
+            while end < self.ranges.len() && self.ranges[end].buffer == buffer {
+                end += 1;
+            }
+            self.by_buffer.insert(buffer, start..end);
+            start = end;
+        }
+    }
+
+    fn get_bit(&self, buffer: u32, bit: u32) -> Option<bool> {
+        let word_in_buffer = bit / 32;
+        let bit_in_word = bit % 32;
+        self.word(buffer, word_in_buffer)
+            .map(|word| ((word >> bit_in_word) & 1) != 0)
+    }
 
     fn word(&self, buffer: u32, word_in_buffer: u32) -> Option<u32> {
-        let range_indices = self.loaded_by_buffer.get(&buffer)?;
-        for range in &self.loaded_ranges[range_indices.clone()] {
+        let range_indices = self.by_buffer.get(&buffer)?;
+        for range in &self.ranges[range_indices.clone()] {
             let end_word = range.start_word + range.words.len() as u32;
             if (range.start_word..end_word).contains(&word_in_buffer) {
                 return range

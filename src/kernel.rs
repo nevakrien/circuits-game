@@ -488,7 +488,7 @@ fn flatten_output_write_instruction(
 }
 
 fn absolute_bit_index(bits_per_buffer: u32, bit: BitsIndex) -> u32 {
-    absolute_buffer_bit(bits_per_buffer, bit.0, bit.1 .0)
+    absolute_buffer_bit(bits_per_buffer, bit.0, bit.1.0)
 }
 
 fn absolute_buffer_bit(bits_per_buffer: u32, buffer: BufferId, bit_in_buffer: u32) -> u32 {
@@ -504,8 +504,8 @@ mod tests {
     use super::*;
     use crate::{
         gate_plans::{
-            compile_component_tree, ChildId, ChildInputConnection, Component, ComponentPlan,
-            ComponentPlans, ComponentPort, Gate, GateId, PortId, PortLocation, SignalRef,
+            ChildId, ChildInputConnection, Component, ComponentPlan, ComponentPlans, ComponentPort,
+            Gate, GateId, PortId, PortLocation, SignalRef, compile_component_tree,
         },
         setup,
     };
