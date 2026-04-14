@@ -1,19 +1,20 @@
 use std::{
     env,
-    sync::{Arc, mpsc},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use circuits_game::{
     gate_plans::{
-        ChildPlacement, Component, ComponentPlan, ComponentPlans, Gate, GateId, SignalRef,
-        compile_component_tree,
+        compile_component_tree, ChildPlacement, Component, ComponentPlan, ComponentPlans, Gate,
+        GateId, SignalRef,
     },
     kernel::{GateKernel, UploadedGpuPlan},
-    readback::{ReadManager, VisibleBufferRange},
     scene_render::SceneRenderer,
     setup,
-    visual_ui::{FocusedScene, ViewportState, build_focused_scene, interact_focused_scene},
+    visual_ui::{
+        build_focused_scene_with_preview_depth, interact_focused_scene, FocusedScene, ViewportState,
+    },
 };
 use egui_wgpu::wgpu;
 use egui_winit::winit;
@@ -27,6 +28,7 @@ const DEFAULT_FRAMES: u32 = 600;
 const DEFAULT_TICKS_PER_FRAME: u32 = 1;
 const DEFAULT_ZOOM: f32 = 2.0;
 const DEFAULT_VISIBLE_SECONDS: f32 = 8.0;
+const BENCH_PREVIEW_DEPTH: usize = 1;
 
 fn main() {
     let args = Args::parse();
@@ -64,24 +66,16 @@ fn run(args: Args) {
     let runtime_build = runtime_started_at.elapsed();
 
     let focused_scene_started_at = Instant::now();
-    let scene = build_focused_scene(
+    let scene = build_focused_scene_with_preview_depth(
         &runtime.root,
         &runtime.plans,
         runtime.root.id,
         runtime.gate_store.clone(),
         runtime.words_per_buffer,
+        BENCH_PREVIEW_DEPTH,
     )
     .expect("focused scene should build");
     let focused_scene_build = focused_scene_started_at.elapsed();
-
-    let read_manager_started_at = Instant::now();
-    let mut read_manager = ReadManager::for_scene(&scene);
-    let read_manager_build = read_manager_started_at.elapsed();
-    let readback_plan = readback_plan_stats(&mut read_manager);
-
-    let initial_refresh_started_at = Instant::now();
-    let initial_refresh = runtime.refresh_read_manager(device, queue, &mut read_manager);
-    let initial_refresh_total = initial_refresh_started_at.elapsed();
 
     let egui_ctx = egui::Context::default();
     egui_ctx.options_mut(|options| options.zoom_factor = 1.0);
@@ -107,12 +101,8 @@ fn run(args: Args) {
             scene_build,
             runtime_build,
             focused_scene_build,
-            read_manager_build,
-            initial_refresh_total,
-            initial_refresh,
         },
         scene,
-        read_manager,
         viewport: ViewportState::default(),
         viewport_initialized: false,
         frame_timings: Vec::with_capacity(args.frames as usize),
@@ -124,7 +114,6 @@ fn run(args: Args) {
         egui_renderer,
         scene_renderer,
         runtime,
-        readback_plan,
         app_started_at: started_at,
     };
 
@@ -148,12 +137,6 @@ fn run(args: Args) {
         bench.scene.children.len(),
         bench.scene.wires.len()
     );
-    println!(
-        "  readback plan: {} ranges, {} words, {:.2} MiB",
-        bench.readback_plan.range_count,
-        bench.readback_plan.total_words,
-        mib(bench.readback_plan.total_bytes)
-    );
     println!("startup");
     println!(
         "  build stress scene:      {}",
@@ -166,26 +149,6 @@ fn run(args: Args) {
     println!(
         "  build focused scene:     {}",
         fmt_duration(bench.startup.focused_scene_build)
-    );
-    println!(
-        "  build read manager:      {}",
-        fmt_duration(bench.startup.read_manager_build)
-    );
-    println!(
-        "  initial readback total:  {}",
-        fmt_duration(bench.startup.initial_refresh_total)
-    );
-    println!(
-        "    preview tick:         {}",
-        fmt_duration(bench.startup.initial_refresh.preview_tick)
-    );
-    println!(
-        "    read current buffer:  {}",
-        fmt_duration(bench.startup.initial_refresh.read_current)
-    );
-    println!(
-        "    read preview buffer:  {}",
-        fmt_duration(bench.startup.initial_refresh.read_preview)
     );
     println!(
         "  ready to first visible frame: {}",
@@ -216,13 +179,6 @@ fn run(args: Args) {
                         bench.runtime.step(device, queue);
                     }
                     let tick_time = tick_started_at.elapsed();
-
-                    let refresh_started_at = Instant::now();
-                    let refresh =
-                        bench
-                            .runtime
-                            .refresh_read_manager(device, queue, &mut bench.read_manager);
-                    let refresh_total = refresh_started_at.elapsed();
 
                     let ui_started_at = Instant::now();
                     let mut scene_rect = None;
@@ -352,10 +308,6 @@ fn run(args: Args) {
                     let frame_total = tick_started_at.elapsed();
                     bench.frame_timings.push(FrameMetrics {
                         tick: tick_time,
-                        refresh_total,
-                        refresh_preview_tick: refresh.preview_tick,
-                        refresh_read_current: refresh.read_current,
-                        refresh_read_preview: refresh.read_preview,
                         ui: ui_time,
                         tessellate: tessellate_time,
                         texture_updates: texture_time,
@@ -550,69 +502,6 @@ impl BenchRuntime {
         wait_for_gpu(device);
         self.current_read = write_index;
     }
-
-    fn refresh_read_manager(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        read_manager: &mut ReadManager,
-    ) -> RefreshMetrics {
-        let ranges = read_manager.required_ranges().to_vec();
-        let total_words: u32 = ranges.iter().map(|range| range.word_len).sum();
-        if total_words == 0 {
-            read_manager.load_ranges(std::iter::empty(), std::iter::empty());
-            return RefreshMetrics::default();
-        }
-
-        let preview_write = (self.current_read + 1) % self.charge_buffers.len();
-        let preview_tick_started_at = Instant::now();
-        let mut preview_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("stress-viewer-preview-step"),
-        });
-        self.kernel.encode(
-            device,
-            &mut preview_encoder,
-            &self.uploaded,
-            &self.charge_buffers[self.current_read],
-            &self.charge_buffers[preview_write],
-            &self.output_buffer,
-        );
-        queue.submit(Some(preview_encoder.finish()));
-        wait_for_gpu(device);
-        let preview_tick = preview_tick_started_at.elapsed();
-
-        let read_current_started_at = Instant::now();
-        let loaded_read_ranges = read_back_buffer_ranges(
-            device,
-            queue,
-            &self.charge_buffers[self.current_read],
-            &ranges,
-            self.words_per_buffer,
-            "stress-viewer-readback-read",
-            "stress-viewer-readback-read-copy",
-        );
-        let read_current = read_current_started_at.elapsed();
-
-        let read_preview_started_at = Instant::now();
-        let loaded_write_ranges = read_back_buffer_ranges(
-            device,
-            queue,
-            &self.charge_buffers[preview_write],
-            &ranges,
-            self.words_per_buffer,
-            "stress-viewer-readback-write",
-            "stress-viewer-readback-write-copy",
-        );
-        let read_preview = read_preview_started_at.elapsed();
-
-        read_manager.load_ranges(loaded_read_ranges, loaded_write_ranges);
-
-        RefreshMetrics {
-            preview_tick,
-            read_current,
-            read_preview,
-        }
-    }
 }
 
 struct ViewerBenchState {
@@ -621,7 +510,6 @@ struct ViewerBenchState {
     backend: wgpu::Backend,
     startup: StartupMetrics,
     scene: FocusedScene,
-    read_manager: ReadManager,
     viewport: ViewportState,
     viewport_initialized: bool,
     frame_timings: Vec<FrameMetrics>,
@@ -633,7 +521,6 @@ struct ViewerBenchState {
     egui_renderer: egui_wgpu::Renderer,
     scene_renderer: SceneRenderer,
     runtime: BenchRuntime,
-    readback_plan: ReadbackPlanStats,
     app_started_at: Instant,
 }
 
@@ -643,32 +530,11 @@ struct StartupMetrics {
     scene_build: Duration,
     runtime_build: Duration,
     focused_scene_build: Duration,
-    read_manager_build: Duration,
-    initial_refresh_total: Duration,
-    initial_refresh: RefreshMetrics,
-}
-
-#[derive(Clone, Copy, Default)]
-struct RefreshMetrics {
-    preview_tick: Duration,
-    read_current: Duration,
-    read_preview: Duration,
-}
-
-#[derive(Clone, Copy)]
-struct ReadbackPlanStats {
-    range_count: usize,
-    total_words: u32,
-    total_bytes: u64,
 }
 
 #[derive(Clone, Copy, Default)]
 struct FrameMetrics {
     tick: Duration,
-    refresh_total: Duration,
-    refresh_preview_tick: Duration,
-    refresh_read_current: Duration,
-    refresh_read_preview: Duration,
     ui: Duration,
     tessellate: Duration,
     texture_updates: Duration,
@@ -677,82 +543,6 @@ struct FrameMetrics {
     render_encode: Duration,
     submit_present: Duration,
     total: Duration,
-}
-
-fn read_back_buffer_ranges(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    source: &wgpu::Buffer,
-    ranges: &[VisibleBufferRange],
-    words_per_buffer: u32,
-    readback_label: &str,
-    copy_label: &str,
-) -> Vec<(VisibleBufferRange, Box<[u32]>)> {
-    let total_words: u32 = ranges.iter().map(|range| range.word_len).sum();
-    let size = total_words as u64 * std::mem::size_of::<u32>() as u64;
-    let readback = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some(readback_label),
-        size,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some(copy_label),
-    });
-    let mut dst_word_offset = 0u64;
-    for range in ranges {
-        let src_word_offset = (range.buffer * words_per_buffer + range.start_word) as u64;
-        let byte_len = range.word_len as u64 * std::mem::size_of::<u32>() as u64;
-        encoder.copy_buffer_to_buffer(
-            source,
-            src_word_offset * std::mem::size_of::<u32>() as u64,
-            &readback,
-            dst_word_offset * std::mem::size_of::<u32>() as u64,
-            byte_len,
-        );
-        dst_word_offset += range.word_len as u64;
-    }
-    queue.submit(Some(encoder.finish()));
-
-    let slice = readback.slice(..);
-    let (sender, receiver) = mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = sender.send(result);
-    });
-    wait_for_gpu(device);
-    receiver
-        .recv()
-        .expect("readback channel should receive a result")
-        .expect("readback buffer should map successfully");
-
-    let loaded_ranges = {
-        let mapped = slice.get_mapped_range();
-        let words = bytemuck::cast_slice::<u8, u32>(&mapped);
-        let mut start = 0usize;
-        ranges
-            .iter()
-            .copied()
-            .map(|range| {
-                let end = start + range.word_len as usize;
-                let values = words[start..end].to_vec().into_boxed_slice();
-                start = end;
-                (range, values)
-            })
-            .collect::<Vec<_>>()
-    };
-    readback.unmap();
-    loaded_ranges
-}
-
-fn readback_plan_stats(read_manager: &mut ReadManager) -> ReadbackPlanStats {
-    let ranges = read_manager.required_ranges();
-    let total_words: u32 = ranges.iter().map(|range| range.word_len).sum();
-    ReadbackPlanStats {
-        range_count: ranges.len(),
-        total_words,
-        total_bytes: total_words as u64 * std::mem::size_of::<u32>() as u64,
-    }
 }
 
 fn centered_zoom_viewport(
@@ -795,22 +585,6 @@ fn print_frame_summary(bench: &ViewerBenchState) {
     println!("frames");
     println!("  first frame total:      {}", fmt_duration(warmup.total));
     println!("    tick:                 {}", fmt_duration(warmup.tick));
-    println!(
-        "    refresh total:        {}",
-        fmt_duration(warmup.refresh_total)
-    );
-    println!(
-        "      preview tick:       {}",
-        fmt_duration(warmup.refresh_preview_tick)
-    );
-    println!(
-        "      current readback:   {}",
-        fmt_duration(warmup.refresh_read_current)
-    );
-    println!(
-        "      preview readback:   {}",
-        fmt_duration(warmup.refresh_read_preview)
-    );
     println!("    egui ui:              {}", fmt_duration(warmup.ui));
     println!(
         "    tessellate:           {}",
@@ -845,22 +619,6 @@ fn print_frame_summary(bench: &ViewerBenchState) {
         duration_fps(avg.total)
     );
     println!("  avg tick:               {}", fmt_duration(avg.tick));
-    println!(
-        "  avg refresh total:      {}",
-        fmt_duration(avg.refresh_total)
-    );
-    println!(
-        "    avg preview tick:     {}",
-        fmt_duration(avg.refresh_preview_tick)
-    );
-    println!(
-        "    avg current readback: {}",
-        fmt_duration(avg.refresh_read_current)
-    );
-    println!(
-        "    avg preview readback: {}",
-        fmt_duration(avg.refresh_read_preview)
-    );
     println!("  avg egui ui:            {}", fmt_duration(avg.ui));
     println!("  avg tessellate:         {}", fmt_duration(avg.tessellate));
     println!(
@@ -892,19 +650,6 @@ fn average_frame_metrics(frames: &[FrameMetrics]) -> FrameMetrics {
     let len = frames.len() as f64;
     FrameMetrics {
         tick: avg_duration(frames.iter().map(|frame| frame.tick), len),
-        refresh_total: avg_duration(frames.iter().map(|frame| frame.refresh_total), len),
-        refresh_preview_tick: avg_duration(
-            frames.iter().map(|frame| frame.refresh_preview_tick),
-            len,
-        ),
-        refresh_read_current: avg_duration(
-            frames.iter().map(|frame| frame.refresh_read_current),
-            len,
-        ),
-        refresh_read_preview: avg_duration(
-            frames.iter().map(|frame| frame.refresh_read_preview),
-            len,
-        ),
         ui: avg_duration(frames.iter().map(|frame| frame.ui), len),
         tessellate: avg_duration(frames.iter().map(|frame| frame.tessellate), len),
         texture_updates: avg_duration(frames.iter().map(|frame| frame.texture_updates), len),
@@ -936,10 +681,6 @@ fn fmt_duration(duration: Duration) -> String {
     } else {
         format!("{:.3} us", duration.as_secs_f64() * 1_000_000.0)
     }
-}
-
-fn mib(bytes: u64) -> f64 {
-    bytes as f64 / (1024.0 * 1024.0)
 }
 
 fn wait_for_gpu(device: &wgpu::Device) {

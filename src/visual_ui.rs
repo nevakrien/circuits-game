@@ -113,25 +113,45 @@ pub fn build_focused_scene(
     gate_store: Arc<HashMap<(NodeId, GateId), GateStoreLocation>>,
     words_per_buffer: u32,
 ) -> Result<FocusedScene, CompileError> {
-    let by_id = collect_components(root);
-    build_focused_scene_with_index(
+    build_focused_scene_with_preview_depth(
         root,
         plans,
         focused,
         gate_store,
         words_per_buffer,
-        &by_id,
         usize::MAX,
     )
 }
 
-fn build_focused_scene_with_index(
+pub fn build_focused_scene_with_preview_depth(
     root: &Component,
     plans: &ComponentPlans,
     focused: NodeId,
     gate_store: Arc<HashMap<(NodeId, GateId), GateStoreLocation>>,
     words_per_buffer: u32,
+    preview_depth: usize,
+) -> Result<FocusedScene, CompileError> {
+    let by_id = collect_components(root);
+    build_focused_scene_with_index(
+        plans,
+        &by_id,
+        &[],
+        root,
+        focused,
+        gate_store,
+        words_per_buffer,
+        preview_depth,
+    )
+}
+
+fn build_focused_scene_with_index(
+    plans: &ComponentPlans,
     by_id: &HashMap<NodeId, &Component>,
+    parent_stack: &[NodeId],
+    root: &Component,
+    focused: NodeId,
+    gate_store: Arc<HashMap<(NodeId, GateId), GateStoreLocation>>,
+    words_per_buffer: u32,
     preview_depth: usize,
 ) -> Result<FocusedScene, CompileError> {
     let focus = by_id
@@ -145,10 +165,9 @@ fn build_focused_scene_with_index(
     let grid_dims = plan.grid_size;
     let grid_size = Vec2::new(grid_dims[0] as f32 * CELL, grid_dims[1] as f32 * CELL);
     let grid_rect = Rect::from_min_size(Pos2::new(PAD, PAD + 36.0), grid_size);
-    let parent_stack = parent_stack_to(root, focused).unwrap_or_default();
     let child_ids: Vec<_> = focus.children.iter().map(|child| child.id).collect();
     let ctx = VisualCtx {
-        parent_stack: &parent_stack,
+        parent_stack,
         child_ids: &child_ids,
     };
 
@@ -201,6 +220,9 @@ fn build_focused_scene_with_index(
     let children = if preview_depth == 0 {
         Vec::new()
     } else {
+        let mut next_parent_stack = Vec::with_capacity(parent_stack.len() + 1);
+        next_parent_stack.extend_from_slice(parent_stack);
+        next_parent_stack.push(focus.id);
         focus
             .children
             .iter()
@@ -244,12 +266,13 @@ fn build_focused_scene_with_index(
                     })
                     .collect();
                 let scene = build_focused_scene_with_index(
-                    root,
                     plans,
+                    by_id,
+                    &next_parent_stack,
+                    root,
                     child.id,
                     gate_store.clone(),
                     words_per_buffer,
-                    by_id,
                     preview_depth.saturating_sub(1),
                 )?;
                 Ok(PlacedChild {
