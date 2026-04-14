@@ -30,6 +30,6 @@ pub const CHILD_BG: Color32 = Color32::from_rgb(36, 43, 57);
 pub const CHILD_ZOOM_PREVIEW: f32 = 1.6;
 pub const CHILD_PORT_INSET: f32 = 10.0;
 
-pub const PULSE_CYCLES_PER_TICK: f32 = 0.14;
+pub const PULSE_CYCLES_PER_TICK: f32 = 0.64;
 pub const MIN_PULSE_CYCLES_PER_SECOND: f32 = 0.18;
 pub const MAX_PULSE_CYCLES_PER_SECOND: f32 = 2.4;
