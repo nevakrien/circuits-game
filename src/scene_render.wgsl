@@ -30,12 +30,13 @@ struct VsOut {
 
 struct WireVsOut {
     @builtin(position) clip_pos: vec4<f32>,
-    @location(0) local: vec2<f32>,
+    @location(0) local_px: vec2<f32>,
     @location(1) color: vec4<f32>,
     @location(2) charge: vec4<u32>,
     @location(3) path: vec4<f32>,
     @location(4) length_px: f32,
     @location(5) half_width_px: f32,
+    @location(6) render_radius_px: f32,
 };
 
 @group(0) @binding(0)
@@ -107,6 +108,12 @@ fn circle_alpha(local: vec2<f32>) -> f32 {
 
 fn mix_color(a: vec4<f32>, b: vec4<f32>, t: f32) -> vec4<f32> {
     return a * (1.0 - t) + b * t;
+}
+
+fn capsule_mask(local_px: vec2<f32>, length_px: f32, radius_px: f32) -> f32 {
+    let closest_x = clamp(local_px.x, 0.0, length_px);
+    let distance = length(vec2<f32>(local_px.x - closest_x, local_px.y));
+    return 1.0 - smoothstep(radius_px - 1.0, radius_px + 1.0, distance);
 }
 
 fn gate_label_len(gate_tag: u32) -> u32 {
@@ -336,7 +343,6 @@ fn fs_shape(in: VsOut) -> @location(0) vec4<f32> {
 @vertex
 fn vs_wire(instance: WireInstance, @builtin(vertex_index) vertex_index: u32) -> WireVsOut {
     let local = quad_pos(vertex_index);
-    let along = local.x;
     let side = local.y * 2.0 - 1.0;
     let start_screen = world_to_screen(instance.start);
     let end_screen = world_to_screen(instance.end);
@@ -345,16 +351,20 @@ fn vs_wire(instance: WireInstance, @builtin(vertex_index) vertex_index: u32) -> 
     let dir = delta / length_px;
     let perp = vec2<f32>(-dir.y, dir.x);
     let thickness_px = instance.path.w;
-    let screen = mix(start_screen, end_screen, along) + perp * side * thickness_px;
+    let render_radius_px = thickness_px * 2.4;
+    let along_px = mix(-render_radius_px, length_px + render_radius_px, local.x);
+    let across_px = side * render_radius_px;
+    let screen = start_screen + dir * along_px + perp * across_px;
 
     var out: WireVsOut;
     out.clip_pos = screen_to_clip(screen);
-    out.local = vec2<f32>(along, side);
+    out.local_px = vec2<f32>(along_px, across_px);
     out.color = instance.color;
     out.charge = instance.charge;
     out.path = instance.path;
     out.length_px = length_px;
     out.half_width_px = thickness_px;
+    out.render_radius_px = render_radius_px;
     return out;
 }
 
@@ -363,25 +373,51 @@ fn fs_wire(in: WireVsOut) -> @location(0) vec4<f32> {
     let is_active = charge_active(in.charge);
     var color = in.color;
     let half_width_px = in.half_width_px;
-    let side_px = abs(in.local.y) * half_width_px;
-    let core = 1.0 - smoothstep(0.45, 0.92, abs(in.local.y));
+    let render_radius_px = in.render_radius_px;
+    let wire_mask = capsule_mask(in.local_px, in.length_px, half_width_px);
+    let render_mask = capsule_mask(in.local_px, in.length_px, render_radius_px);
+    if render_mask <= 0.001 {
+        discard;
+    }
+
+    let side_px = abs(in.local_px.y);
+    let center_glow = 1.0 - smoothstep(0.0, half_width_px, side_px);
     if is_active {
-        let pulse_time = uniforms.source_scale_time_pulse.w * bitcast<f32>(uniforms.scene_bits.w);
-        let distance_along_px = mix(0.0, in.length_px, in.local.x) + in.path.x * max(in.path.z, 0.001) * uniforms.source_scale_time_pulse.z;
-        let dot_spacing_px = 34.0;
-        let dot_radius_px = half_width_px * 1.8;
-        let along_to_center = abs(fract(distance_along_px / dot_spacing_px - pulse_time) - 0.5) * dot_spacing_px;
-        let dot = 1.0 - smoothstep(dot_radius_px * 0.35, dot_radius_px, length(vec2<f32>(along_to_center, side_px)));
-        let ribbon = 1.0 - smoothstep(half_width_px * 0.30, half_width_px * 0.92, side_px);
-        let orb_core = 1.0 - smoothstep(dot_radius_px * 0.05, dot_radius_px * 0.55, length(vec2<f32>(along_to_center, side_px)));
-        let orb_color = mix(color.rgb * 1.05, vec3<f32>(0.86, 0.93, 1.0), orb_core);
+        let pulse_time = uniforms.source_scale_time_pulse.w * bitcast<f32>(uniforms.scene_bits.w) * 1.85;
+        let distance_along_px = clamp(in.local_px.x, 0.0, in.length_px)
+            + in.path.x * max(in.path.z, 0.001) * uniforms.source_scale_time_pulse.z;
+        let dot_spacing_px = 28.0;
+        let dot_radius_px = half_width_px * 2.35;
+        let along_to_center = abs(fract(distance_along_px / dot_spacing_px - pulse_time) - 0.5)
+            * dot_spacing_px;
+        let sphere_dist = length(vec2<f32>(along_to_center, side_px));
+        let sphere = 1.0 - smoothstep(dot_radius_px * 0.18, dot_radius_px, sphere_dist);
+        let sphere_core = 1.0 - smoothstep(dot_radius_px * 0.04, dot_radius_px * 0.48, sphere_dist);
+        let sphere_highlight = 1.0
+            - smoothstep(
+                dot_radius_px * 0.02,
+                dot_radius_px * 0.22,
+                length(vec2<f32>(along_to_center - dot_radius_px * 0.22, side_px + dot_radius_px * 0.24)),
+            );
+        let growth = 1.0 - smoothstep(half_width_px * 0.6, dot_radius_px * 1.05, along_to_center);
+        let ribbon = 1.0 - smoothstep(half_width_px * 0.28, half_width_px * 0.95, side_px);
+        let base_wire = color.rgb * 0.78 + vec3<f32>(0.05, 0.08, 0.12) * center_glow;
+        let energized_wire = color.rgb * (1.05 + growth * 0.18)
+            + vec3<f32>(0.10, 0.16, 0.24) * ribbon
+            + vec3<f32>(0.04, 0.07, 0.10) * center_glow;
+        let orb_color = mix(
+            energized_wire,
+            vec3<f32>(0.88, 0.95, 1.0),
+            sphere_core * 0.72 + sphere_highlight * 0.28,
+        );
         color = vec4<f32>(
-            orb_color + vec3<f32>(0.08, 0.12, 0.16) * ribbon + vec3<f32>(0.16, 0.20, 0.26) * dot,
+            mix(base_wire, energized_wire, wire_mask) + (orb_color - energized_wire) * sphere,
             color.a,
         );
-        return vec4<f32>(color.rgb, max(core * 0.92, dot * 0.98));
+        let alpha = max(wire_mask * 0.94, sphere * render_mask);
+        return vec4<f32>(color.rgb, alpha);
     } else {
-        color = vec4<f32>(color.rgb * 0.45, color.a);
-        return vec4<f32>(color.rgb, core * 0.55);
+        color = vec4<f32>(color.rgb * 0.40 + vec3<f32>(0.01, 0.015, 0.02) * center_glow, color.a);
+        return vec4<f32>(color.rgb, wire_mask * 0.55);
     }
 }
