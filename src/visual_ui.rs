@@ -1,7 +1,4 @@
-use egui::{
-    Align2, Color32, FontId, Painter, PointerButton, Pos2, Rect, Sense, Shape, Stroke, StrokeKind,
-    Ui, Vec2,
-};
+use egui::{Color32, PointerButton, Pos2, Rect, Sense, Ui, Vec2};
 use foldhash::HashMap;
 use std::sync::Arc;
 
@@ -9,14 +6,7 @@ use crate::gate_plans::{
     ChildId, ChildPlacement, CompileError, Component, ComponentPlans, Gate, GateId,
     GateStoreLocation, NodeId, PortId, PortLocation, SignalRef,
 };
-use crate::readback::ReadManager;
-use crate::ui_config::{
-    ANCESTOR_COLOR, CELL, CHILD_BG, CHILD_INPUT_COLOR, CHILD_OUTPUT_COLOR, CHILD_PORT_INSET,
-    CHILD_ZOOM_PREVIEW, GATE_INPUT_FILL, GATE_INPUT_STROKE, GATE_OFF, GATE_ON, GATE_OUTPUT_FILL,
-    GATE_OUTPUT_STROKE, GATE_STROKE, GRID_BG, GRID_LINE, GRID_STROKE, INPUT_PORT_COLOR,
-    MAX_PULSE_CYCLES_PER_SECOND, MIN_PULSE_CYCLES_PER_SECOND, OUTPUT_PORT_COLOR, PAD, PANEL_BG,
-    PORT_RADIUS, PULSE_CYCLES_PER_TICK,
-};
+use crate::ui_config::{CELL, CHILD_PORT_INSET, PAD};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ViewportState {
@@ -100,6 +90,12 @@ pub enum SceneAction {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct SceneViewportOutput {
+    pub rect: Rect,
+    pub action: Option<SceneAction>,
+}
+
+#[derive(Debug, Clone, Copy)]
 enum Endpoint {
     GateOutput(GateId),
     GateInput(GateId, usize),
@@ -125,7 +121,7 @@ pub fn build_focused_scene(
         gate_store,
         words_per_buffer,
         &by_id,
-        1,
+        usize::MAX,
     )
 }
 
@@ -254,7 +250,7 @@ fn build_focused_scene_with_index(
                     gate_store.clone(),
                     words_per_buffer,
                     by_id,
-                    preview_depth - 1,
+                    preview_depth.saturating_sub(1),
                 )?;
                 Ok(PlacedChild {
                     id: child_id,
@@ -433,17 +429,13 @@ pub fn child_ids_of(root: &Component, node_id: NodeId) -> Vec<NodeId> {
     rec(root, node_id).unwrap_or_default()
 }
 
-pub fn show_focused_scene(
+pub fn interact_focused_scene(
     ui: &mut Ui,
     scene: &FocusedScene,
-    read_manager: &ReadManager,
-    time: f64,
-    pulse_rate_hz: f32,
     viewport: &mut ViewportState,
-) -> Option<SceneAction> {
+) -> SceneViewportOutput {
     let available = ui.available_size_before_wrap();
     let (rect, response) = ui.allocate_exact_size(available, Sense::click_and_drag());
-    let painter = ui.painter_at(rect);
 
     if response.dragged_by(PointerButton::Middle) || response.dragged_by(PointerButton::Primary) {
         viewport.pan += ui.ctx().input(|input| input.pointer.delta());
@@ -451,29 +443,20 @@ pub fn show_focused_scene(
     if response.hovered() {
         let zoom_delta = ui.ctx().input(|input| input.zoom_delta());
         if (zoom_delta - 1.0).abs() > f32::EPSILON {
-            viewport.zoom = (viewport.zoom * zoom_delta).clamp(0.35, 3.0);
+            let old_zoom = viewport.zoom;
+            let new_zoom = (old_zoom * zoom_delta).clamp(0.35, 3.0);
+            if (new_zoom - old_zoom).abs() > f32::EPSILON {
+                if let Some(pointer) = ui.ctx().input(|input| input.pointer.hover_pos()) {
+                    let local = pointer - rect.min;
+                    let world = (local - viewport.pan) / old_zoom.max(f32::EPSILON);
+                    viewport.pan = local - world * new_zoom;
+                }
+                viewport.zoom = new_zoom;
+            }
         }
     }
 
-    painter.rect(
-        rect,
-        12.0,
-        PANEL_BG,
-        Stroke::new(1.0, Color32::from_rgb(38, 46, 59)),
-        StrokeKind::Outside,
-    );
-
     let camera = Camera::new(Pos2::ZERO, rect.min + viewport.pan, viewport.zoom);
-    paint_scene(
-        &painter,
-        scene,
-        read_manager,
-        time,
-        pulse_rate_hz,
-        &camera,
-        ScenePaintOptions::top_level(),
-    );
-
     let mut action = None;
     for child in &scene.children {
         let child_hit = camera.rect(child.rect);
@@ -486,15 +469,8 @@ pub fn show_focused_scene(
             action = Some(SceneAction::FocusChild(child.node));
         }
     }
-    action
-}
 
-#[derive(Clone, Copy)]
-struct ScenePaintOptions {
-    show_title: bool,
-    show_component_ports: bool,
-    show_ancestor_ports: bool,
-    show_child_ports: bool,
+    SceneViewportOutput { rect, action }
 }
 
 #[derive(Clone, Copy)]
@@ -513,14 +489,6 @@ impl Camera {
         }
     }
 
-    fn fit(source: Rect, target: Rect) -> Self {
-        let scale = (target.width() / source.width().max(f32::EPSILON))
-            .min(target.height() / source.height().max(f32::EPSILON));
-        let fitted_size = source.size() * scale;
-        let screen_min = target.center() - fitted_size * 0.5;
-        Self::new(source.min, screen_min, scale)
-    }
-
     fn pos(&self, pos: Pos2) -> Pos2 {
         self.screen_min + (pos - self.source_min) * self.scale
     }
@@ -528,382 +496,6 @@ impl Camera {
     fn rect(&self, rect: Rect) -> Rect {
         Rect::from_min_max(self.pos(rect.min), self.pos(rect.max))
     }
-}
-
-impl ScenePaintOptions {
-    fn top_level() -> Self {
-        Self {
-            show_title: true,
-            show_component_ports: true,
-            show_ancestor_ports: true,
-            show_child_ports: true,
-        }
-    }
-
-    fn nested() -> Self {
-        Self {
-            show_title: false,
-            show_component_ports: false,
-            show_ancestor_ports: false,
-            show_child_ports: true,
-        }
-    }
-}
-
-fn paint_scene(
-    painter: &Painter,
-    scene: &FocusedScene,
-    read_manager: &ReadManager,
-    time: f64,
-    pulse_rate_hz: f32,
-    camera: &Camera,
-    options: ScenePaintOptions,
-) {
-    paint_grid(painter, scene.grid_rect, scene.grid_dims, camera);
-
-    if options.show_title {
-        painter.text(
-            camera.pos(Pos2::new(PAD, 8.0)),
-            Align2::LEFT_TOP,
-            &scene.title,
-            FontId::proportional(20.0 * camera.scale.clamp(0.8, 1.2)),
-            Color32::WHITE,
-        );
-    }
-
-    for gate in &scene.gates {
-        paint_gate(painter, gate, scene, read_manager, camera);
-    }
-
-    for child in &scene.children {
-        paint_child(painter, child, read_manager, time, pulse_rate_hz, camera);
-    }
-
-    for wire in &scene.wires {
-        paint_wire(
-            painter,
-            wire,
-            scene,
-            read_manager,
-            time,
-            pulse_rate_hz,
-            camera,
-        );
-    }
-
-    if options.show_component_ports {
-        for port in &scene.input_ports {
-            paint_port(
-                painter,
-                port,
-                INPUT_PORT_COLOR,
-                scene,
-                read_manager,
-                camera,
-                true,
-            );
-        }
-        for port in &scene.output_ports {
-            paint_port(
-                painter,
-                port,
-                OUTPUT_PORT_COLOR,
-                scene,
-                read_manager,
-                camera,
-                true,
-            );
-        }
-    }
-
-    if options.show_ancestor_ports {
-        for port in &scene.ancestor_ports {
-            paint_external_port(painter, port, ANCESTOR_COLOR, scene, read_manager, camera);
-        }
-    }
-
-    if options.show_child_ports {
-        for child in &scene.children {
-            for port in &child.inputs {
-                paint_port(
-                    painter,
-                    port,
-                    CHILD_INPUT_COLOR,
-                    scene,
-                    read_manager,
-                    camera,
-                    true,
-                );
-            }
-            for port in &child.outputs {
-                paint_port(
-                    painter,
-                    port,
-                    CHILD_OUTPUT_COLOR,
-                    scene,
-                    read_manager,
-                    camera,
-                    true,
-                );
-            }
-        }
-    }
-}
-
-fn paint_grid(painter: &Painter, grid_rect: Rect, dims: [u32; 2], camera: &Camera) {
-    let rect = camera.rect(grid_rect);
-    painter.rect(
-        rect,
-        8.0,
-        GRID_BG,
-        Stroke::new(1.2, GRID_LINE),
-        StrokeKind::Outside,
-    );
-    for x in 1..dims[0] {
-        let x = camera
-            .pos(Pos2::new(
-                grid_rect.left() + x as f32 * CELL,
-                grid_rect.top(),
-            ))
-            .x;
-        painter.line_segment(
-            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
-            Stroke::new(GRID_STROKE, GRID_LINE),
-        );
-    }
-    for y in 1..dims[1] {
-        let y = camera
-            .pos(Pos2::new(
-                grid_rect.left(),
-                grid_rect.top() + y as f32 * CELL,
-            ))
-            .y;
-        painter.line_segment(
-            [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
-            Stroke::new(GRID_STROKE, GRID_LINE),
-        );
-    }
-}
-
-fn paint_gate(
-    painter: &Painter,
-    gate: &PlacedGate,
-    scene: &FocusedScene,
-    read_manager: &ReadManager,
-    camera: &Camera,
-) {
-    let rect = camera.rect(gate.rect.shrink(10.0));
-    let is_on = scene
-        .gate_store
-        .get(&(scene.node, gate.id))
-        .is_some_and(|store| gate_write_value(read_manager, *store));
-    painter.rect(
-        rect,
-        10.0,
-        if is_on { GATE_ON } else { GATE_OFF },
-        Stroke::new(1.5, GATE_STROKE),
-        StrokeKind::Outside,
-    );
-    let gate_font_size = (15.0 * camera.scale).clamp(6.0, 16.0);
-    if rect.width() >= gate_font_size * 1.9 && rect.height() >= gate_font_size * 1.4 {
-        painter.text(
-            rect.center(),
-            Align2::CENTER_CENTER,
-            gate.gate.label(),
-            FontId::proportional(gate_font_size),
-            Color32::WHITE,
-        );
-    }
-
-    for (input_index, source_gate) in gate.input_sources.iter().enumerate() {
-        let anchor = camera.pos(gate_anchor(gate.rect, gate.gate, Some(input_index)));
-        paint_gate_input_marker(
-            painter,
-            anchor,
-            source_gate.is_some_and(|source_gate| gate_is_active(scene, read_manager, source_gate)),
-            camera.scale,
-        );
-    }
-    let output_anchor = camera.pos(gate_anchor(gate.rect, gate.gate, None));
-    paint_gate_output_marker(
-        painter,
-        output_anchor,
-        gate_is_active(scene, read_manager, (scene.node, gate.id)),
-        camera.scale,
-    );
-}
-
-fn paint_child(
-    painter: &Painter,
-    child: &PlacedChild,
-    read_manager: &ReadManager,
-    time: f64,
-    pulse_rate_hz: f32,
-    camera: &Camera,
-) {
-    let rect = camera.rect(child.rect);
-    painter.rect(
-        rect,
-        10.0,
-        CHILD_BG,
-        Stroke::new(1.5, CHILD_INPUT_COLOR),
-        StrokeKind::Outside,
-    );
-    if camera.scale < CHILD_ZOOM_PREVIEW {
-        return;
-    }
-
-    let clip_painter = painter.with_clip_rect(rect);
-    let nested_camera = Camera::fit(child.scene.grid_rect, rect);
-
-    paint_scene(
-        &clip_painter,
-        &child.scene,
-        read_manager,
-        time,
-        pulse_rate_hz,
-        &nested_camera,
-        ScenePaintOptions::nested(),
-    );
-}
-
-fn paint_port(
-    painter: &Painter,
-    port: &PlacedPort,
-    color: Color32,
-    scene: &FocusedScene,
-    read_manager: &ReadManager,
-    camera: &Camera,
-    show_label: bool,
-) {
-    let anchor = camera.pos(port.anchor);
-    let active = gate_is_active(scene, read_manager, port.source_gate);
-    let color = if active {
-        color
-    } else {
-        color.gamma_multiply(0.45)
-    };
-    painter.circle_filled(anchor, PORT_RADIUS * camera.scale.clamp(0.7, 1.4), color);
-    let font_size = 12.0 * camera.scale;
-    if show_label && !port.label.is_empty() && font_size >= 8.0 {
-        let (label_offset, align) = port_label_layout(port.location, camera.scale);
-        painter.text(
-            anchor + label_offset,
-            align,
-            &port.label,
-            FontId::monospace(font_size.min(12.0)),
-            if active {
-                Color32::from_rgb(220, 227, 238)
-            } else {
-                Color32::from_rgb(112, 118, 128)
-            },
-        );
-    }
-}
-
-fn paint_gate_input_marker(painter: &Painter, anchor: Pos2, active: bool, zoom: f32) {
-    let radius = 5.5 * zoom.clamp(0.75, 1.35);
-    let fill = if active {
-        GATE_INPUT_FILL
-    } else {
-        GATE_INPUT_FILL.gamma_multiply(0.45)
-    };
-    let stroke = if active {
-        GATE_INPUT_STROKE
-    } else {
-        GATE_INPUT_STROKE.gamma_multiply(0.45)
-    };
-    painter.circle_filled(anchor, radius, fill);
-    painter.circle_stroke(anchor, radius, Stroke::new(1.4, stroke));
-}
-
-fn paint_gate_output_marker(painter: &Painter, anchor: Pos2, active: bool, zoom: f32) {
-    let radius = 5.5 * zoom.clamp(0.75, 1.35);
-    let fill = if active {
-        GATE_OUTPUT_FILL
-    } else {
-        GATE_OUTPUT_FILL.gamma_multiply(0.45)
-    };
-    let stroke = if active {
-        GATE_OUTPUT_STROKE
-    } else {
-        GATE_OUTPUT_STROKE.gamma_multiply(0.45)
-    };
-    painter.circle_filled(anchor, radius, fill);
-    painter.circle_stroke(anchor, radius, Stroke::new(1.4, stroke));
-}
-
-fn paint_external_port(
-    painter: &Painter,
-    port: &ExternalPort,
-    color: Color32,
-    scene: &FocusedScene,
-    read_manager: &ReadManager,
-    camera: &Camera,
-) {
-    let anchor = camera.pos(port.anchor);
-    let active = gate_is_active(scene, read_manager, port.source_gate);
-    let color = if active {
-        color
-    } else {
-        color.gamma_multiply(0.45)
-    };
-    painter.circle_filled(anchor, PORT_RADIUS * camera.scale.clamp(0.7, 1.4), color);
-    let font_size = 12.0 * camera.scale;
-    if !port.label.is_empty() && font_size >= 8.0 {
-        painter.text(
-            anchor + Vec2::new(10.0 * camera.scale, 0.0),
-            Align2::LEFT_CENTER,
-            &port.label,
-            FontId::monospace(font_size.min(12.0)),
-            if active {
-                Color32::from_rgb(216, 224, 235)
-            } else {
-                Color32::from_rgb(112, 118, 128)
-            },
-        );
-    }
-}
-
-fn paint_wire(
-    painter: &Painter,
-    wire: &VisualWire,
-    scene: &FocusedScene,
-    read_manager: &ReadManager,
-    time: f64,
-    pulse_rate_hz: f32,
-    camera: &Camera,
-) {
-    let active = wire
-        .source_gate
-        .is_some_and(|source_gate| gate_is_active(scene, read_manager, source_gate));
-    let color = if active {
-        wire.color
-    } else {
-        wire.color.gamma_multiply(0.6)
-    };
-    let points: Vec<_> = wire.points.iter().map(|point| camera.pos(*point)).collect();
-    painter.add(Shape::line(
-        points.clone(),
-        Stroke::new(2.0 * camera.scale.clamp(0.7, 1.3), color),
-    ));
-    if active {
-        let count = ((polyline_length(&points) / 90.0).ceil() as usize).max(2);
-        let pulse_cycles = pulse_cycles_per_second(pulse_rate_hz);
-        for i in 0..count {
-            let phase = ((time as f32 * pulse_cycles) + i as f32 / count as f32).fract();
-            painter.circle_filled(
-                point_along_polyline(&points, phase),
-                4.0 * camera.scale.clamp(0.7, 1.3),
-                color,
-            );
-        }
-    }
-}
-
-fn pulse_cycles_per_second(pulse_rate_hz: f32) -> f32 {
-    (pulse_rate_hz * PULSE_CYCLES_PER_TICK)
-        .clamp(MIN_PULSE_CYCLES_PER_SECOND, MAX_PULSE_CYCLES_PER_SECOND)
 }
 
 fn grid_anchor_for_port(grid_rect: Rect, grid_dims: [u32; 2], location: PortLocation) -> Pos2 {
@@ -967,22 +559,6 @@ fn child_rect_from_placement(
     let footprint = Rect::from_min_size(min, Vec2::new(width as f32 * CELL, height as f32 * CELL));
     let scaled_size = footprint.size() * CHILD_FOOTPRINT_FILL;
     Rect::from_center_size(footprint.center(), scaled_size)
-}
-
-fn port_label_layout(location: PortLocation, zoom: f32) -> (Vec2, Align2) {
-    let dx = 8.0 * zoom;
-    let dy = 8.0 * zoom;
-    if location.x == 0 {
-        (Vec2::new(dx, 0.0), Align2::LEFT_CENTER)
-    } else if location.x == u16::MAX {
-        (Vec2::new(-dx, 0.0), Align2::RIGHT_CENTER)
-    } else if location.y == 0 {
-        (Vec2::new(0.0, dy), Align2::CENTER_TOP)
-    } else if location.y == u16::MAX {
-        (Vec2::new(0.0, -dy), Align2::CENTER_BOTTOM)
-    } else {
-        (Vec2::new(dx, -dy), Align2::LEFT_BOTTOM)
-    }
 }
 
 fn gate_anchor(rect: Rect, gate: Gate, input: Option<usize>) -> Pos2 {
@@ -1197,30 +773,6 @@ fn collect_components<'a>(root: &'a Component) -> HashMap<NodeId, &'a Component>
     out
 }
 
-fn gate_value(read_manager: &ReadManager, store: GateStoreLocation) -> bool {
-    read_manager
-        .get_read_bit(store.buffer.0, store.bit.0)
-        .unwrap_or(false)
-}
-
-fn gate_write_value(read_manager: &ReadManager, store: GateStoreLocation) -> bool {
-    read_manager
-        .get_write_bit(store.buffer.0, store.bit.0)
-        .unwrap_or(false)
-}
-
-fn gate_is_active(
-    scene: &FocusedScene,
-    read_manager: &ReadManager,
-    source_gate: (NodeId, GateId),
-) -> bool {
-    scene
-        .gate_store
-        .get(&source_gate)
-        .copied()
-        .is_some_and(|store| gate_value(read_manager, store))
-}
-
 fn palette_color(index: usize) -> Color32 {
     const PALETTE: [Color32; 8] = [
         Color32::from_rgb(96, 214, 184),
@@ -1233,30 +785,4 @@ fn palette_color(index: usize) -> Color32 {
         Color32::from_rgb(255, 146, 103),
     ];
     PALETTE[index % PALETTE.len()]
-}
-
-fn polyline_length(points: &[Pos2]) -> f32 {
-    points
-        .windows(2)
-        .map(|segment| segment[0].distance(segment[1]))
-        .sum()
-}
-
-fn point_along_polyline(points: &[Pos2], t: f32) -> Pos2 {
-    if points.len() < 2 {
-        return points.first().copied().unwrap_or_default();
-    }
-    let total = polyline_length(points);
-    if total <= f32::EPSILON {
-        return points[0];
-    }
-    let mut remaining = total * t.clamp(0.0, 1.0);
-    for segment in points.windows(2) {
-        let length = segment[0].distance(segment[1]);
-        if remaining <= length {
-            return segment[0].lerp(segment[1], remaining / length.max(f32::EPSILON));
-        }
-        remaining -= length;
-    }
-    *points.last().expect("len checked above")
 }

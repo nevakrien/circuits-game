@@ -1,5 +1,5 @@
 use std::{
-    sync::{Arc, mpsc},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -9,7 +9,7 @@ use circuits_game::{
         ComponentPort, Gate, GateId, PortId, PortLocation, SignalRef, compile_component_tree,
     },
     kernel::{GateKernel, UploadedGpuPlan},
-    readback::ReadManager,
+    scene_render::SceneRenderer,
     setup,
     ui_config::{
         DEFAULT_TICK_RATE, FAST_RATE_FACTOR, MAX_FRAME_STEP_BUDGET, PAUSED_VISUAL_RATE_FACTOR,
@@ -17,7 +17,7 @@ use circuits_game::{
     },
     visual_ui::{
         FocusedScene, SceneAction, ViewportState, build_focused_scene, child_ids_of,
-        parent_stack_to, show_focused_scene,
+        interact_focused_scene, parent_stack_to,
     },
 };
 use egui_wgpu::wgpu;
@@ -89,8 +89,9 @@ async fn run() {
     let mut runtime = DemoRuntime::new(device, queue, build_demo_circuit(DemoSceneKind::Starter))
         .expect("demo runtime should build");
     let mut viewer = ViewerState::new(&runtime).expect("viewer should build initial scene");
-    runtime.refresh_read_manager(device, queue, &mut viewer.read_manager);
     let animation_started_at = Instant::now();
+    let mut scene_renderer = SceneRenderer::new(device, config.format);
+    scene_renderer.upload_scene(device, queue, &viewer.scene);
 
     let egui_ctx = egui::Context::default();
     let mut egui_state = egui_winit::State::new(
@@ -122,14 +123,12 @@ async fn run() {
                     let raw_input = egui_state.take_egui_input(&window);
                     let step_once = viewer.apply_hotkeys(&raw_input);
                     let mut requested_scene = None;
+                    let mut scene_rect = None;
                     let now = Instant::now();
                     let scheduled_steps = viewer.scheduled_steps(now);
                     let total_steps = scheduled_steps.saturating_add(u32::from(step_once));
                     for _ in 0..total_steps {
                         runtime.step(device, queue);
-                    }
-                    if total_steps > 0 {
-                        runtime.refresh_read_manager(device, queue, &mut viewer.read_manager);
                     }
 
                     let full_output = egui_ctx.run(raw_input, |ctx| {
@@ -238,11 +237,7 @@ async fn run() {
                                         viewer.focus_node = node;
                                         viewer.reset_camera();
                                         viewer.rebuild_scene(&runtime).expect("focused scene should rebuild");
-                                        runtime.refresh_read_manager(
-                                            device,
-                                            queue,
-                                            &mut viewer.read_manager,
-                                        );
+                                        scene_renderer.upload_scene(device, queue, &viewer.scene);
                                     }
                                 }
                             });
@@ -250,25 +245,22 @@ async fn run() {
                             ui.label("Hotkeys: R run, T slow-step, F fast, P pause, Space single-step. Pause freezes the simulation state but keeps charge flow animated on screen.");
                         });
 
-                        egui::CentralPanel::default().show(ctx, |ui| {
-                            if let Some(action) = show_focused_scene(
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE.fill(egui::Color32::TRANSPARENT))
+                            .show(ctx, |ui| {
+                            let viewport_output = interact_focused_scene(
                                 ui,
                                 &viewer.scene,
-                                &viewer.read_manager,
-                                animation_started_at.elapsed().as_secs_f64(),
-                                viewer.visual_pulse_rate_hz(),
                                 &mut viewer.viewport,
-                            ) {
+                            );
+                            scene_rect = Some(viewport_output.rect);
+                            if let Some(action) = viewport_output.action {
                                 match action {
                                     SceneAction::FocusChild(node) => {
                                         viewer.focus_node = node;
                                         viewer.reset_camera();
                                         viewer.rebuild_scene(&runtime).expect("child focus scene should rebuild");
-                                        runtime.refresh_read_manager(
-                                            device,
-                                            queue,
-                                            &mut viewer.read_manager,
-                                        );
+                                        scene_renderer.upload_scene(device, queue, &viewer.scene);
                                     }
                                 }
                             }
@@ -310,23 +302,34 @@ async fn run() {
                         &screen_descriptor,
                     );
 
+                    let output_view = frame
+                        .texture
+                        .create_view(&wgpu::TextureViewDescriptor::default());
+                    scene_renderer.draw(
+                        device,
+                        queue,
+                        &mut encoder,
+                        &output_view,
+                        [config.width, config.height],
+                        scene_rect,
+                        full_output.pixels_per_point,
+                        &viewer.viewport,
+                        &runtime.charge_buffers[runtime.current_read],
+                        &runtime.charge_buffers[(runtime.current_read + 1) % runtime.charge_buffers.len()],
+                        true,
+                        animation_started_at.elapsed().as_secs_f32(),
+                        viewer.visual_pulse_rate_hz(),
+                    );
+
                     {
-                        let output_view = frame
-                            .texture
-                            .create_view(&wgpu::TextureViewDescriptor::default());
                         let mut pass = encoder
                             .begin_render_pass(&wgpu::RenderPassDescriptor {
-                                label: Some("viewer-pass"),
+                                label: Some("viewer-egui-pass"),
                                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                                     view: &output_view,
                                     resolve_target: None,
                                     ops: wgpu::Operations {
-                                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                                            r: 0.04,
-                                            g: 0.05,
-                                            b: 0.07,
-                                            a: 1.0,
-                                        }),
+                                        load: wgpu::LoadOp::Load,
                                         store: wgpu::StoreOp::Store,
                                     },
                                     depth_slice: None,
@@ -349,7 +352,7 @@ async fn run() {
                             .expect("requested demo scene should build");
                         viewer = ViewerState::new(&runtime)
                             .expect("viewer should rebuild for requested scene");
-                        runtime.refresh_read_manager(device, queue, &mut viewer.read_manager);
+                        scene_renderer.upload_scene(device, queue, &viewer.scene);
                     }
 
                     if !response.repaint {
@@ -479,137 +482,12 @@ impl DemoRuntime {
         self.current_read = write_index;
         self.tick += 1;
     }
-
-    fn refresh_read_manager(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        read_manager: &mut ReadManager,
-    ) {
-        // The viewport must only read back the specific word ranges it asked
-        // for. Full-buffer readback scales with total simulation size and can
-        // become invalid once logical storage outgrows practical map/copy size.
-        let ranges = read_manager.required_ranges().to_vec();
-        let total_words: u32 = ranges.iter().map(|range| range.word_len).sum();
-        if total_words == 0 {
-            read_manager.load_ranges(std::iter::empty(), std::iter::empty());
-            return;
-        }
-
-        let preview_write = (self.current_read + 1) % self.charge_buffers.len();
-        let mut preview_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("viewer-preview-step"),
-        });
-        self.kernel.encode(
-            device,
-            &mut preview_encoder,
-            &self.uploaded,
-            &self.charge_buffers[self.current_read],
-            &self.charge_buffers[preview_write],
-            &self.output_buffer,
-        );
-        queue.submit(Some(preview_encoder.finish()));
-        let _ = device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        });
-
-        let loaded_read_ranges = read_back_buffer_ranges(
-            device,
-            queue,
-            &self.charge_buffers[self.current_read],
-            &ranges,
-            self.words_per_buffer,
-            "viewer-readback-read",
-            "viewer-readback-read-copy",
-        );
-        let loaded_write_ranges = read_back_buffer_ranges(
-            device,
-            queue,
-            &self.charge_buffers[preview_write],
-            &ranges,
-            self.words_per_buffer,
-            "viewer-readback-write",
-            "viewer-readback-write-copy",
-        );
-        read_manager.load_ranges(loaded_read_ranges, loaded_write_ranges);
-    }
-}
-
-fn read_back_buffer_ranges(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    source: &wgpu::Buffer,
-    ranges: &[circuits_game::readback::VisibleBufferRange],
-    words_per_buffer: u32,
-    readback_label: &str,
-    copy_label: &str,
-) -> Vec<(circuits_game::readback::VisibleBufferRange, Box<[u32]>)> {
-    let total_words: u32 = ranges.iter().map(|range| range.word_len).sum();
-    let size = total_words as u64 * std::mem::size_of::<u32>() as u64;
-    let readback = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some(readback_label),
-        size,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some(copy_label),
-    });
-    let mut dst_word_offset = 0u64;
-    for range in ranges {
-        let src_word_offset = (range.buffer * words_per_buffer + range.start_word) as u64;
-        let byte_len = range.word_len as u64 * std::mem::size_of::<u32>() as u64;
-        encoder.copy_buffer_to_buffer(
-            source,
-            src_word_offset * std::mem::size_of::<u32>() as u64,
-            &readback,
-            dst_word_offset * std::mem::size_of::<u32>() as u64,
-            byte_len,
-        );
-        dst_word_offset += range.word_len as u64;
-    }
-    queue.submit(Some(encoder.finish()));
-
-    let slice = readback.slice(..);
-    let (sender, receiver) = mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = sender.send(result);
-    });
-    let _ = device.poll(wgpu::PollType::Wait {
-        submission_index: None,
-        timeout: None,
-    });
-    receiver
-        .recv()
-        .expect("readback channel should receive a result")
-        .expect("readback buffer should map successfully");
-
-    let loaded_ranges = {
-        let mapped = slice.get_mapped_range();
-        let words = bytemuck::cast_slice::<u8, u32>(&mapped);
-        let mut start = 0usize;
-        ranges
-            .iter()
-            .copied()
-            .map(|range| {
-                let end = start + range.word_len as usize;
-                let values = words[start..end].to_vec().into_boxed_slice();
-                start = end;
-                (range, values)
-            })
-            .collect::<Vec<_>>()
-    };
-    readback.unmap();
-    loaded_ranges
 }
 
 struct ViewerState {
     focus_node: circuits_game::gate_plans::NodeId,
     child_ids: Vec<circuits_game::gate_plans::NodeId>,
     scene: FocusedScene,
-    read_manager: ReadManager,
     viewport: ViewportState,
     simulation_mode: SimulationMode,
     tick_rate: u32,
@@ -637,12 +515,10 @@ impl ViewerState {
             runtime.words_per_buffer,
         )
         .map_err(|error| format!("failed to build initial focused scene: {error:?}"))?;
-        let read_manager = ReadManager::for_scene(&scene);
         Ok(Self {
             focus_node,
             child_ids: child_ids_of(&runtime.root, focus_node),
             scene,
-            read_manager,
             viewport: ViewportState::default(),
             simulation_mode: SimulationMode::Paused,
             tick_rate: DEFAULT_TICK_RATE,
@@ -716,7 +592,6 @@ impl ViewerState {
             runtime.words_per_buffer,
         )
         .map_err(|error| format!("failed to rebuild focused scene: {error:?}"))?;
-        self.read_manager = ReadManager::for_scene(&self.scene);
         self.child_ids = child_ids_of(&runtime.root, self.focus_node);
         Ok(())
     }

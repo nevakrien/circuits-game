@@ -1,18 +1,19 @@
 use std::{
     env,
-    sync::{mpsc, Arc},
+    sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
 
 use circuits_game::{
     gate_plans::{
-        compile_component_tree, ChildPlacement, Component, ComponentPlan, ComponentPlans, Gate,
-        GateId, SignalRef,
+        ChildPlacement, Component, ComponentPlan, ComponentPlans, Gate, GateId, SignalRef,
+        compile_component_tree,
     },
     kernel::{GateKernel, UploadedGpuPlan},
     readback::{ReadManager, VisibleBufferRange},
+    scene_render::SceneRenderer,
     setup,
-    visual_ui::{build_focused_scene, show_focused_scene, FocusedScene, ViewportState},
+    visual_ui::{FocusedScene, ViewportState, build_focused_scene, interact_focused_scene},
 };
 use egui_wgpu::wgpu;
 use egui_winit::winit;
@@ -94,6 +95,8 @@ fn run(args: Args) {
     );
     let egui_renderer =
         egui_wgpu::Renderer::new(device, config.format, egui_wgpu::RendererOptions::default());
+    let mut scene_renderer = SceneRenderer::new(device, config.format);
+    scene_renderer.upload_scene(device, queue, &scene);
 
     let mut bench = ViewerBenchState {
         args,
@@ -119,6 +122,7 @@ fn run(args: Args) {
         egui_ctx,
         egui_state,
         egui_renderer,
+        scene_renderer,
         runtime,
         readback_plan,
         app_started_at: started_at,
@@ -221,9 +225,10 @@ fn run(args: Args) {
                     let refresh_total = refresh_started_at.elapsed();
 
                     let ui_started_at = Instant::now();
+                    let mut scene_rect = None;
                     let full_output = bench.egui_ctx.run(raw_input, |ctx| {
                         egui::CentralPanel::default()
-                            .frame(egui::Frame::central_panel(&ctx.style()))
+                            .frame(egui::Frame::NONE.fill(egui::Color32::TRANSPARENT))
                             .show(ctx, |ui| {
                                 if !bench.viewport_initialized {
                                     bench.viewport = centered_zoom_viewport(
@@ -233,14 +238,9 @@ fn run(args: Args) {
                                     );
                                     bench.viewport_initialized = true;
                                 }
-                                let _ = show_focused_scene(
-                                    ui,
-                                    &bench.scene,
-                                    &bench.read_manager,
-                                    bench.app_started_at.elapsed().as_secs_f64(),
-                                    60.0,
-                                    &mut bench.viewport,
-                                );
+                                let viewport_output =
+                                    interact_focused_scene(ui, &bench.scene, &mut bench.viewport);
+                                scene_rect = Some(viewport_output.rect);
                             });
                     });
                     let ui_time = ui_started_at.elapsed();
@@ -301,6 +301,22 @@ fn run(args: Args) {
                         let output_view = frame
                             .texture
                             .create_view(&wgpu::TextureViewDescriptor::default());
+                        bench.scene_renderer.draw(
+                            device,
+                            queue,
+                            &mut encoder,
+                            &output_view,
+                            [bench.config.width, bench.config.height],
+                            scene_rect,
+                            full_output.pixels_per_point,
+                            &bench.viewport,
+                            &bench.runtime.charge_buffers[bench.runtime.current_read],
+                            &bench.runtime.charge_buffers[(bench.runtime.current_read + 1)
+                                % bench.runtime.charge_buffers.len()],
+                            true,
+                            bench.app_started_at.elapsed().as_secs_f32(),
+                            60.0,
+                        );
                         let mut pass = encoder
                             .begin_render_pass(&wgpu::RenderPassDescriptor {
                                 label: Some("stress-viewer-benchmark-pass"),
@@ -308,12 +324,7 @@ fn run(args: Args) {
                                     view: &output_view,
                                     resolve_target: None,
                                     ops: wgpu::Operations {
-                                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                                            r: 0.04,
-                                            g: 0.05,
-                                            b: 0.07,
-                                            a: 1.0,
-                                        }),
+                                        load: wgpu::LoadOp::Load,
                                         store: wgpu::StoreOp::Store,
                                     },
                                     depth_slice: None,
@@ -620,6 +631,7 @@ struct ViewerBenchState {
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
+    scene_renderer: SceneRenderer,
     runtime: BenchRuntime,
     readback_plan: ReadbackPlanStats,
     app_started_at: Instant,
