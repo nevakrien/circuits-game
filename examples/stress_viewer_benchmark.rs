@@ -269,7 +269,6 @@ fn run(args: Args) {
                             &bench.runtime.charge_buffers[bench.runtime.current_read],
                             &bench.runtime.charge_buffers[(bench.runtime.current_read + 1)
                                 % bench.runtime.charge_buffers.len()],
-                            true,
                             bench.app_started_at.elapsed().as_secs_f32(),
                             60.0,
                         );

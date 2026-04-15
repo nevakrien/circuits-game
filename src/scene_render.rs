@@ -11,17 +11,18 @@ use crate::{
     visual_ui::{FocusedScene, PlacedGate, ViewportState, VisualWire},
 };
 
-const SHAPE_BUFFER_LABEL: &str = "scene-render-shapes";
+const GRID_BUFFER_LABEL: &str = "scene-render-grids";
+const GATE_BUFFER_LABEL: &str = "scene-render-gates";
+const PORT_BUFFER_LABEL: &str = "scene-render-ports";
+const CHILD_FRAME_BUFFER_LABEL: &str = "scene-render-child-frames";
 const WIRE_BUFFER_LABEL: &str = "scene-render-wires";
-const SHAPE_KIND_GATE: u32 = 0;
-const SHAPE_KIND_CHILD: u32 = 1;
-const SHAPE_KIND_INPUT_PORT: u32 = 2;
-const SHAPE_KIND_OUTPUT_PORT: u32 = 3;
-const SHAPE_KIND_CHILD_INPUT_PORT: u32 = 4;
-const SHAPE_KIND_CHILD_OUTPUT_PORT: u32 = 5;
-const SHAPE_KIND_ANCESTOR_PORT: u32 = 6;
-const SHAPE_KIND_GATE_INPUT_MARKER: u32 = 7;
-const SHAPE_KIND_GATE_OUTPUT_MARKER: u32 = 8;
+const PORT_KIND_INPUT: u32 = 0;
+const PORT_KIND_OUTPUT: u32 = 1;
+const PORT_KIND_ANCESTOR: u32 = 2;
+const PORT_KIND_CHILD_INPUT: u32 = 3;
+const PORT_KIND_CHILD_OUTPUT: u32 = 4;
+const PORT_KIND_GATE_INPUT_MARKER: u32 = 5;
+const PORT_KIND_GATE_OUTPUT_MARKER: u32 = 6;
 const CHARGE_SOURCE_READ: u32 = 0;
 const CHARGE_SOURCE_WRITE: u32 = 1;
 const CHARGE_SOURCE_NONE: u32 = 2;
@@ -29,22 +30,47 @@ const CHARGE_SOURCE_NONE: u32 = 2;
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct SceneUniform {
-    surface_scene_min: [f32; 4],
-    scene_size_screen_min: [f32; 4],
-    source_scale_time_pulse: [f32; 4],
-    grid_rect: [f32; 4],
+    surface_size: [f32; 4],
+    scene_rect: [f32; 4],
+    view_scale_time: [f32; 4],
     scene_bits: [u32; 4],
 }
 
-const _: () = assert!(std::mem::size_of::<SceneUniform>() == 80);
+const _: () = assert!(std::mem::size_of::<SceneUniform>() == 64);
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct ShapeInstance {
+struct GridInstance {
+    min: [f32; 2],
+    max: [f32; 2],
+    grid_min: [f32; 2],
+    grid_max: [f32; 2],
+    grid_dims: [u32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct GateInstance {
     min: [f32; 2],
     max: [f32; 2],
     charge: [u32; 4],
-    shape_meta: [u32; 4],
+    gate_meta: [u32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PortInstance {
+    min: [f32; 2],
+    max: [f32; 2],
+    charge: [u32; 4],
+    port_meta: [u32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ChildFrameInstance {
+    min: [f32; 2],
+    max: [f32; 2],
 }
 
 #[repr(C)]
@@ -63,13 +89,17 @@ struct UploadedChild {
 }
 
 struct UploadedScene {
-    shape_buffer: wgpu::Buffer,
+    grid_buffer: wgpu::Buffer,
+    gate_buffer: wgpu::Buffer,
+    port_buffer: wgpu::Buffer,
+    child_frame_buffer: wgpu::Buffer,
     wire_buffer: wgpu::Buffer,
-    shape_count: u32,
+    grid_count: u32,
+    gate_count: u32,
+    port_count: u32,
+    child_frame_count: u32,
     wire_count: u32,
     words_per_buffer: u32,
-    grid_rect: Rect,
-    grid_dims: [u32; 2],
     children: Vec<UploadedChild>,
 }
 
@@ -111,8 +141,10 @@ impl SceneTransform {
 }
 
 pub struct SceneRenderer {
-    board_pipeline: wgpu::RenderPipeline,
-    shape_pipeline: wgpu::RenderPipeline,
+    grid_pipeline: wgpu::RenderPipeline,
+    gate_pipeline: wgpu::RenderPipeline,
+    port_pipeline: wgpu::RenderPipeline,
+    child_frame_pipeline: wgpu::RenderPipeline,
     wire_pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     uniform_buffer: wgpu::Buffer,
@@ -175,8 +207,19 @@ impl SceneRenderer {
             mapped_at_creation: false,
         });
 
-        let shape_layout = wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<ShapeInstance>() as u64,
+        let grid_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<GridInstance>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &wgpu::vertex_attr_array![
+                0 => Float32x2,
+                1 => Float32x2,
+                2 => Float32x2,
+                3 => Float32x2,
+                4 => Uint32x4
+            ],
+        };
+        let gate_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<GateInstance>() as u64,
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &wgpu::vertex_attr_array![
                 0 => Float32x2,
@@ -184,6 +227,21 @@ impl SceneRenderer {
                 2 => Uint32x4,
                 3 => Uint32x4
             ],
+        };
+        let port_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<PortInstance>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &wgpu::vertex_attr_array![
+                0 => Float32x2,
+                1 => Float32x2,
+                2 => Uint32x4,
+                3 => Uint32x4
+            ],
+        };
+        let child_frame_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<ChildFrameInstance>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2],
         };
         let wire_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<WireInstance>() as u64,
@@ -197,88 +255,68 @@ impl SceneRenderer {
             ],
         };
 
-        let board_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("scene-render-board-pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_board"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_board"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: Default::default(),
-            depth_stencil: None,
-            multisample: Default::default(),
-            multiview: None,
-            cache: None,
-        });
-
-        let shape_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("scene-render-shape-pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_shape"),
-                buffers: &[shape_layout],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_shape"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: Default::default(),
-            depth_stencil: None,
-            multisample: Default::default(),
-            multiview: None,
-            cache: None,
-        });
-
-        let wire_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("scene-render-wire-pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_wire"),
-                buffers: &[wire_layout],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_wire"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: Default::default(),
-            depth_stencil: None,
-            multisample: Default::default(),
-            multiview: None,
-            cache: None,
-        });
+        let make_pipeline = |label: &str,
+                             vertex: &str,
+                             fragment: &str,
+                             buffers: &[wgpu::VertexBufferLayout<'_>]| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some(vertex),
+                    buffers,
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(fragment),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                multiview: None,
+                cache: None,
+            })
+        };
 
         Self {
-            board_pipeline,
-            shape_pipeline,
-            wire_pipeline,
+            grid_pipeline: make_pipeline(
+                "scene-render-grid-pipeline",
+                "vs_grid",
+                "fs_grid",
+                &[grid_layout],
+            ),
+            gate_pipeline: make_pipeline(
+                "scene-render-gate-pipeline",
+                "vs_gate",
+                "fs_gate",
+                &[gate_layout],
+            ),
+            port_pipeline: make_pipeline(
+                "scene-render-port-pipeline",
+                "vs_port",
+                "fs_port",
+                &[port_layout],
+            ),
+            child_frame_pipeline: make_pipeline(
+                "scene-render-child-frame-pipeline",
+                "vs_child_frame",
+                "fs_child_frame",
+                &[child_frame_layout],
+            ),
+            wire_pipeline: make_pipeline(
+                "scene-render-wire-pipeline",
+                "vs_wire",
+                "fs_wire",
+                &[wire_layout],
+            ),
             bind_group_layout,
             uniform_buffer,
             uploaded_scene: None,
@@ -313,7 +351,6 @@ impl SceneRenderer {
         viewport: &ViewportState,
         current_charge: &wgpu::Buffer,
         next_charge: &wgpu::Buffer,
-        clear_background: bool,
         time: f32,
         pulse_rate_hz: f32,
     ) {
@@ -344,7 +381,7 @@ impl SceneRenderer {
         });
 
         let scene_rect_px = rect_to_pixels(scene_rect, pixels_per_point);
-        self.draw_shapes_tree(
+        self.draw_scene_tree(
             queue,
             encoder,
             output_view,
@@ -352,23 +389,7 @@ impl SceneRenderer {
             surface_size,
             scene_rect_px,
             uploaded_scene,
-            uploaded_scene.grid_rect,
-            viewport,
-            pixels_per_point,
-            clear_background,
-            time,
-            pulse_rate_hz,
-            false,
-        );
-        self.draw_wires_tree(
-            queue,
-            encoder,
-            output_view,
-            &bind_group,
-            surface_size,
             scene_rect_px,
-            uploaded_scene,
-            uploaded_scene.grid_rect,
             viewport,
             pixels_per_point,
             time,
@@ -378,98 +399,7 @@ impl SceneRenderer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn draw_shapes_tree(
-        &self,
-        queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        output_view: &wgpu::TextureView,
-        bind_group: &wgpu::BindGroup,
-        surface_size: [u32; 2],
-        scene_rect_px: Rect,
-        scene: &UploadedScene,
-        clip_world_rect: Rect,
-        viewport: &ViewportState,
-        pixels_per_point: f32,
-        clear_background: bool,
-        time: f32,
-        pulse_rate_hz: f32,
-        nested: bool,
-    ) {
-        let Some((scissor_x, scissor_y, scissor_width, scissor_height)) = self
-            .write_scene_uniforms(
-                queue,
-                surface_size,
-                scene_rect_px,
-                scene,
-                clip_world_rect,
-                viewport,
-                pixels_per_point,
-                time,
-                pulse_rate_hz,
-                nested,
-            )
-        else {
-            return;
-        };
-
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("scene-render-pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: output_view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: if clear_background {
-                        wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.04,
-                            g: 0.05,
-                            b: 0.07,
-                            a: 1.0,
-                        })
-                    } else {
-                        wgpu::LoadOp::Load
-                    },
-                    store: wgpu::StoreOp::Store,
-                },
-                depth_slice: None,
-            })],
-            ..Default::default()
-        });
-        pass.set_scissor_rect(scissor_x, scissor_y, scissor_width, scissor_height);
-        pass.set_bind_group(0, bind_group, &[]);
-        pass.set_pipeline(&self.board_pipeline);
-        pass.draw(0..6, 0..1);
-
-        if scene.shape_count > 0 {
-            pass.set_pipeline(&self.shape_pipeline);
-            pass.set_vertex_buffer(0, scene.shape_buffer.slice(..));
-            pass.draw(0..6, 0..scene.shape_count);
-        }
-        drop(pass);
-
-        if viewport.zoom >= CHILD_ZOOM_PREVIEW {
-            for child in &scene.children {
-                self.draw_shapes_tree(
-                    queue,
-                    encoder,
-                    output_view,
-                    bind_group,
-                    surface_size,
-                    scene_rect_px,
-                    &child.scene,
-                    child.rect,
-                    viewport,
-                    pixels_per_point,
-                    false,
-                    time,
-                    pulse_rate_hz,
-                    true,
-                );
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn draw_wires_tree(
+    fn draw_scene_tree(
         &self,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
@@ -490,21 +420,74 @@ impl SceneRenderer {
                 queue,
                 surface_size,
                 scene_rect_px,
-                scene,
                 clip_world_rect,
                 viewport,
                 pixels_per_point,
                 time,
                 pulse_rate_hz,
+                scene.words_per_buffer,
                 nested,
             )
         else {
             return;
         };
 
+        self.draw_instance_pass(
+            encoder,
+            output_view,
+            bind_group,
+            &self.grid_pipeline,
+            scene.grid_buffer.slice(..),
+            scene.grid_count,
+            scissor_x,
+            scissor_y,
+            scissor_width,
+            scissor_height,
+            "scene-render-grid-pass",
+        );
+        self.draw_instance_pass(
+            encoder,
+            output_view,
+            bind_group,
+            &self.child_frame_pipeline,
+            scene.child_frame_buffer.slice(..),
+            scene.child_frame_count,
+            scissor_x,
+            scissor_y,
+            scissor_width,
+            scissor_height,
+            "scene-render-child-frame-pass",
+        );
+        self.draw_instance_pass(
+            encoder,
+            output_view,
+            bind_group,
+            &self.gate_pipeline,
+            scene.gate_buffer.slice(..),
+            scene.gate_count,
+            scissor_x,
+            scissor_y,
+            scissor_width,
+            scissor_height,
+            "scene-render-gate-pass",
+        );
+        self.draw_instance_pass(
+            encoder,
+            output_view,
+            bind_group,
+            &self.port_pipeline,
+            scene.port_buffer.slice(..),
+            scene.port_count,
+            scissor_x,
+            scissor_y,
+            scissor_width,
+            scissor_height,
+            "scene-render-port-pass",
+        );
+
         if viewport.zoom >= CHILD_ZOOM_PREVIEW {
             for child in &scene.children {
-                self.draw_wires_tree(
+                self.draw_scene_tree(
                     queue,
                     encoder,
                     output_view,
@@ -522,12 +505,42 @@ impl SceneRenderer {
             }
         }
 
-        if scene.wire_count == 0 {
+        self.draw_instance_pass(
+            encoder,
+            output_view,
+            bind_group,
+            &self.wire_pipeline,
+            scene.wire_buffer.slice(..),
+            scene.wire_count,
+            scissor_x,
+            scissor_y,
+            scissor_width,
+            scissor_height,
+            "scene-render-wire-pass",
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_instance_pass(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        output_view: &wgpu::TextureView,
+        bind_group: &wgpu::BindGroup,
+        pipeline: &wgpu::RenderPipeline,
+        buffer_slice: wgpu::BufferSlice<'_>,
+        instance_count: u32,
+        scissor_x: u32,
+        scissor_y: u32,
+        scissor_width: u32,
+        scissor_height: u32,
+        label: &str,
+    ) {
+        if instance_count == 0 {
             return;
         }
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("scene-render-wire-pass"),
+            label: Some(label),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: output_view,
                 resolve_target: None,
@@ -541,9 +554,9 @@ impl SceneRenderer {
         });
         pass.set_scissor_rect(scissor_x, scissor_y, scissor_width, scissor_height);
         pass.set_bind_group(0, bind_group, &[]);
-        pass.set_pipeline(&self.wire_pipeline);
-        pass.set_vertex_buffer(0, scene.wire_buffer.slice(..));
-        pass.draw(0..6, 0..scene.wire_count);
+        pass.set_pipeline(pipeline);
+        pass.set_vertex_buffer(0, buffer_slice);
+        pass.draw(0..6, 0..instance_count);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -552,45 +565,41 @@ impl SceneRenderer {
         queue: &wgpu::Queue,
         surface_size: [u32; 2],
         scene_rect_px: Rect,
-        scene: &UploadedScene,
         clip_world_rect: Rect,
         viewport: &ViewportState,
         pixels_per_point: f32,
         time: f32,
         pulse_rate_hz: f32,
+        words_per_buffer: u32,
         nested: bool,
     ) -> Option<(u32, u32, u32, u32)> {
-        let scissor_rect =
+        let scissor_rect = if nested {
             root_world_rect_to_screen(scene_rect_px, viewport, pixels_per_point, clip_world_rect)
-                .intersect(scene_rect_px);
+                .intersect(scene_rect_px)
+        } else {
+            scene_rect_px
+        };
         let scissor = scissor_to_u32(scissor_rect, surface_size)?;
-
         let scene_origin_px = scene_rect_px.min + viewport.pan * pixels_per_point;
         let uniforms = SceneUniform {
-            surface_scene_min: [
+            surface_size: [
                 surface_size[0].max(1) as f32,
                 surface_size[1].max(1) as f32,
+                0.0,
+                0.0,
+            ],
+            scene_rect: [
                 scene_rect_px.min.x,
                 scene_rect_px.min.y,
-            ],
-            scene_size_screen_min: [
-                scene_rect_px.width(),
-                scene_rect_px.height(),
                 scene_origin_px.x,
                 scene_origin_px.y,
             ],
-            source_scale_time_pulse: [0.0, 0.0, viewport.zoom * pixels_per_point, time],
-            grid_rect: [
-                scene.grid_rect.min.x,
-                scene.grid_rect.min.y,
-                scene.grid_rect.max.x,
-                scene.grid_rect.max.y,
-            ],
+            view_scale_time: [0.0, 0.0, viewport.zoom * pixels_per_point, time],
             scene_bits: [
-                scene.words_per_buffer,
+                words_per_buffer,
                 nested as u32,
-                scene.grid_dims[1].max(1),
                 pulse_cycles_per_second(pulse_rate_hz).to_bits(),
+                0,
             ],
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
@@ -606,7 +615,15 @@ fn upload_scene_tree(
     transform: SceneTransform,
 ) -> UploadedScene {
     let cached = build_scene_instances(scene, nested, transform);
-    let shape_buffer = upload_buffer(device, queue, SHAPE_BUFFER_LABEL, &cached.shapes);
+    let grid_buffer = upload_buffer(device, queue, GRID_BUFFER_LABEL, &cached.grids);
+    let gate_buffer = upload_buffer(device, queue, GATE_BUFFER_LABEL, &cached.gates);
+    let port_buffer = upload_buffer(device, queue, PORT_BUFFER_LABEL, &cached.ports);
+    let child_frame_buffer = upload_buffer(
+        device,
+        queue,
+        CHILD_FRAME_BUFFER_LABEL,
+        &cached.child_frames,
+    );
     let wire_buffer = upload_buffer(device, queue, WIRE_BUFFER_LABEL, &cached.wires);
     let children = scene
         .children
@@ -628,13 +645,17 @@ fn upload_scene_tree(
         .collect();
 
     UploadedScene {
-        shape_buffer,
+        grid_buffer,
+        gate_buffer,
+        port_buffer,
+        child_frame_buffer,
         wire_buffer,
-        shape_count: cached.shapes.len() as u32,
+        grid_count: cached.grids.len() as u32,
+        gate_count: cached.gates.len() as u32,
+        port_count: cached.ports.len() as u32,
+        child_frame_count: cached.child_frames.len() as u32,
         wire_count: cached.wires.len() as u32,
         words_per_buffer: scene.words_per_buffer,
-        grid_rect: transform.rect(scene.grid_rect),
-        grid_dims: scene.grid_dims,
         children,
     }
 }
@@ -660,7 +681,10 @@ fn upload_buffer<T: Pod>(
 }
 
 struct CachedInstances {
-    shapes: Vec<ShapeInstance>,
+    grids: Vec<GridInstance>,
+    gates: Vec<GateInstance>,
+    ports: Vec<PortInstance>,
+    child_frames: Vec<ChildFrameInstance>,
     wires: Vec<WireInstance>,
 }
 
@@ -670,12 +694,33 @@ fn build_scene_instances(
     transform: SceneTransform,
 ) -> CachedInstances {
     let mut cached = CachedInstances {
-        shapes: Vec::new(),
+        grids: vec![GridInstance {
+            min: [
+                transform.pos(scene.bounds.min).x,
+                transform.pos(scene.bounds.min).y,
+            ],
+            max: [
+                transform.pos(scene.bounds.max).x,
+                transform.pos(scene.bounds.max).y,
+            ],
+            grid_min: [
+                transform.pos(scene.grid_rect.min).x,
+                transform.pos(scene.grid_rect.min).y,
+            ],
+            grid_max: [
+                transform.pos(scene.grid_rect.max).x,
+                transform.pos(scene.grid_rect.max).y,
+            ],
+            grid_dims: [scene.grid_dims[0], scene.grid_dims[1], nested as u32, 0],
+        }],
+        gates: Vec::new(),
+        ports: Vec::new(),
+        child_frames: Vec::new(),
         wires: Vec::new(),
     };
 
     for gate in &scene.gates {
-        cached.shapes.push(ShapeInstance {
+        cached.gates.push(GateInstance {
             min: [
                 transform.pos(gate.rect.min + egui::vec2(10.0, 10.0)).x,
                 transform.pos(gate.rect.min + egui::vec2(10.0, 10.0)).y,
@@ -690,30 +735,30 @@ fn build_scene_instances(
                 CHARGE_SOURCE_WRITE,
                 gate.gate,
             ),
-            shape_meta: [SHAPE_KIND_GATE, gate_tag(gate.gate), 0, 0],
+            gate_meta: [gate_tag(gate.gate), 0, 0, 0],
         });
         for (input_index, source_gate) in gate.input_sources.iter().enumerate() {
             let anchor = gate_anchor(gate, Some(input_index));
-            cached.shapes.push(circle_instance(
+            cached.ports.push(circle_instance(
                 transform.pos(anchor),
                 7.0 * transform.scale,
                 source_gate
                     .and_then(|source| scene.gate_store.get(&source).copied())
                     .map(|store| charge_ref(store, CHARGE_SOURCE_READ, 0))
                     .unwrap_or([0, 0, CHARGE_SOURCE_NONE, 0]),
-                SHAPE_KIND_GATE_INPUT_MARKER,
+                PORT_KIND_GATE_INPUT_MARKER,
             ));
         }
-        cached.shapes.push(circle_instance(
+        cached.ports.push(circle_instance(
             transform.pos(gate_anchor(gate, None)),
             7.0 * transform.scale,
             charge_ref_for_gate(scene, (scene.node, gate.id), CHARGE_SOURCE_READ, gate.gate),
-            SHAPE_KIND_GATE_OUTPUT_MARKER,
+            PORT_KIND_GATE_OUTPUT_MARKER,
         ));
     }
 
     for child in &scene.children {
-        cached.shapes.push(ShapeInstance {
+        cached.child_frames.push(ChildFrameInstance {
             min: [
                 transform.pos(child.rect.min).x,
                 transform.pos(child.rect.min).y,
@@ -722,11 +767,9 @@ fn build_scene_instances(
                 transform.pos(child.rect.max).x,
                 transform.pos(child.rect.max).y,
             ],
-            charge: [0, 0, CHARGE_SOURCE_NONE, 0],
-            shape_meta: [SHAPE_KIND_CHILD, 0, 0, 0],
         });
         for port in &child.inputs {
-            cached.shapes.push(circle_instance(
+            cached.ports.push(circle_instance(
                 transform.pos(port.anchor),
                 6.5 * transform.scale,
                 charge_ref_for_gate(
@@ -737,11 +780,11 @@ fn build_scene_instances(
                         src: crate::gate_plans::SignalRef::ThisGate(port.source_gate.1),
                     },
                 ),
-                SHAPE_KIND_CHILD_INPUT_PORT,
+                PORT_KIND_CHILD_INPUT,
             ));
         }
         for port in &child.outputs {
-            cached.shapes.push(circle_instance(
+            cached.ports.push(circle_instance(
                 transform.pos(port.anchor),
                 6.5 * transform.scale,
                 charge_ref_for_gate(
@@ -752,14 +795,14 @@ fn build_scene_instances(
                         src: crate::gate_plans::SignalRef::ThisGate(port.source_gate.1),
                     },
                 ),
-                SHAPE_KIND_CHILD_OUTPUT_PORT,
+                PORT_KIND_CHILD_OUTPUT,
             ));
         }
     }
 
     if !nested {
         for port in &scene.input_ports {
-            cached.shapes.push(circle_instance(
+            cached.ports.push(circle_instance(
                 transform.pos(port.anchor),
                 6.5 * transform.scale,
                 charge_ref_for_gate(
@@ -770,11 +813,11 @@ fn build_scene_instances(
                         src: crate::gate_plans::SignalRef::ThisGate(port.source_gate.1),
                     },
                 ),
-                SHAPE_KIND_INPUT_PORT,
+                PORT_KIND_INPUT,
             ));
         }
         for port in &scene.output_ports {
-            cached.shapes.push(circle_instance(
+            cached.ports.push(circle_instance(
                 transform.pos(port.anchor),
                 6.5 * transform.scale,
                 charge_ref_for_gate(
@@ -785,11 +828,11 @@ fn build_scene_instances(
                         src: crate::gate_plans::SignalRef::ThisGate(port.source_gate.1),
                     },
                 ),
-                SHAPE_KIND_OUTPUT_PORT,
+                PORT_KIND_OUTPUT,
             ));
         }
         for port in &scene.ancestor_ports {
-            cached.shapes.push(circle_instance(
+            cached.ports.push(circle_instance(
                 transform.pos(port.anchor),
                 6.5 * transform.scale,
                 charge_ref_for_gate(
@@ -800,7 +843,7 @@ fn build_scene_instances(
                         src: crate::gate_plans::SignalRef::ThisGate(port.source_gate.1),
                     },
                 ),
-                SHAPE_KIND_ANCESTOR_PORT,
+                PORT_KIND_ANCESTOR,
             ));
         }
     }
@@ -856,12 +899,12 @@ fn append_wire_instances(
     }
 }
 
-fn circle_instance(center: Pos2, radius: f32, charge: [u32; 4], kind: u32) -> ShapeInstance {
-    ShapeInstance {
+fn circle_instance(center: Pos2, radius: f32, charge: [u32; 4], port_kind: u32) -> PortInstance {
+    PortInstance {
         min: [center.x - radius, center.y - radius],
         max: [center.x + radius, center.y + radius],
         charge,
-        shape_meta: [kind, 0, 0, 0],
+        port_meta: [port_kind, 0, 0, 0],
     }
 }
 

@@ -316,7 +316,6 @@ async fn run() {
                         &viewer.viewport,
                         &runtime.charge_buffers[runtime.current_read],
                         &runtime.charge_buffers[(runtime.current_read + 1) % runtime.charge_buffers.len()],
-                        true,
                         animation_started_at.elapsed().as_secs_f32(),
                         viewer.visual_pulse_rate_hz(),
                     );

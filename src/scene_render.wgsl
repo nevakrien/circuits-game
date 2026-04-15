@@ -1,16 +1,35 @@
 struct SceneUniform {
-    surface_scene_min: vec4<f32>,
-    scene_size_screen_min: vec4<f32>,
-    source_scale_time_pulse: vec4<f32>,
-    grid_rect: vec4<f32>,
+    surface_size: vec4<f32>,
+    scene_rect: vec4<f32>,
+    view_scale_time: vec4<f32>,
     scene_bits: vec4<u32>,
 };
 
-struct ShapeInstance {
+struct GridInstance {
+    @location(0) min: vec2<f32>,
+    @location(1) max: vec2<f32>,
+    @location(2) grid_min: vec2<f32>,
+    @location(3) grid_max: vec2<f32>,
+    @location(4) grid_dims: vec4<u32>,
+};
+
+struct GateInstance {
     @location(0) min: vec2<f32>,
     @location(1) max: vec2<f32>,
     @location(2) charge: vec4<u32>,
-    @location(3) shape_meta: vec4<u32>,
+    @location(3) gate_meta: vec4<u32>,
+};
+
+struct PortInstance {
+    @location(0) min: vec2<f32>,
+    @location(1) max: vec2<f32>,
+    @location(2) charge: vec4<u32>,
+    @location(3) port_meta: vec4<u32>,
+};
+
+struct ChildFrameInstance {
+    @location(0) min: vec2<f32>,
+    @location(1) max: vec2<f32>,
 };
 
 struct WireInstance {
@@ -21,11 +40,33 @@ struct WireInstance {
     @location(4) charge: vec4<u32>,
 };
 
-struct VsOut {
+struct GridVsOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) world: vec2<f32>,
+    @location(1) grid_min: vec2<f32>,
+    @location(2) grid_max: vec2<f32>,
+    @location(3) grid_dims: vec2<f32>,
+    @location(4) nested: f32,
+};
+
+struct RectVsOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) local: vec2<f32>,
+    @location(1) size_px: vec2<f32>,
+};
+
+struct GateVsOut {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) local: vec2<f32>,
     @location(1) charge: vec4<u32>,
-    @location(2) shape_meta: vec4<u32>,
+    @location(2) gate_tag: u32,
+};
+
+struct PortVsOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) local: vec2<f32>,
+    @location(1) charge: vec4<u32>,
+    @location(2) port_kind: u32,
 };
 
 struct WireVsOut {
@@ -62,15 +103,14 @@ fn quad_pos(vertex_index: u32) -> vec2<f32> {
 
 fn screen_to_clip(screen: vec2<f32>) -> vec4<f32> {
     let ndc = vec2<f32>(
-        (screen.x / uniforms.surface_scene_min.x) * 2.0 - 1.0,
-        1.0 - (screen.y / uniforms.surface_scene_min.y) * 2.0,
+        (screen.x / uniforms.surface_size.x) * 2.0 - 1.0,
+        1.0 - (screen.y / uniforms.surface_size.y) * 2.0,
     );
     return vec4<f32>(ndc, 0.0, 1.0);
 }
 
 fn world_to_screen(world: vec2<f32>) -> vec2<f32> {
-    return uniforms.scene_size_screen_min.zw
-        + (world - uniforms.source_scale_time_pulse.xy) * uniforms.source_scale_time_pulse.z;
+    return uniforms.scene_rect.zw + (world - uniforms.view_scale_time.xy) * uniforms.view_scale_time.z;
 }
 
 fn world_to_clip(world: vec2<f32>) -> vec4<f32> {
@@ -204,7 +244,7 @@ fn glyph_row_bits(ch: u32, row: u32) -> u32 {
 
 fn gate_label_alpha(local: vec2<f32>, gate_tag: u32) -> f32 {
     let label_len = gate_label_len(gate_tag);
-    if label_len == 0u || uniforms.source_scale_time_pulse.z < 0.45 {
+    if label_len == 0u || uniforms.view_scale_time.z < 0.45 {
         return 0.0;
     }
 
@@ -233,111 +273,170 @@ fn gate_label_alpha(local: vec2<f32>, gate_tag: u32) -> f32 {
     let row_bits = glyph_row_bits(gate_label_char(gate_tag, char_index), glyph_y);
     let column_mask = 1u << (4u - glyph_x);
     let filled = f32(select(0u, 1u, (row_bits & column_mask) != 0u));
-
     let grid = fract(vec2<f32>(pixel_x, pixel_y));
     let edge = min(min(grid.x, 1.0 - grid.x), min(grid.y, 1.0 - grid.y));
     return filled * smoothstep(0.02, 0.18, edge);
 }
 
 @vertex
-fn vs_board(@builtin(vertex_index) vertex_index: u32) -> VsOut {
+fn vs_grid(instance: GridInstance, @builtin(vertex_index) vertex_index: u32) -> GridVsOut {
     let local = quad_pos(vertex_index);
-    let screen = uniforms.surface_scene_min.zw + local * uniforms.scene_size_screen_min.xy;
-    var out: VsOut;
-    out.clip_pos = screen_to_clip(screen);
-    out.local = local;
-    out.charge = vec4<u32>(0u);
-    out.shape_meta = vec4<u32>(0u);
+    let world = instance.min + (instance.max - instance.min) * local;
+    var out: GridVsOut;
+    out.clip_pos = world_to_clip(world);
+    out.world = world;
+    out.grid_min = instance.grid_min;
+    out.grid_max = instance.grid_max;
+    out.grid_dims = vec2<f32>(f32(instance.grid_dims.x), f32(instance.grid_dims.y));
+    out.nested = f32(instance.grid_dims.z);
     return out;
 }
 
 @fragment
-fn fs_board(in: VsOut) -> @location(0) vec4<f32> {
-    let screen = uniforms.surface_scene_min.zw + in.local * uniforms.scene_size_screen_min.xy;
-    let world = uniforms.source_scale_time_pulse.xy
-        + (screen - uniforms.scene_size_screen_min.zw) / max(uniforms.source_scale_time_pulse.z, 0.0001);
-    let panel_bg = vec4<f32>(0.0048, 0.0060, 0.0088, 1.0);
-    let board_bg = vec4<f32>(0.0075, 0.0103, 0.0160, 1.0);
-    let grid_line = vec4<f32>(0.035, 0.051, 0.086, 1.0);
-    var color = panel_bg;
-    if world.x >= uniforms.grid_rect.x && world.x <= uniforms.grid_rect.z && world.y >= uniforms.grid_rect.y && world.y <= uniforms.grid_rect.w {
-        color = board_bg;
-        let cell = 88.0;
-        let local_grid = world - uniforms.grid_rect.xy;
-        let gx = abs(fract(local_grid.x / cell) - 0.5);
-        let gy = abs(fract(local_grid.y / cell) - 0.5);
-        let line_w = 0.008 / max(uniforms.source_scale_time_pulse.z, 0.35);
-        let line = 1.0 - smoothstep(0.5 - line_w, 0.5, min(gx, gy));
-        color = mix_color(color, grid_line, line * 0.65);
-    } else if uniforms.scene_bits.y != 0u {
-        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+fn fs_grid(in: GridVsOut) -> @location(0) vec4<f32> {
+    let panel_bg = vec4<f32>(0.010, 0.013, 0.018, 1.0);
+    let board_bg = vec4<f32>(0.012, 0.016, 0.022, 1.0);
+    let minor_grid_line = vec4<f32>(0.040, 0.056, 0.092, 1.0);
+    let major_grid_line = vec4<f32>(0.075, 0.106, 0.172, 1.0);
+    let grid_border = vec4<f32>(0.090, 0.132, 0.218, 1.0);
+    let in_grid = in.world.x >= in.grid_min.x
+        && in.world.x <= in.grid_max.x
+        && in.world.y >= in.grid_min.y
+        && in.world.y <= in.grid_max.y;
+    if !in_grid && in.nested > 0.5 {
+        discard;
     }
+    if !in_grid {
+        return panel_bg;
+    }
+
+    let grid_size = max(in.grid_max - in.grid_min, vec2<f32>(1.0, 1.0));
+    let local = (in.world - in.grid_min) / grid_size;
+    let grid_dims = max(in.grid_dims, vec2<f32>(1.0, 1.0));
+    let grid_px_size = max(abs(world_to_screen(in.grid_max) - world_to_screen(in.grid_min)), vec2<f32>(1.0, 1.0));
+    let pixel_to_local = 1.0 / grid_px_size;
+
+    let minor_dist_x = min(fract(local.x * grid_dims.x), 1.0 - fract(local.x * grid_dims.x)) / grid_dims.x;
+    let minor_dist_y = min(fract(local.y * grid_dims.y), 1.0 - fract(local.y * grid_dims.y)) / grid_dims.y;
+    let minor_line_x = 1.0 - smoothstep(pixel_to_local.x * 0.9, pixel_to_local.x * 2.4, minor_dist_x);
+    let minor_line_y = 1.0 - smoothstep(pixel_to_local.y * 0.9, pixel_to_local.y * 2.4, minor_dist_y);
+    let minor_line = max(minor_line_x, minor_line_y);
+
+    let major_grid_dims = max(grid_dims / 4.0, vec2<f32>(1.0, 1.0));
+    let major_dist_x = min(fract(local.x * major_grid_dims.x), 1.0 - fract(local.x * major_grid_dims.x)) / major_grid_dims.x;
+    let major_dist_y = min(fract(local.y * major_grid_dims.y), 1.0 - fract(local.y * major_grid_dims.y)) / major_grid_dims.y;
+    let major_line_x = 1.0 - smoothstep(pixel_to_local.x * 1.1, pixel_to_local.x * 2.9, major_dist_x);
+    let major_line_y = 1.0 - smoothstep(pixel_to_local.y * 1.1, pixel_to_local.y * 2.9, major_dist_y);
+    let major_line = max(major_line_x, major_line_y);
+
+    let edge_dist = min(
+        min(in.world.x - in.grid_min.x, in.grid_max.x - in.world.x),
+        min(in.world.y - in.grid_min.y, in.grid_max.y - in.world.y),
+    );
+    let edge_px = edge_dist * uniforms.view_scale_time.z;
+    let border_line = 1.0 - smoothstep(0.9, 2.3, edge_px);
+
+    var color = board_bg;
+    color = mix_color(color, minor_grid_line, minor_line * 0.58);
+    color = mix_color(color, major_grid_line, major_line * 0.82);
+    color = mix_color(color, grid_border, border_line * 0.90);
     return color;
 }
 
 @vertex
-fn vs_shape(instance: ShapeInstance, @builtin(vertex_index) vertex_index: u32) -> VsOut {
+fn vs_gate(instance: GateInstance, @builtin(vertex_index) vertex_index: u32) -> GateVsOut {
     let local = quad_pos(vertex_index);
     let world = instance.min + (instance.max - instance.min) * local;
-    var out: VsOut;
+    var out: GateVsOut;
     out.clip_pos = world_to_clip(world);
     out.local = local;
     out.charge = instance.charge;
-    out.shape_meta = instance.shape_meta;
+    out.gate_tag = instance.gate_meta.x;
     return out;
 }
 
 @fragment
-fn fs_shape(in: VsOut) -> @location(0) vec4<f32> {
-    let kind = in.shape_meta.x;
-    let gate_tag = in.shape_meta.y;
+fn fs_gate(in: GateVsOut) -> @location(0) vec4<f32> {
     let is_active = charge_active(in.charge);
-    var alpha = 1.0;
-    var color = vec4<f32>(0.2, 0.24, 0.3, 1.0);
-
-    if kind == 0u {
-        alpha = rounded_rect_alpha(in.local, 0.16);
-        let off = vec4<f32>(0.032, 0.046, 0.071, 0.96);
-        let on = vec4<f32>(0.052, 0.30, 0.16, 0.96);
-        color = mix_color(off, on, select(0.0, 1.0, is_active));
-        let edge = 1.0 - rounded_rect_alpha(clamp((in.local - 0.04) / 0.92, vec2<f32>(0.0), vec2<f32>(1.0)), 0.16);
-        color = mix_color(color, vec4<f32>(0.33, 0.39, 0.48, 1.0), edge * 0.65);
-        let icon = select(0.35, 0.65, gate_tag == 7u || gate_tag == 8u);
-        let stripe = 1.0 - smoothstep(0.0, 0.08, abs(in.local.y - icon));
-        color = vec4<f32>(color.rgb + stripe * vec3<f32>(0.05, 0.06, 0.08), color.a);
-        let text_alpha = gate_label_alpha(in.local, gate_tag);
-        let text_color = mix_color(
-            vec4<f32>(0.82, 0.87, 0.94, 1.0),
-            vec4<f32>(0.94, 0.99, 0.96, 1.0),
-            select(0.0, 1.0, is_active),
-        );
-        color = mix_color(color, text_color, text_alpha);
-    } else if kind == 1u {
-        alpha = rounded_rect_alpha(in.local, 0.14);
-        color = vec4<f32>(0.023, 0.030, 0.043, 0.92);
-    } else {
-        alpha = circle_alpha(in.local);
-        if kind == 2u {
-            color = mix_color(vec4<f32>(0.05, 0.10, 0.18, 0.85), vec4<f32>(0.19, 0.39, 0.88, 1.0), select(0.0, 1.0, is_active));
-        } else if kind == 3u {
-            color = mix_color(vec4<f32>(0.05, 0.16, 0.10, 0.85), vec4<f32>(0.20, 0.78, 0.32, 1.0), select(0.0, 1.0, is_active));
-        } else if kind == 4u {
-            color = mix_color(vec4<f32>(0.16, 0.08, 0.03, 0.85), vec4<f32>(0.88, 0.50, 0.16, 1.0), select(0.0, 1.0, is_active));
-        } else if kind == 5u {
-            color = mix_color(vec4<f32>(0.11, 0.05, 0.16, 0.85), vec4<f32>(0.71, 0.36, 0.92, 1.0), select(0.0, 1.0, is_active));
-        } else if kind == 6u {
-            color = mix_color(vec4<f32>(0.12, 0.05, 0.16, 0.85), vec4<f32>(0.74, 0.41, 0.92, 1.0), select(0.0, 1.0, is_active));
-        } else if kind == 7u {
-            color = mix_color(vec4<f32>(0.09, 0.13, 0.20, 0.88), vec4<f32>(0.33, 0.61, 0.98, 1.0), select(0.0, 1.0, is_active));
-        } else {
-            color = mix_color(vec4<f32>(0.09, 0.18, 0.11, 0.88), vec4<f32>(0.38, 0.88, 0.52, 1.0), select(0.0, 1.0, is_active));
-        }
-    }
-
+    let alpha = rounded_rect_alpha(in.local, 0.16);
+    let off = vec4<f32>(0.032, 0.046, 0.071, 0.96);
+    let on = vec4<f32>(0.052, 0.30, 0.16, 0.96);
+    var color = mix_color(off, on, select(0.0, 1.0, is_active));
+    let edge = 1.0 - rounded_rect_alpha(clamp((in.local - 0.04) / 0.92, vec2<f32>(0.0), vec2<f32>(1.0)), 0.16);
+    color = mix_color(color, vec4<f32>(0.33, 0.39, 0.48, 1.0), edge * 0.65);
+    let icon = select(0.35, 0.65, in.gate_tag == 7u || in.gate_tag == 8u);
+    let stripe = 1.0 - smoothstep(0.0, 0.08, abs(in.local.y - icon));
+    color = vec4<f32>(color.rgb + stripe * vec3<f32>(0.05, 0.06, 0.08), color.a);
+    let text_alpha = gate_label_alpha(in.local, in.gate_tag);
+    let text_color = mix_color(
+        vec4<f32>(0.82, 0.87, 0.94, 1.0),
+        vec4<f32>(0.94, 0.99, 0.96, 1.0),
+        select(0.0, 1.0, is_active),
+    );
+    color = mix_color(color, text_color, text_alpha);
     if alpha <= 0.001 {
         discard;
     }
     return vec4<f32>(color.rgb, color.a * alpha);
+}
+
+@vertex
+fn vs_port(instance: PortInstance, @builtin(vertex_index) vertex_index: u32) -> PortVsOut {
+    let local = quad_pos(vertex_index);
+    let world = instance.min + (instance.max - instance.min) * local;
+    var out: PortVsOut;
+    out.clip_pos = world_to_clip(world);
+    out.local = local;
+    out.charge = instance.charge;
+    out.port_kind = instance.port_meta.x;
+    return out;
+}
+
+@fragment
+fn fs_port(in: PortVsOut) -> @location(0) vec4<f32> {
+    let is_active = charge_active(in.charge);
+    let alpha = circle_alpha(in.local);
+    if alpha <= 0.001 {
+        discard;
+    }
+
+    var color = vec4<f32>(0.2, 0.24, 0.3, 1.0);
+    if in.port_kind == 0u {
+        color = mix_color(vec4<f32>(0.05, 0.10, 0.18, 0.85), vec4<f32>(0.19, 0.39, 0.88, 1.0), select(0.0, 1.0, is_active));
+    } else if in.port_kind == 1u {
+        color = mix_color(vec4<f32>(0.05, 0.16, 0.10, 0.85), vec4<f32>(0.20, 0.78, 0.32, 1.0), select(0.0, 1.0, is_active));
+    } else if in.port_kind == 2u {
+        color = mix_color(vec4<f32>(0.12, 0.05, 0.16, 0.85), vec4<f32>(0.74, 0.41, 0.92, 1.0), select(0.0, 1.0, is_active));
+    } else if in.port_kind == 3u {
+        color = mix_color(vec4<f32>(0.16, 0.08, 0.03, 0.85), vec4<f32>(0.88, 0.50, 0.16, 1.0), select(0.0, 1.0, is_active));
+    } else if in.port_kind == 4u {
+        color = mix_color(vec4<f32>(0.11, 0.05, 0.16, 0.85), vec4<f32>(0.71, 0.36, 0.92, 1.0), select(0.0, 1.0, is_active));
+    } else if in.port_kind == 5u {
+        color = mix_color(vec4<f32>(0.09, 0.13, 0.20, 0.88), vec4<f32>(0.33, 0.61, 0.98, 1.0), select(0.0, 1.0, is_active));
+    } else {
+        color = mix_color(vec4<f32>(0.09, 0.18, 0.11, 0.88), vec4<f32>(0.38, 0.88, 0.52, 1.0), select(0.0, 1.0, is_active));
+    }
+    return vec4<f32>(color.rgb, color.a * alpha);
+}
+
+@vertex
+fn vs_child_frame(instance: ChildFrameInstance, @builtin(vertex_index) vertex_index: u32) -> RectVsOut {
+    let local = quad_pos(vertex_index);
+    let world = instance.min + (instance.max - instance.min) * local;
+    var out: RectVsOut;
+    out.clip_pos = world_to_clip(world);
+    out.local = local;
+    out.size_px = abs(world_to_screen(instance.max) - world_to_screen(instance.min));
+    return out;
+}
+
+@fragment
+fn fs_child_frame(in: RectVsOut) -> @location(0) vec4<f32> {
+    let alpha = rounded_rect_alpha(in.local, 0.14);
+    if alpha <= 0.001 {
+        discard;
+    }
+    return vec4<f32>(0.023, 0.030, 0.043, 0.92 * alpha);
 }
 
 @vertex
@@ -383,9 +482,9 @@ fn fs_wire(in: WireVsOut) -> @location(0) vec4<f32> {
     let side_px = abs(in.local_px.y);
     let center_glow = 1.0 - smoothstep(0.0, half_width_px, side_px);
     if is_active {
-        let pulse_time = uniforms.source_scale_time_pulse.w * bitcast<f32>(uniforms.scene_bits.w) * 1.85;
+        let pulse_time = uniforms.view_scale_time.w * bitcast<f32>(uniforms.scene_bits.z) * 1.85;
         let distance_along_px = clamp(in.local_px.x, 0.0, in.length_px)
-            + in.path.x * max(in.path.z, 0.001) * uniforms.source_scale_time_pulse.z;
+            + in.path.x * max(in.path.z, 0.001) * uniforms.view_scale_time.z;
         let dot_spacing_px = 28.0;
         let dot_radius_px = half_width_px * 2.35;
         let along_to_center = abs(fract(distance_along_px / dot_spacing_px - pulse_time) - 0.5)
@@ -416,8 +515,8 @@ fn fs_wire(in: WireVsOut) -> @location(0) vec4<f32> {
         );
         let alpha = max(wire_mask * 0.94, sphere * render_mask);
         return vec4<f32>(color.rgb, alpha);
-    } else {
-        color = vec4<f32>(color.rgb * 0.40 + vec3<f32>(0.01, 0.015, 0.02) * center_glow, color.a);
-        return vec4<f32>(color.rgb, wire_mask * 0.55);
     }
+
+    color = vec4<f32>(color.rgb * 0.40 + vec3<f32>(0.01, 0.015, 0.02) * center_glow, color.a);
+    return vec4<f32>(color.rgb, wire_mask * 0.55);
 }
