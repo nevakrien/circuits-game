@@ -12,6 +12,7 @@ use circuits_game::{
     kernel::{GateKernel, UploadedGpuPlan},
     scene_render::SceneRenderer,
     setup,
+    viewer_frame::render_viewer_frame,
     visual_ui::{
         build_focused_scene_with_preview_depth, interact_focused_scene, FocusedScene, ViewportState,
     },
@@ -201,32 +202,40 @@ fn run(args: Args) {
                     });
                     let ui_time = ui_started_at.elapsed();
 
-                    bench
-                        .egui_state
-                        .handle_platform_output(&window, full_output.platform_output);
-
                     let tessellate_started_at = Instant::now();
-                    let paint_jobs = bench
-                        .egui_ctx
-                        .tessellate(full_output.shapes, full_output.pixels_per_point);
+                    let egui::FullOutput {
+                        platform_output,
+                        textures_delta,
+                        shapes,
+                        pixels_per_point,
+                        ..
+                    } = full_output;
+                    let paint_jobs = bench.egui_ctx.tessellate(shapes, pixels_per_point);
                     let tessellate_time = tessellate_started_at.elapsed();
 
-                    let screen_descriptor = egui_wgpu::ScreenDescriptor {
-                        size_in_pixels: [bench.config.width, bench.config.height],
-                        pixels_per_point: full_output.pixels_per_point,
-                    };
+                    let render_started_at = Instant::now();
+                    let render_result = render_viewer_frame(
+                        device,
+                        queue,
+                        &surface,
+                        &bench.config,
+                        &mut bench.egui_renderer,
+                        &bench.scene_renderer,
+                        scene_rect,
+                        pixels_per_point,
+                        &bench.viewport,
+                        &bench.runtime.charge_buffers[bench.runtime.current_read],
+                        &bench.runtime.charge_buffers
+                            [(bench.runtime.current_read + 1) % bench.runtime.charge_buffers.len()],
+                        bench.app_started_at.elapsed().as_secs_f32(),
+                        60.0,
+                        &textures_delta,
+                        &paint_jobs,
+                    );
+                    let render_encode_time = render_started_at.elapsed();
 
-                    let texture_started_at = Instant::now();
-                    for (id, image_delta) in &full_output.textures_delta.set {
-                        bench
-                            .egui_renderer
-                            .update_texture(device, queue, *id, image_delta);
-                    }
-                    let texture_time = texture_started_at.elapsed();
-
-                    let acquire_started_at = Instant::now();
-                    let frame = match surface.get_current_texture() {
-                        Ok(frame) => frame,
+                    let frame_stats = match render_result {
+                        Ok(stats) => stats,
                         Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
                             surface.configure(device, &bench.config);
                             return;
@@ -238,82 +247,25 @@ fn run(args: Args) {
                         }
                         Err(wgpu::SurfaceError::Other) => return,
                     };
-                    let acquire_time = acquire_started_at.elapsed();
 
-                    let update_buffers_started_at = Instant::now();
-                    let mut encoder =
-                        device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-                    bench.egui_renderer.update_buffers(
-                        device,
-                        queue,
-                        &mut encoder,
-                        &paint_jobs,
-                        &screen_descriptor,
-                    );
-                    let update_buffers_time = update_buffers_started_at.elapsed();
+                    bench
+                        .egui_state
+                        .handle_platform_output(&window, platform_output);
 
-                    let render_started_at = Instant::now();
-                    {
-                        let output_view = frame
-                            .texture
-                            .create_view(&wgpu::TextureViewDescriptor::default());
-                        bench.scene_renderer.draw(
-                            device,
-                            queue,
-                            &mut encoder,
-                            &output_view,
-                            [bench.config.width, bench.config.height],
-                            scene_rect,
-                            full_output.pixels_per_point,
-                            &bench.viewport,
-                            &bench.runtime.charge_buffers[bench.runtime.current_read],
-                            &bench.runtime.charge_buffers[(bench.runtime.current_read + 1)
-                                % bench.runtime.charge_buffers.len()],
-                            bench.app_started_at.elapsed().as_secs_f32(),
-                            60.0,
-                        );
-                        let mut pass = encoder
-                            .begin_render_pass(&wgpu::RenderPassDescriptor {
-                                label: Some("stress-viewer-benchmark-pass"),
-                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                    view: &output_view,
-                                    resolve_target: None,
-                                    ops: wgpu::Operations {
-                                        load: wgpu::LoadOp::Load,
-                                        store: wgpu::StoreOp::Store,
-                                    },
-                                    depth_slice: None,
-                                })],
-                                ..Default::default()
-                            })
-                            .forget_lifetime();
-                        bench
-                            .egui_renderer
-                            .render(&mut pass, &paint_jobs, &screen_descriptor);
-                    }
-                    let render_encode_time = render_started_at.elapsed();
-
-                    let submit_started_at = Instant::now();
-                    for id in &full_output.textures_delta.free {
-                        bench.egui_renderer.free_texture(id);
-                    }
-                    queue.submit(Some(encoder.finish()));
-                    frame.present();
                     if bench.first_present_at.is_none() {
                         bench.first_present_at = Some(Instant::now());
                     }
-                    let submit_present_time = submit_started_at.elapsed();
 
                     let frame_total = tick_started_at.elapsed();
                     bench.frame_timings.push(FrameMetrics {
                         tick: tick_time,
                         ui: ui_time,
                         tessellate: tessellate_time,
-                        texture_updates: texture_time,
-                        acquire_surface: acquire_time,
-                        update_buffers: update_buffers_time,
+                        texture_updates: frame_stats.texture_updates,
+                        acquire_surface: frame_stats.acquire_surface,
+                        update_buffers: frame_stats.update_buffers,
                         render_encode: render_encode_time,
-                        submit_present: submit_present_time,
+                        submit_present: frame_stats.submit_present,
                         total: frame_total,
                     });
                     bench.frame_index += 1;

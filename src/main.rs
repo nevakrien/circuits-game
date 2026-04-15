@@ -19,6 +19,7 @@ use circuits_game::{
         FocusedScene, SceneAction, ViewportState, build_focused_scene, child_ids_of,
         interact_focused_scene, parent_stack_to,
     },
+    viewer_frame::render_viewer_frame,
 };
 use egui_wgpu::wgpu;
 use egui_winit::winit;
@@ -266,20 +267,32 @@ async fn run() {
                             }
                         });
                     });
-                    egui_state.handle_platform_output(&window, full_output.platform_output);
-                    let paint_jobs =
-                        egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
-                    let screen_descriptor = egui_wgpu::ScreenDescriptor {
-                        size_in_pixels: [config.width, config.height],
-                        pixels_per_point: full_output.pixels_per_point,
-                    };
-
-                    for (id, image_delta) in &full_output.textures_delta.set {
-                        egui_renderer.update_texture(device, queue, *id, image_delta);
-                    }
-
-                    let frame = match surface.get_current_texture() {
-                        Ok(frame) => frame,
+                    let egui::FullOutput {
+                        platform_output,
+                        textures_delta,
+                        shapes,
+                        pixels_per_point,
+                        ..
+                    } = full_output;
+                    let paint_jobs = egui_ctx.tessellate(shapes, pixels_per_point);
+                    match render_viewer_frame(
+                        device,
+                        queue,
+                        &surface,
+                        &config,
+                        &mut egui_renderer,
+                        &scene_renderer,
+                        scene_rect,
+                        pixels_per_point,
+                        &viewer.viewport,
+                        &runtime.charge_buffers[runtime.current_read],
+                        &runtime.charge_buffers[(runtime.current_read + 1) % runtime.charge_buffers.len()],
+                        animation_started_at.elapsed().as_secs_f32(),
+                        viewer.visual_pulse_rate_hz(),
+                        &textures_delta,
+                        &paint_jobs,
+                    ) {
+                        Ok(_) => {}
                         Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
                             surface.configure(device, &config);
                             return;
@@ -290,61 +303,9 @@ async fn run() {
                             return;
                         }
                         Err(wgpu::SurfaceError::Other) => return,
-                    };
-
-                    let mut encoder =
-                        device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-                    egui_renderer.update_buffers(
-                        device,
-                        queue,
-                        &mut encoder,
-                        &paint_jobs,
-                        &screen_descriptor,
-                    );
-
-                    let output_view = frame
-                        .texture
-                        .create_view(&wgpu::TextureViewDescriptor::default());
-                    scene_renderer.draw(
-                        device,
-                        queue,
-                        &mut encoder,
-                        &output_view,
-                        [config.width, config.height],
-                        scene_rect,
-                        full_output.pixels_per_point,
-                        &viewer.viewport,
-                        &runtime.charge_buffers[runtime.current_read],
-                        &runtime.charge_buffers[(runtime.current_read + 1) % runtime.charge_buffers.len()],
-                        animation_started_at.elapsed().as_secs_f32(),
-                        viewer.visual_pulse_rate_hz(),
-                    );
-
-                    {
-                        let mut pass = encoder
-                            .begin_render_pass(&wgpu::RenderPassDescriptor {
-                                label: Some("viewer-egui-pass"),
-                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                    view: &output_view,
-                                    resolve_target: None,
-                                    ops: wgpu::Operations {
-                                        load: wgpu::LoadOp::Load,
-                                        store: wgpu::StoreOp::Store,
-                                    },
-                                    depth_slice: None,
-                                })],
-                                ..Default::default()
-                            })
-                            .forget_lifetime();
-                        egui_renderer.render(&mut pass, &paint_jobs, &screen_descriptor);
                     }
 
-                    for id in &full_output.textures_delta.free {
-                        egui_renderer.free_texture(id);
-                    }
-
-                    queue.submit(Some(encoder.finish()));
-                    frame.present();
+                    egui_state.handle_platform_output(&window, platform_output);
 
                     if let Some(kind) = requested_scene {
                         runtime = DemoRuntime::new(device, queue, build_demo_circuit(kind))

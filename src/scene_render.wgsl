@@ -131,151 +131,16 @@ fn charge_active(charge: vec4<u32>) -> bool {
     return ((word >> bit_in_word) & 1u) != 0u;
 }
 
-fn rounded_rect_alpha(local: vec2<f32>, radius: f32) -> f32 {
-    let half_size = vec2<f32>(0.5, 0.5);
-    let p = abs(local - half_size) - (half_size - vec2<f32>(radius, radius));
-    let outside = length(max(p, vec2<f32>(0.0, 0.0)));
-    let inside = min(max(p.x, p.y), 0.0);
-    let distance = outside + inside - radius;
-    return 1.0 - smoothstep(-0.01, 0.01, distance);
-}
-
 fn circle_alpha(local: vec2<f32>) -> f32 {
     let centered = local * 2.0 - vec2<f32>(1.0, 1.0);
     let dist = length(centered);
     return 1.0 - smoothstep(0.92, 1.0, dist);
 }
 
-fn mix_color(a: vec4<f32>, b: vec4<f32>, t: f32) -> vec4<f32> {
-    return a * (1.0 - t) + b * t;
-}
-
 fn capsule_mask(local_px: vec2<f32>, length_px: f32, radius_px: f32) -> f32 {
     let closest_x = clamp(local_px.x, 0.0, length_px);
     let distance = length(vec2<f32>(local_px.x - closest_x, local_px.y));
     return 1.0 - smoothstep(radius_px - 1.0, radius_px + 1.0, distance);
-}
-
-fn gate_label_len(gate_tag: u32) -> u32 {
-    switch gate_tag {
-        case 1u, 6u { return 4u; }
-        case 2u, 4u, 7u, 8u { return 3u; }
-        case 3u { return 2u; }
-        case 5u { return 3u; }
-        default { return 0u; }
-    }
-}
-
-fn gate_label_char(gate_tag: u32, index: u32) -> u32 {
-    switch gate_tag {
-        case 1u {
-            let chars = array<u32, 4>(78u, 65u, 78u, 68u);
-            return chars[index];
-        }
-        case 2u {
-            let chars = array<u32, 3>(65u, 78u, 68u);
-            return chars[index];
-        }
-        case 3u {
-            let chars = array<u32, 2>(79u, 82u);
-            return chars[index];
-        }
-        case 4u {
-            let chars = array<u32, 3>(78u, 79u, 82u);
-            return chars[index];
-        }
-        case 5u {
-            let chars = array<u32, 3>(88u, 79u, 82u);
-            return chars[index];
-        }
-        case 6u {
-            let chars = array<u32, 4>(88u, 78u, 79u, 82u);
-            return chars[index];
-        }
-        case 7u {
-            let chars = array<u32, 3>(78u, 79u, 84u);
-            return chars[index];
-        }
-        case 8u {
-            let chars = array<u32, 3>(78u, 79u, 80u);
-            return chars[index];
-        }
-        default { return 0u; }
-    }
-}
-
-fn glyph_row_bits(ch: u32, row: u32) -> u32 {
-    switch ch {
-        case 65u {
-            let rows = array<u32, 7>(14u, 17u, 17u, 31u, 17u, 17u, 17u);
-            return rows[row];
-        }
-        case 68u {
-            let rows = array<u32, 7>(30u, 17u, 17u, 17u, 17u, 17u, 30u);
-            return rows[row];
-        }
-        case 78u {
-            let rows = array<u32, 7>(17u, 25u, 21u, 19u, 17u, 17u, 17u);
-            return rows[row];
-        }
-        case 79u {
-            let rows = array<u32, 7>(14u, 17u, 17u, 17u, 17u, 17u, 14u);
-            return rows[row];
-        }
-        case 80u {
-            let rows = array<u32, 7>(30u, 17u, 17u, 30u, 16u, 16u, 16u);
-            return rows[row];
-        }
-        case 82u {
-            let rows = array<u32, 7>(30u, 17u, 17u, 30u, 20u, 18u, 17u);
-            return rows[row];
-        }
-        case 84u {
-            let rows = array<u32, 7>(31u, 4u, 4u, 4u, 4u, 4u, 4u);
-            return rows[row];
-        }
-        case 88u {
-            let rows = array<u32, 7>(17u, 17u, 10u, 4u, 10u, 17u, 17u);
-            return rows[row];
-        }
-        default { return 0u; }
-    }
-}
-
-fn gate_label_alpha(local: vec2<f32>, gate_tag: u32) -> f32 {
-    let label_len = gate_label_len(gate_tag);
-    if label_len == 0u || uniforms.view_scale_time.z < 0.45 {
-        return 0.0;
-    }
-
-    let text_min = vec2<f32>(0.18, 0.28);
-    let text_max = vec2<f32>(0.82, 0.72);
-    if any(local < text_min) || any(local > text_max) {
-        return 0.0;
-    }
-
-    let uv = (local - text_min) / (text_max - text_min);
-    let total_columns = f32(label_len * 6u - 1u);
-    let total_rows = 7.0;
-    let pixel_x = uv.x * total_columns;
-    let pixel_y = uv.y * total_rows;
-    let char_index = u32(floor(pixel_x / 6.0));
-    if char_index >= label_len {
-        return 0.0;
-    }
-
-    let glyph_x = u32(floor(pixel_x - f32(char_index) * 6.0));
-    let glyph_y = u32(floor(pixel_y));
-    if glyph_x >= 5u || glyph_y >= 7u {
-        return 0.0;
-    }
-
-    let row_bits = glyph_row_bits(gate_label_char(gate_tag, char_index), glyph_y);
-    let column_mask = 1u << (4u - glyph_x);
-    let filled = f32(select(0u, 1u, (row_bits & column_mask) != 0u));
-    let grid = fract(vec2<f32>(pixel_x, pixel_y));
-    let edge = min(min(grid.x, 1.0 - grid.x), min(grid.y, 1.0 - grid.y));
-    return filled * smoothstep(0.02, 0.18, edge);
 }
 
 @vertex
@@ -358,26 +223,19 @@ fn vs_gate(instance: GateInstance, @builtin(vertex_index) vertex_index: u32) -> 
 @fragment
 fn fs_gate(in: GateVsOut) -> @location(0) vec4<f32> {
     let is_active = charge_active(in.charge);
-    let alpha = rounded_rect_alpha(in.local, 0.16);
-    let off = vec4<f32>(0.032, 0.046, 0.071, 0.96);
-    let on = vec4<f32>(0.052, 0.30, 0.16, 0.96);
-    var color = mix_color(off, on, select(0.0, 1.0, is_active));
-    let edge = 1.0 - rounded_rect_alpha(clamp((in.local - 0.04) / 0.92, vec2<f32>(0.0), vec2<f32>(1.0)), 0.16);
-    color = mix_color(color, vec4<f32>(0.33, 0.39, 0.48, 1.0), edge * 0.65);
-    let icon = select(0.35, 0.65, in.gate_tag == 7u || in.gate_tag == 8u);
-    let stripe = 1.0 - smoothstep(0.0, 0.08, abs(in.local.y - icon));
-    color = vec4<f32>(color.rgb + stripe * vec3<f32>(0.05, 0.06, 0.08), color.a);
-    let text_alpha = gate_label_alpha(in.local, in.gate_tag);
-    let text_color = mix_color(
-        vec4<f32>(0.82, 0.87, 0.94, 1.0),
-        vec4<f32>(0.94, 0.99, 0.96, 1.0),
-        select(0.0, 1.0, is_active),
+    return render_gate(
+        in.local,
+        in.gate_tag,
+        is_active,
+        uniforms.view_scale_time.z,
+        scene_gate_style(),
     );
-    color = mix_color(color, text_color, text_alpha);
-    if alpha <= 0.001 {
-        discard;
-    }
-    return vec4<f32>(color.rgb, color.a * alpha);
+}
+
+@fragment
+fn fs_gate_ui(in: GateVsOut) -> @location(0) vec4<f32> {
+    let is_active = charge_active(in.charge);
+    return render_gate(in.local, in.gate_tag, is_active, 1.0, ui_gate_style());
 }
 
 @vertex
@@ -449,7 +307,7 @@ fn vs_wire(instance: WireInstance, @builtin(vertex_index) vertex_index: u32) -> 
     let length_px = max(length(delta), 0.001);
     let dir = delta / length_px;
     let perp = vec2<f32>(-dir.y, dir.x);
-    let thickness_px = instance.path.w;
+    let thickness_px = max(instance.path.w * uniforms.view_scale_time.z, 0.75);
     let render_radius_px = thickness_px * 2.4;
     let along_px = mix(-render_radius_px, length_px + render_radius_px, local.x);
     let across_px = side * render_radius_px;

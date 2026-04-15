@@ -4,10 +4,7 @@ use egui_wgpu::wgpu;
 
 use crate::{
     gate_plans::{Gate, GateStoreLocation, NodeId},
-    ui_config::{
-        CHILD_ZOOM_PREVIEW, MAX_PULSE_CYCLES_PER_SECOND, MIN_PULSE_CYCLES_PER_SECOND,
-        PULSE_CYCLES_PER_TICK,
-    },
+    ui_config::{MAX_PULSE_CYCLES_PER_SECOND, MIN_PULSE_CYCLES_PER_SECOND, PULSE_CYCLES_PER_TICK},
     visual_ui::{FocusedScene, PlacedGate, ViewportState, VisualWire},
 };
 
@@ -155,7 +152,14 @@ impl SceneRenderer {
     pub fn new(device: &wgpu::Device, surface_format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("scene-render-shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("scene_render.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                concat!(
+                    include_str!("gate_shared.wgsl"),
+                    "\n",
+                    include_str!("scene_render.wgsl")
+                )
+                .into(),
+            ),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -485,24 +489,22 @@ impl SceneRenderer {
             "scene-render-port-pass",
         );
 
-        if viewport.zoom >= CHILD_ZOOM_PREVIEW {
-            for child in &scene.children {
-                self.draw_scene_tree(
-                    queue,
-                    encoder,
-                    output_view,
-                    bind_group,
-                    surface_size,
-                    scene_rect_px,
-                    &child.scene,
-                    child.rect,
-                    viewport,
-                    pixels_per_point,
-                    time,
-                    pulse_rate_hz,
-                    true,
-                );
-            }
+        for child in &scene.children {
+            self.draw_scene_tree(
+                queue,
+                encoder,
+                output_view,
+                bind_group,
+                surface_size,
+                scene_rect_px,
+                &child.scene,
+                child.rect,
+                viewport,
+                pixels_per_point,
+                time,
+                pulse_rate_hz,
+                true,
+            );
         }
 
         self.draw_instance_pass(
