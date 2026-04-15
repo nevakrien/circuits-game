@@ -5,5 +5,5 @@ pub mod readback;
 pub mod scene_render;
 pub mod setup;
 pub mod ui_config;
-pub mod visual_ui;
 pub mod viewer_frame;
+pub mod visual_ui;

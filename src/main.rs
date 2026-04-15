@@ -15,11 +15,11 @@ use circuits_game::{
         DEFAULT_TICK_RATE, FAST_RATE_FACTOR, MAX_FRAME_STEP_BUDGET, PAUSED_VISUAL_RATE_FACTOR,
         STEP_RATE_FACTOR,
     },
+    viewer_frame::render_viewer_frame,
     visual_ui::{
         FocusedScene, SceneAction, ViewportState, build_focused_scene, child_ids_of,
         interact_focused_scene, parent_stack_to,
     },
-    viewer_frame::render_viewer_frame,
 };
 use egui_wgpu::wgpu;
 use egui_winit::winit;
@@ -125,6 +125,7 @@ async fn run() {
                     let step_once = viewer.apply_hotkeys(&raw_input);
                     let mut requested_scene = None;
                     let mut scene_rect = None;
+                    let mut hover_world = None;
                     let now = Instant::now();
                     let scheduled_steps = viewer.scheduled_steps(now);
                     let total_steps = scheduled_steps.saturating_add(u32::from(step_once));
@@ -249,23 +250,21 @@ async fn run() {
                         egui::CentralPanel::default()
                             .frame(egui::Frame::NONE.fill(egui::Color32::TRANSPARENT))
                             .show(ctx, |ui| {
-                            let viewport_output = interact_focused_scene(
-                                ui,
-                                &viewer.scene,
-                                &mut viewer.viewport,
-                            );
-                            scene_rect = Some(viewport_output.rect);
-                            if let Some(action) = viewport_output.action {
-                                match action {
-                                    SceneAction::FocusChild(node) => {
-                                        viewer.focus_node = node;
-                                        viewer.reset_camera();
-                                        viewer.rebuild_scene(&runtime).expect("child focus scene should rebuild");
-                                        scene_renderer.upload_scene(device, queue, &viewer.scene);
+                                let viewport_output =
+                                    interact_focused_scene(ui, &viewer.scene, &mut viewer.viewport);
+                                scene_rect = Some(viewport_output.rect);
+                                hover_world = viewport_output.hover_world;
+                                if let Some(action) = viewport_output.action {
+                                    match action {
+                                        SceneAction::FocusChild(node) => {
+                                            viewer.focus_node = node;
+                                            viewer.reset_camera();
+                                            viewer.rebuild_scene(&runtime).expect("child focus scene should rebuild");
+                                            scene_renderer.upload_scene(device, queue, &viewer.scene);
+                                        }
                                     }
                                 }
-                            }
-                        });
+                            });
                     });
                     let egui::FullOutput {
                         platform_output,
@@ -283,6 +282,7 @@ async fn run() {
                         &mut egui_renderer,
                         &scene_renderer,
                         scene_rect,
+                        hover_world,
                         pixels_per_point,
                         &viewer.viewport,
                         &runtime.charge_buffers[runtime.current_read],

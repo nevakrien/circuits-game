@@ -294,7 +294,7 @@ fn fs_child_frame(in: RectVsOut) -> @location(0) vec4<f32> {
     if alpha <= 0.001 {
         discard;
     }
-    return vec4<f32>(0.023, 0.030, 0.043, 0.92 * alpha);
+    return vec4<f32>(0.040, 0.052, 0.074, 0.95 * alpha);
 }
 
 @vertex

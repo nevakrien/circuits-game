@@ -1,4 +1,4 @@
-use egui::{ClippedPrimitive, Rect, TexturesDelta};
+use egui::{ClippedPrimitive, Pos2, Rect, TexturesDelta};
 use egui_wgpu::wgpu;
 use std::time::{Duration, Instant};
 
@@ -20,6 +20,7 @@ pub fn render_viewer_frame(
     egui_renderer: &mut egui_wgpu::Renderer,
     scene_renderer: &SceneRenderer,
     scene_rect: Option<Rect>,
+    hover_world: Option<Pos2>,
     pixels_per_point: f32,
     viewport: &ViewportState,
     current_charge: &wgpu::Buffer,
@@ -59,6 +60,7 @@ pub fn render_viewer_frame(
         &output_view,
         [config.width, config.height],
         scene_rect,
+        hover_world,
         pixels_per_point,
         viewport,
         current_charge,

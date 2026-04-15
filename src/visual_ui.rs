@@ -8,6 +8,8 @@ use crate::gate_plans::{
 };
 use crate::ui_config::{CELL, CHILD_PORT_INSET, PAD};
 
+const MIN_VIEWPORT_ZOOM: f32 = 0.01;
+
 #[derive(Debug, Clone, Copy)]
 pub struct ViewportState {
     pub zoom: f32,
@@ -93,6 +95,7 @@ pub enum SceneAction {
 pub struct SceneViewportOutput {
     pub rect: Rect,
     pub action: Option<SceneAction>,
+    pub hover_world: Option<Pos2>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -467,7 +470,7 @@ pub fn interact_focused_scene(
         let zoom_delta = ui.ctx().input(|input| input.zoom_delta());
         if (zoom_delta - 1.0).abs() > f32::EPSILON {
             let old_zoom = viewport.zoom;
-            let new_zoom = (old_zoom * zoom_delta).clamp(0.35, 3.0);
+            let new_zoom = (old_zoom * zoom_delta).max(MIN_VIEWPORT_ZOOM);
             if (new_zoom - old_zoom).abs() > f32::EPSILON {
                 if let Some(pointer) = ui.ctx().input(|input| input.pointer.hover_pos()) {
                     let local = pointer - rect.min;
@@ -480,6 +483,17 @@ pub fn interact_focused_scene(
     }
 
     let camera = Camera::new(Pos2::ZERO, rect.min + viewport.pan, viewport.zoom);
+    let hover_world = ui.ctx().input(|input| {
+        input.pointer.hover_pos().and_then(|pointer| {
+            rect.contains(pointer).then(|| {
+                let local = pointer - rect.min;
+                Pos2::new(
+                    (local.x - viewport.pan.x) / viewport.zoom.max(f32::EPSILON),
+                    (local.y - viewport.pan.y) / viewport.zoom.max(f32::EPSILON),
+                )
+            })
+        })
+    });
     let mut action = None;
     for child in &scene.children {
         let child_hit = camera.rect(child.rect);
@@ -493,7 +507,11 @@ pub fn interact_focused_scene(
         }
     }
 
-    SceneViewportOutput { rect, action }
+    SceneViewportOutput {
+        rect,
+        action,
+        hover_world,
+    }
 }
 
 #[derive(Clone, Copy)]

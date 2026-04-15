@@ -6,15 +6,15 @@ use std::{
 
 use circuits_game::{
     gate_plans::{
-        compile_component_tree, ChildPlacement, Component, ComponentPlan, ComponentPlans, Gate,
-        GateId, SignalRef,
+        ChildPlacement, Component, ComponentPlan, ComponentPlans, Gate, GateId, SignalRef,
+        compile_component_tree,
     },
     kernel::{GateKernel, UploadedGpuPlan},
     scene_render::SceneRenderer,
     setup,
     viewer_frame::render_viewer_frame,
     visual_ui::{
-        build_focused_scene_with_preview_depth, interact_focused_scene, FocusedScene, ViewportState,
+        FocusedScene, ViewportState, build_focused_scene_with_preview_depth, interact_focused_scene,
     },
 };
 use egui_wgpu::wgpu;
@@ -30,6 +30,7 @@ const DEFAULT_TICKS_PER_FRAME: u32 = 1;
 const DEFAULT_ZOOM: f32 = 2.0;
 const DEFAULT_VISIBLE_SECONDS: f32 = 8.0;
 const BENCH_PREVIEW_DEPTH: usize = 1;
+const MIN_VIEWPORT_ZOOM: f32 = 0.01;
 
 fn main() {
     let args = Args::parse();
@@ -183,6 +184,7 @@ fn run(args: Args) {
 
                     let ui_started_at = Instant::now();
                     let mut scene_rect = None;
+                    let mut hover_world = None;
                     let full_output = bench.egui_ctx.run(raw_input, |ctx| {
                         egui::CentralPanel::default()
                             .frame(egui::Frame::NONE.fill(egui::Color32::TRANSPARENT))
@@ -198,6 +200,7 @@ fn run(args: Args) {
                                 let viewport_output =
                                     interact_focused_scene(ui, &bench.scene, &mut bench.viewport);
                                 scene_rect = Some(viewport_output.rect);
+                                hover_world = viewport_output.hover_world;
                             });
                     });
                     let ui_time = ui_started_at.elapsed();
@@ -222,6 +225,7 @@ fn run(args: Args) {
                         &mut bench.egui_renderer,
                         &bench.scene_renderer,
                         scene_rect,
+                        hover_world,
                         pixels_per_point,
                         &bench.viewport,
                         &bench.runtime.charge_buffers[bench.runtime.current_read],
@@ -337,7 +341,7 @@ impl Args {
         Self {
             frames: frames.max(1),
             ticks_per_frame,
-            zoom: zoom.clamp(0.35, 3.0),
+            zoom: zoom.max(MIN_VIEWPORT_ZOOM),
             visible_seconds: visible_seconds.max(0.1),
         }
     }

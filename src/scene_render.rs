@@ -107,6 +107,10 @@ struct SceneTransform {
     scale: f32,
 }
 
+const BASE_WIRE_WIDTH: f32 = 5.0;
+const DRILL_IN_VISIBLE_COVERAGE_THRESHOLD: f32 = 0.20;
+const DRILL_IN_FOCUS_REGION: f32 = 0.55;
+
 impl SceneTransform {
     fn identity() -> Self {
         Self {
@@ -351,6 +355,7 @@ impl SceneRenderer {
         output_view: &wgpu::TextureView,
         surface_size: [u32; 2],
         scene_rect: Option<Rect>,
+        hover_world: Option<Pos2>,
         pixels_per_point: f32,
         viewport: &ViewportState,
         current_charge: &wgpu::Buffer,
@@ -394,6 +399,7 @@ impl SceneRenderer {
             scene_rect_px,
             uploaded_scene,
             scene_rect_px,
+            hover_world,
             viewport,
             pixels_per_point,
             time,
@@ -413,6 +419,7 @@ impl SceneRenderer {
         scene_rect_px: Rect,
         scene: &UploadedScene,
         clip_world_rect: Rect,
+        hover_world: Option<Pos2>,
         viewport: &ViewportState,
         pixels_per_point: f32,
         time: f32,
@@ -489,7 +496,11 @@ impl SceneRenderer {
             "scene-render-port-pass",
         );
 
-        for child in &scene.children {
+        if let Some(child) = select_drill_child(
+            scene,
+            viewport_visible_world_rect(scene_rect_px, viewport, pixels_per_point),
+            hover_world,
+        ) {
             self.draw_scene_tree(
                 queue,
                 encoder,
@@ -499,6 +510,7 @@ impl SceneRenderer {
                 scene_rect_px,
                 &child.scene,
                 child.rect,
+                hover_world,
                 viewport,
                 pixels_per_point,
                 time,
@@ -632,7 +644,6 @@ fn upload_scene_tree(
         .iter()
         .map(|child| {
             let child_rect = transform.rect(child.rect);
-            let child_transform = SceneTransform::fit(child.scene.grid_rect, child_rect);
             UploadedChild {
                 rect: child_rect,
                 scene: Box::new(upload_scene_tree(
@@ -640,7 +651,7 @@ fn upload_scene_tree(
                     queue,
                     &child.scene,
                     true,
-                    child_transform,
+                    SceneTransform::fit(child.scene.grid_rect, child_rect),
                 )),
             }
         })
@@ -893,7 +904,12 @@ fn append_wire_instances(
         out.push(WireInstance {
             start: [start.x, start.y],
             end: [end.x, end.y],
-            path: [path_start / total_len, path_end / total_len, total_len, 5.0],
+            path: [
+                path_start / total_len,
+                path_end / total_len,
+                total_len,
+                BASE_WIRE_WIDTH * transform.scale,
+            ],
             color,
             charge,
         });
@@ -994,6 +1010,63 @@ fn root_world_rect_to_screen(
         offset + rect.min.to_vec2() * scale,
         offset + rect.max.to_vec2() * scale,
     )
+}
+
+fn viewport_visible_world_rect(
+    scene_rect_px: Rect,
+    viewport: &ViewportState,
+    pixels_per_point: f32,
+) -> Rect {
+    let scale = (viewport.zoom * pixels_per_point).max(f32::EPSILON);
+    let offset = scene_rect_px.min + viewport.pan * pixels_per_point;
+    Rect::from_min_max(
+        Pos2::new(
+            (scene_rect_px.min.x - offset.x) / scale,
+            (scene_rect_px.min.y - offset.y) / scale,
+        ),
+        Pos2::new(
+            (scene_rect_px.max.x - offset.x) / scale,
+            (scene_rect_px.max.y - offset.y) / scale,
+        ),
+    )
+}
+
+fn select_drill_child(
+    scene: &UploadedScene,
+    visible_world_rect: Rect,
+    hover_world: Option<Pos2>,
+) -> Option<&UploadedChild> {
+    let viewport_area = rect_area(visible_world_rect).max(f32::EPSILON);
+    let viewport_center = visible_world_rect.center();
+    if let Some(hover_world) = hover_world {
+        if let Some(child) = scene
+            .children
+            .iter()
+            .find(|child| child.rect.contains(hover_world))
+        {
+            return Some(child);
+        }
+    }
+    scene
+        .children
+        .iter()
+        .filter(|child| child_focus_rect(child.rect).contains(viewport_center))
+        .filter_map(|child| {
+            let overlap = child.rect.intersect(visible_world_rect);
+            let visible_coverage = rect_area(overlap) / viewport_area;
+            (visible_coverage >= DRILL_IN_VISIBLE_COVERAGE_THRESHOLD)
+                .then_some((visible_coverage, child))
+        })
+        .max_by(|(a, _), (b, _)| a.total_cmp(b))
+        .map(|(_, child)| child)
+}
+
+fn child_focus_rect(rect: Rect) -> Rect {
+    Rect::from_center_size(rect.center(), rect.size() * DRILL_IN_FOCUS_REGION)
+}
+
+fn rect_area(rect: Rect) -> f32 {
+    rect.width().max(0.0) * rect.height().max(0.0)
 }
 
 fn scissor_to_u32(rect: Rect, surface_size: [u32; 2]) -> Option<(u32, u32, u32, u32)> {
