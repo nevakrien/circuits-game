@@ -6,15 +6,15 @@ use std::{
 
 use circuits_game::{
     gate_plans::{
-        ChildPlacement, Component, ComponentPlan, ComponentPlans, Gate, GateId, SignalRef,
-        compile_component_tree,
+        compile_component_tree, ChildPlacement, Component, ComponentPlan, ComponentPlans, Gate,
+        GateId, SignalRef,
     },
     kernel::{GateKernel, UploadedGpuPlan},
     scene_render::SceneRenderer,
     setup,
-    viewer_frame::render_viewer_frame,
+    viewer_frame::{render_viewer_frame, ViewerRenderMode},
     visual_ui::{
-        FocusedScene, ViewportState, build_focused_scene_with_preview_depth, interact_focused_scene,
+        build_focused_scene_with_preview_depth, interact_focused_scene, FocusedScene, ViewportState,
     },
 };
 use egui_wgpu::wgpu;
@@ -228,6 +228,7 @@ fn run(args: Args) {
                         hover_world,
                         pixels_per_point,
                         &bench.viewport,
+                        ViewerRenderMode::Run,
                         &bench.runtime.charge_buffers[bench.runtime.current_read],
                         &bench.runtime.charge_buffers
                             [(bench.runtime.current_read + 1) % bench.runtime.charge_buffers.len()],

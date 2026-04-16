@@ -1,4 +1,5 @@
 pub mod charge_buffer;
+pub mod editor;
 pub mod gate_plans;
 pub mod kernel;
 pub mod readback;
