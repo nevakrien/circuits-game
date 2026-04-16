@@ -1,6 +1,6 @@
 # Circuits Game Document Format (`CGDF`)
 
-This file format stores the authored circuit document, not GPU runtime state.
+This file format stores the authored circuit document, with no runtime state.
 
 It is designed to be:
 - simple to parse in low-level languages
@@ -155,6 +155,23 @@ Each component is:
 | child placements | variable |
 | wire count | `u32` |
 | wires | variable |
+
+`child count` and `child placement count` are intentionally separate.
+
+- `child count` is the number of child components in the component's actual circuit structure.
+- `child placement count` is the number of saved visual positions for those children in the editor layout.
+
+In a complete file, these counts are usually the same because each child normally has one placement entry at the same index.
+
+They can still differ in valid files because child placements are visual-only data. A file may omit some placement entries at the end of the list, and the game will infer default positions for those missing children when loading the document.
+
+The placement list is ordered to match the child list:
+
+- placement `0` describes child `0`
+- placement `1` describes child `1`
+- and so on
+
+Because of that ordering, omitted placements are only supported at the end of the placement list, not in the middle.
 
 ### Child Input Connections
 

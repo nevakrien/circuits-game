@@ -747,6 +747,12 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        env, fs,
+        path::{Path, PathBuf},
+        process::Command,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     const INPUT_A: PortId = PortId(10);
     const INPUT_B: PortId = PortId(11);
@@ -869,6 +875,45 @@ mod tests {
         let decoded = decode_document(fixture).expect("fixture should decode");
         let reencoded = encode_document(&decoded).expect("fixture should re-encode");
         assert_eq!(reencoded.as_slice(), fixture);
+    }
+
+    #[test]
+    fn python_codec_roundtrips_fixture_binary() {
+        let fixture = include_bytes!("../fixtures/sample_document_v1.cgdf");
+        let temp = TestPaths::new("fixture_roundtrip");
+        fs::write(&temp.input, fixture).expect("fixture input should be written");
+
+        run_python_codec(&temp.input, &temp.output);
+
+        let python_encoded = fs::read(&temp.output).expect("python output should exist");
+        assert_eq!(python_encoded.as_slice(), fixture);
+
+        let rust_decoded =
+            decode_document(&python_encoded).expect("rust decoder should accept python output");
+        let rust_reencoded =
+            encode_document(&rust_decoded).expect("rust encoder should re-encode python output");
+        assert_eq!(rust_reencoded, python_encoded);
+    }
+
+    #[test]
+    fn python_codec_roundtrips_rust_encoded_document() {
+        let rust_encoded = encode_document(&sample_document()).expect("document should encode");
+        let temp = TestPaths::new("rust_roundtrip");
+        fs::write(&temp.input, &rust_encoded).expect("rust input should be written");
+
+        run_python_codec(&temp.input, &temp.output);
+
+        let python_encoded = fs::read(&temp.output).expect("python output should exist");
+        let python_decoded =
+            decode_document(&python_encoded).expect("rust decoder should accept python output");
+        let python_reencoded =
+            encode_document(&python_decoded).expect("rust encoder should re-encode python output");
+
+        assert_eq!(python_encoded, rust_encoded);
+        assert_eq!(python_reencoded, rust_encoded);
+        assert_eq!(python_decoded.root, ComponentDefId(1));
+        assert_eq!(python_decoded.components.len(), 2);
+        assert_eq!(python_decoded.plans.len(), 2);
     }
 
     #[test]
@@ -1039,5 +1084,54 @@ mod tests {
         reader
             .read_u32("wire endpoint field b")
             .expect("wire endpoint field b should decode");
+    }
+
+    struct TestPaths {
+        input: PathBuf,
+        output: PathBuf,
+    }
+
+    impl TestPaths {
+        fn new(label: &str) -> Self {
+            let unique = format!(
+                "{}_{}_{}",
+                label,
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system time should be after epoch")
+                    .as_nanos()
+            );
+            let base = env::temp_dir().join(format!("circuits_game_{unique}"));
+            fs::create_dir_all(&base).expect("test temp dir should be created");
+            Self {
+                input: base.join("input.cgdf"),
+                output: base.join("output.cgdf"),
+            }
+        }
+    }
+
+    impl Drop for TestPaths {
+        fn drop(&mut self) {
+            if let Some(dir) = self.input.parent() {
+                let _ = fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    fn run_python_codec(input: &Path, output: &Path) {
+        let output_result = Command::new("python3")
+            .arg("examples/document_codec.py")
+            .arg(input)
+            .arg(output)
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .expect("python3 should be available to run the codec example");
+        assert!(
+            output_result.status.success(),
+            "python codec command should succeed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output_result.stdout),
+            String::from_utf8_lossy(&output_result.stderr),
+        );
     }
 }
