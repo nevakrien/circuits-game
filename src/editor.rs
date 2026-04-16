@@ -263,8 +263,7 @@ impl EditorDocument {
             .child_placements
             .get(child.0 as usize)
             .ok_or_else(|| format!("missing child placement {:?}", child))?;
-        let width = child_plan.grid_size[0].max(1).min(plan.grid_size[0].max(1));
-        let height = child_plan.grid_size[1].max(1).min(plan.grid_size[1].max(1));
+        let [width, height] = effective_child_grid_size(plan.grid_size, child_plan.grid_size);
         let max_x = plan.grid_size[0].saturating_sub(width) as i32;
         let max_y = plan.grid_size[1].saturating_sub(height) as i32;
         let to = ChildPlacement::at([
@@ -1024,14 +1023,7 @@ fn child_rect_from_placement(
 ) -> Rect {
     const CHILD_FOOTPRINT_FILL: f32 = 0.88;
 
-    let [width, height] = if child_dims[0] >= grid_dims[0] || child_dims[1] >= grid_dims[1] {
-        [(grid_dims[0] / 2).max(1), (grid_dims[1] / 2).max(1)]
-    } else {
-        [
-            child_dims[0].max(1).min(grid_dims[0].max(1)),
-            child_dims[1].max(1).min(grid_dims[1].max(1)),
-        ]
-    };
+    let [width, height] = effective_child_grid_size(grid_dims, child_dims);
     let max_x = grid_dims[0].saturating_sub(width);
     let max_y = grid_dims[1].saturating_sub(height);
     let min_x = placement.min[0].min(max_x);
@@ -1040,6 +1032,17 @@ fn child_rect_from_placement(
     let footprint = Rect::from_min_size(min, Vec2::new(width as f32 * CELL, height as f32 * CELL));
     let scaled_size = footprint.size() * CHILD_FOOTPRINT_FILL;
     Rect::from_center_size(footprint.center(), scaled_size)
+}
+
+fn effective_child_grid_size(grid_dims: [u32; 2], child_dims: [u32; 2]) -> [u32; 2] {
+    if child_dims[0] >= grid_dims[0] || child_dims[1] >= grid_dims[1] {
+        [(grid_dims[0] / 2).max(1), (grid_dims[1] / 2).max(1)]
+    } else {
+        [
+            child_dims[0].max(1).min(grid_dims[0].max(1)),
+            child_dims[1].max(1).min(grid_dims[1].max(1)),
+        ]
+    }
 }
 
 fn gate_anchor(rect: Rect, gate: Gate, input: Option<usize>) -> Pos2 {
@@ -1634,11 +1637,9 @@ mod tests {
         let mut document = sample_document();
         let before = document.component(ComponentDefId(1)).unwrap().clone();
 
-        assert!(
-            document
-                .move_child_by(ComponentDefId(1), ChildId(0), [-2, -2])
-                .expect("move should succeed")
-        );
+        assert!(document
+            .move_child_by(ComponentDefId(1), ChildId(0), [-2, -2])
+            .expect("move should succeed"));
         assert_eq!(document.history().applied_len(), 1);
         assert_eq!(document.history().redo_len(), 0);
         assert_ne!(
@@ -1668,11 +1669,9 @@ mod tests {
     fn move_child_detaches_into_dangling_wires_instead_of_deleting_connections() {
         let mut document = sample_document();
 
-        assert!(
-            document
-                .move_child_by(ComponentDefId(1), ChildId(0), [-2, -2])
-                .expect("move should succeed")
-        );
+        assert!(document
+            .move_child_by(ComponentDefId(1), ChildId(0), [-2, -2])
+            .expect("move should succeed"));
 
         let component = document.component(ComponentDefId(1)).unwrap();
         assert!(component.child_input_connections.is_empty());
@@ -1695,16 +1694,12 @@ mod tests {
         let mut document = sample_document();
         let original = document.component(ComponentDefId(1)).unwrap().clone();
 
-        assert!(
-            document
-                .move_child_by(ComponentDefId(1), ChildId(0), [-2, -2])
-                .expect("move away should succeed")
-        );
-        assert!(
-            document
-                .move_child_by(ComponentDefId(1), ChildId(0), [2, 2])
-                .expect("move back should succeed")
-        );
+        assert!(document
+            .move_child_by(ComponentDefId(1), ChildId(0), [-2, -2])
+            .expect("move away should succeed"));
+        assert!(document
+            .move_child_by(ComponentDefId(1), ChildId(0), [2, 2])
+            .expect("move back should succeed"));
 
         let component = document.component(ComponentDefId(1)).unwrap();
         assert_eq!(

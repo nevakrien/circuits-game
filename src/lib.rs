@@ -1,6 +1,7 @@
 pub mod charge_buffer;
 pub mod document_format;
 pub mod editor;
+pub mod editor_interaction;
 pub mod gate_plans;
 pub mod kernel;
 pub mod readback;

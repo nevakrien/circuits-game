@@ -15,14 +15,6 @@ const MIN_VIEWPORT_ZOOM: f32 = 0.01;
 pub struct ViewportState {
     pub zoom: f32,
     pub pan: Vec2,
-    drag_child: Option<ChildDragState>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ChildDragState {
-    child: ChildId,
-    start_world: Pos2,
-    applied_cells: [i32; 2],
 }
 
 impl Default for ViewportState {
@@ -30,18 +22,13 @@ impl Default for ViewportState {
         Self {
             zoom: 1.0,
             pan: Vec2::ZERO,
-            drag_child: None,
         }
     }
 }
 
 impl ViewportState {
     pub fn new(zoom: f32, pan: Vec2) -> Self {
-        Self {
-            zoom,
-            pan,
-            drag_child: None,
-        }
+        Self { zoom, pan }
     }
 }
 
@@ -107,20 +94,15 @@ pub struct VisualWire {
     pub points: Vec<Pos2>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SceneAction {
-    FocusChild(NodeId),
-    SelectChild(ChildId),
-    MoveChild {
-        child: ChildId,
-        delta_cells: [i32; 2],
-    },
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct SceneViewportOutput {
     pub rect: Rect,
-    pub action: Option<SceneAction>,
+    pub pointer_screen: Option<Pos2>,
+    pub primary_clicked: bool,
+    pub primary_double_clicked: bool,
+    pub primary_drag_started: bool,
+    pub primary_dragged: bool,
+    pub primary_drag_stopped: bool,
     pub hover_world: Option<Pos2>,
     pub viewport_changed: bool,
 }
@@ -401,7 +383,7 @@ pub fn child_ids_of(root: &Component, node_id: NodeId) -> Vec<NodeId> {
 
 pub fn interact_focused_scene(
     ui: &mut Ui,
-    scene: &FocusedScene,
+    _scene: &FocusedScene,
     viewport: &mut ViewportState,
 ) -> SceneViewportOutput {
     let available = ui.available_size_before_wrap();
@@ -447,117 +429,33 @@ pub fn interact_focused_scene(
         }
     }
 
-    let camera = Camera::new(Pos2::ZERO, rect.min + viewport.pan, viewport.zoom);
-    let hover_world = ui.ctx().input(|input| {
-        input.pointer.hover_pos().and_then(|pointer| {
-            rect.contains(pointer).then(|| {
-                let local = pointer - rect.min;
-                Pos2::new(
-                    (local.x - viewport.pan.x) / viewport.zoom.max(f32::EPSILON),
-                    (local.y - viewport.pan.y) / viewport.zoom.max(f32::EPSILON),
-                )
-            })
-        })
+    let pointer_screen = ui.ctx().input(|input| {
+        input
+            .pointer
+            .hover_pos()
+            .filter(|pointer| rect.contains(*pointer))
     });
-    let mut action = None;
-    for child in &scene.children {
-        let child_hit = camera.rect(child.rect);
-        let child_drag_id = ui.make_persistent_id((scene.node.0, child.id.0, "child-rect"));
-        let response = ui.interact(child_hit, child_drag_id, Sense::click_and_drag());
-        if response.drag_started_by(PointerButton::Primary) {
-            if let Some(pointer) = response.interact_pointer_pos() {
-                viewport.drag_child = Some(ChildDragState {
-                    child: child.id,
-                    start_world: screen_to_world(pointer, rect, viewport),
-                    applied_cells: [0, 0],
-                });
-            }
-        }
-        if response.dragged_by(PointerButton::Primary) {
-            let Some(pointer) = response.interact_pointer_pos() else {
-                continue;
-            };
-            let Some(mut drag_state) = viewport.drag_child.filter(|state| state.child == child.id)
-            else {
-                continue;
-            };
-            let delta = screen_to_world(pointer, rect, viewport) - drag_state.start_world;
-            let total_delta_cells = [quantize_drag_axis(delta.x), quantize_drag_axis(delta.y)];
-            let delta_cells = [
-                total_delta_cells[0] - drag_state.applied_cells[0],
-                total_delta_cells[1] - drag_state.applied_cells[1],
-            ];
-            if delta_cells != [0, 0] {
-                drag_state.applied_cells = total_delta_cells;
-                viewport.drag_child = Some(drag_state);
-                action = Some(SceneAction::MoveChild {
-                    child: child.id,
-                    delta_cells,
-                });
-                continue;
-            }
-        }
-        if response.drag_stopped_by(PointerButton::Primary)
-            && viewport
-                .drag_child
-                .is_some_and(|drag_state| drag_state.child == child.id)
-        {
-            viewport.drag_child = None;
-        }
-        if response.double_clicked() {
-            action = Some(SceneAction::FocusChild(child.node));
-        } else if response.clicked() {
-            action = Some(SceneAction::SelectChild(child.id));
-        }
-    }
+    let hover_world = pointer_screen.map(|pointer| screen_to_world(pointer, rect, viewport));
 
     SceneViewportOutput {
         rect,
-        action,
+        pointer_screen,
+        primary_clicked: response.clicked_by(PointerButton::Primary),
+        primary_double_clicked: response.double_clicked_by(PointerButton::Primary),
+        primary_drag_started: response.drag_started_by(PointerButton::Primary),
+        primary_dragged: response.dragged_by(PointerButton::Primary),
+        primary_drag_stopped: response.drag_stopped_by(PointerButton::Primary),
         hover_world,
         viewport_changed,
     }
 }
 
-fn screen_to_world(pointer: Pos2, rect: Rect, viewport: &ViewportState) -> Pos2 {
+pub fn screen_to_world(pointer: Pos2, rect: Rect, viewport: &ViewportState) -> Pos2 {
     let local = pointer - rect.min;
     Pos2::new(
         (local.x - viewport.pan.x) / viewport.zoom.max(f32::EPSILON),
         (local.y - viewport.pan.y) / viewport.zoom.max(f32::EPSILON),
     )
-}
-
-fn quantize_drag_axis(delta: f32) -> i32 {
-    if delta >= 0.0 {
-        (delta / CELL).floor() as i32
-    } else {
-        (delta / CELL).ceil() as i32
-    }
-}
-
-#[derive(Clone, Copy)]
-struct Camera {
-    source_min: Pos2,
-    screen_min: Pos2,
-    scale: f32,
-}
-
-impl Camera {
-    fn new(source_min: Pos2, screen_min: Pos2, scale: f32) -> Self {
-        Self {
-            source_min,
-            screen_min,
-            scale,
-        }
-    }
-
-    fn pos(&self, pos: Pos2) -> Pos2 {
-        self.screen_min + (pos - self.source_min) * self.scale
-    }
-
-    fn rect(&self, rect: Rect) -> Rect {
-        Rect::from_min_max(self.pos(rect.min), self.pos(rect.max))
-    }
 }
 
 fn grid_anchor_for_port(grid_rect: Rect, grid_dims: [u32; 2], location: PortLocation) -> Pos2 {

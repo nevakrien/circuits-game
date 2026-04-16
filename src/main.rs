@@ -5,6 +5,9 @@ use std::{
 
 use circuits_game::{
     editor::{ComponentDefId, EditableComponentDef, EditorDocument},
+    editor_interaction::{
+        EditInteractionState, EditSceneAction, child_at_pointer, interact_edit_scene,
+    },
     gate_plans::{
         ChildId, ChildInputConnection, ChildPlacement, Component, ComponentLayout, ComponentPlan,
         ComponentPlans, ComponentPort, Gate, GateId, PlanId, PortId, PortLocation, SignalRef,
@@ -19,8 +22,8 @@ use circuits_game::{
     },
     viewer_frame::{ViewerRenderMode, render_viewer_frame},
     visual_ui::{
-        FocusedScene, SceneAction, ViewportState, build_focused_scene, child_ids_of,
-        interact_focused_scene, parent_stack_to,
+        FocusedScene, ViewportState, build_focused_scene, child_ids_of, interact_focused_scene,
+        parent_stack_to,
     },
 };
 use egui_wgpu::wgpu;
@@ -451,18 +454,35 @@ async fn run() {
                                 let viewport_output =
                                     interact_focused_scene(ui, &viewer.scene, &mut viewer.viewport);
                                 scene_rect = Some(viewport_output.rect);
-                                hover_world = viewport_output.hover_world;
+                                hover_world = if viewer.is_editing() && viewer.edit_interaction.is_dragging() {
+                                    None
+                                } else {
+                                    viewport_output.hover_world
+                                };
                                 let hover_changed = viewer.edit_hover_world != hover_world;
                                 viewer.edit_hover_world = hover_world;
                                 let mut scene_rebuilt = false;
-                                if let Some(action) = viewport_output.action {
+                                let action = if viewer.is_editing() {
+                                    interact_edit_scene(
+                                        &viewer.scene,
+                                        &viewer.viewport,
+                                        &viewport_output,
+                                        &mut viewer.edit_interaction,
+                                    )
+                                } else if viewport_output.primary_double_clicked {
+                                    child_at_pointer(&viewer.scene, viewport_output.hover_world)
+                                        .map(|child| EditSceneAction::FocusChild(child.node))
+                                } else {
+                                    None
+                                };
+                                if let Some(action) = action {
                                     match action {
-                                        SceneAction::SelectChild(child) => {
+                                        EditSceneAction::SelectChild(child) => {
                                             if viewer.is_editing() {
                                                 viewer.select_edit_child(Some(child));
                                             }
                                         }
-                                        SceneAction::MoveChild { child, delta_cells } => {
+                                        EditSceneAction::MoveChild { child, delta_cells } => {
                                             if viewer.is_editing()
                                                 && document
                                                     .move_child_by(viewer.active_edit_component(), child, delta_cells)
@@ -479,7 +499,7 @@ async fn run() {
                                                 scene_rebuilt = true;
                                             }
                                         }
-                                        SceneAction::FocusChild(node) => {
+                                        EditSceneAction::FocusChild(node) => {
                                             if viewer.is_editing() {
                                                 viewer.push_edit_focus(ComponentDefId(node.0 as usize));
                                             } else {
@@ -710,6 +730,7 @@ struct ViewerState {
     edit_focus_stack: Vec<ComponentDefId>,
     selected_edit_child: Option<ChildId>,
     edit_hover_world: Option<egui::Pos2>,
+    edit_interaction: EditInteractionState,
     run_focus_node: circuits_game::gate_plans::NodeId,
     child_ids: Vec<circuits_game::gate_plans::NodeId>,
     scene: FocusedScene,
@@ -738,6 +759,7 @@ impl ViewerState {
             edit_focus_stack: vec![document.root],
             selected_edit_child: None,
             edit_hover_world: None,
+            edit_interaction: EditInteractionState::default(),
             run_focus_node: circuits_game::gate_plans::NodeId(0),
             child_ids: Vec::new(),
             scene: document.build_edit_scene(
@@ -872,6 +894,7 @@ impl ViewerState {
         self.edit_focus_stack.push(document.root);
         self.selected_edit_child = None;
         self.edit_hover_world = None;
+        self.edit_interaction.clear();
         self.child_ids.clear();
         self.rebuild_edit_scene(document, None)?;
         self.reset_camera();
@@ -882,6 +905,7 @@ impl ViewerState {
         self.run_focus_node = runtime.root.id;
         self.selected_edit_child = None;
         self.edit_hover_world = None;
+        self.edit_interaction.clear();
         self.rebuild_run_scene(runtime)?;
         self.reset_camera();
         Ok(())
@@ -902,12 +926,14 @@ impl ViewerState {
         self.edit_focus_stack.truncate(len);
         self.selected_edit_child = None;
         self.edit_hover_world = None;
+        self.edit_interaction.clear();
     }
 
     fn push_edit_focus(&mut self, component: ComponentDefId) {
         self.edit_focus_stack.push(component);
         self.selected_edit_child = None;
         self.edit_hover_world = None;
+        self.edit_interaction.clear();
     }
 
     fn select_edit_child(&mut self, child: Option<ChildId>) {
