@@ -6,14 +6,14 @@ use std::{
 
 use circuits_game::{
     gate_plans::{
-        ChildPlacement, Component, ComponentPlan, ComponentPlans, Gate, GateId, SignalRef,
-        compile_component_tree,
+        compile_component_tree, ChildPlacement, Component, ComponentPlan, ComponentPlans, Gate,
+        GateId, SignalRef,
     },
     kernel::{GateKernel, UploadedGpuPlan},
     scene_render::SceneRenderer,
     setup,
-    viewer_frame::{ViewerRenderMode, render_viewer_frame},
-    visual_ui::{FocusedScene, ViewportState, build_focused_scene, interact_focused_scene},
+    viewer_frame::{render_viewer_frame, ViewerRenderMode},
+    visual_ui::{build_focused_scene, interact_focused_scene, FocusedScene, ViewportState},
 };
 use egui_wgpu::wgpu;
 use egui_winit::winit;

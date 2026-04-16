@@ -2,6 +2,7 @@ use crate::charge_buffer::{
     BitCrossWorker, Bits, BitsIndex, ChargeAlloc, PreparedBitCross, WorkingMem,
 };
 use foldhash::{HashMap, HashSet};
+use rayon::prelude::*;
 use slab::Slab;
 
 const MAX_KERNEL_INSTRUCTIONS: usize = 1 << 8;
@@ -653,13 +654,13 @@ fn gate_store_map(compiler: &GateCompiler) -> HashMap<(NodeId, GateId), GateStor
         .bits
         .iter()
         .map(|(&(node, gate), &bit_index)| {
-            let bit_in_word = (bit_index.1.0 % 32) as u8;
+            let bit_in_word = (bit_index.1 .0 % 32) as u8;
             (
                 (node, gate),
                 GateStoreLocation {
                     buffer: bit_index.0,
                     bit: bit_index.1,
-                    word_byte_offset: (bit_index.1.0 >> 5) << 2,
+                    word_byte_offset: (bit_index.1 .0 >> 5) << 2,
                     bit_in_word,
                 },
             )
@@ -691,19 +692,48 @@ fn lower_basic_gate_groups(
     by_id: &HashMap<NodeId, &Component>,
     compiler: &GateCompiler,
 ) -> Result<Vec<PreparedBasicGates>, CompileError> {
-    fn rec(
+    #[derive(Clone)]
+    struct LoweringNode<'a> {
+        node: &'a Component,
+        parent_stack: Vec<NodeId>,
+        child_index_in_parent: Option<ChildId>,
+    }
+
+    type BasicGateGroups =
+        HashMap<crate::charge_buffer::BufferId, HashMap<u32, Vec<BasicGateInstruction>>>;
+
+    fn collect_lowering_nodes<'a>(
+        node: &'a Component,
+        parent_stack: &[NodeId],
+        child_index_in_parent: Option<ChildId>,
+        out: &mut Vec<LoweringNode<'a>>,
+    ) {
+        out.push(LoweringNode {
+            node,
+            parent_stack: parent_stack.to_vec(),
+            child_index_in_parent,
+        });
+
+        let mut next_stack = Vec::with_capacity(parent_stack.len() + 1);
+        next_stack.extend_from_slice(parent_stack);
+        next_stack.push(node.id);
+
+        for (child_i, child) in node.children.iter().enumerate() {
+            collect_lowering_nodes(child, &next_stack, Some(ChildId(child_i as u32)), out);
+        }
+    }
+
+    fn lower_basic_gate_node(
         node: &Component,
         plans: &ComponentPlans,
         parent_stack: &[NodeId],
         by_id: &HashMap<NodeId, &Component>,
         compiler: &GateCompiler,
-        grouped: &mut HashMap<
-            crate::charge_buffer::BufferId,
-            HashMap<u32, Vec<BasicGateInstruction>>,
-        >,
-    ) -> Result<(), CompileError> {
+        child_index_in_parent: Option<ChildId>,
+    ) -> Result<BasicGateGroups, CompileError> {
+        let mut grouped: BasicGateGroups = HashMap::default();
         let child_ids: Vec<NodeId> = node.children.iter().map(|c| c.id).collect();
-        let ctx = child_ctx(parent_stack, node.id, &child_ids, None);
+        let ctx = child_ctx(parent_stack, node.id, &child_ids, child_index_in_parent);
         let plan = component_plan(node, plans)?;
 
         for (gate_i, gate) in plan.gates.iter().copied().enumerate() {
@@ -727,7 +757,7 @@ fn lower_basic_gate_groups(
                 None => src_a,
             };
 
-            let tgt_word_byte_offset = (dst.1.0 >> 5) << 2;
+            let tgt_word_byte_offset = (dst.1 .0 >> 5) << 2;
             grouped
                 .entry(dst.0)
                 .or_default()
@@ -735,126 +765,35 @@ fn lower_basic_gate_groups(
                 .or_default()
                 .push(BasicGateInstruction {
                     op: BasicGateOp::from_gate(gate),
-                    dst_bit_in_word: Bits(dst.1.0 % 32),
+                    dst_bit_in_word: Bits(dst.1 .0 % 32),
                     src_a,
                     src_b,
                 });
         }
 
-        let mut next_stack = Vec::with_capacity(parent_stack.len() + 1);
-        next_stack.extend_from_slice(parent_stack);
-        next_stack.push(node.id);
-
-        for (child_i, child) in node.children.iter().enumerate() {
-            rec_with_child_index(
-                child,
-                plans,
-                &next_stack,
-                by_id,
-                compiler,
-                grouped,
-                ChildId(child_i as u32),
-            )?;
-        }
-
-        Ok(())
+        Ok(grouped)
     }
 
-    fn rec_with_child_index(
-        node: &Component,
-        plans: &ComponentPlans,
-        parent_stack: &[NodeId],
-        by_id: &HashMap<NodeId, &Component>,
-        compiler: &GateCompiler,
-        grouped: &mut HashMap<
-            crate::charge_buffer::BufferId,
-            HashMap<u32, Vec<BasicGateInstruction>>,
-        >,
-        child_index_in_parent: ChildId,
-    ) -> Result<(), CompileError> {
-        let child_ids: Vec<NodeId> = node.children.iter().map(|c| c.id).collect();
-        let ctx = child_ctx(
-            parent_stack,
-            node.id,
-            &child_ids,
-            Some(child_index_in_parent),
-        );
-        let plan = component_plan(node, plans)?;
-
-        for (gate_i, gate) in plan.gates.iter().copied().enumerate() {
-            let gate_id = GateId(gate_i as u32);
-            let dst = compiler.bits.get(&(node.id, gate_id)).copied().ok_or(
-                CompileError::MissingBitsForGate {
-                    node: node.id,
-                    gate: gate_id,
-                },
-            )?;
-
-            let mut inputs = gate_inputs(gate).into_iter();
-            let src_a_ref = inputs
-                .next()
-                .expect("basic gates always have at least one input");
-            let src_a = resolve_gate_bits(node, gate_id, src_a_ref, &ctx, plans, by_id, compiler)?;
-            let src_b = match inputs.next() {
-                Some(src_b_ref) => {
-                    resolve_gate_bits(node, gate_id, src_b_ref, &ctx, plans, by_id, compiler)?
-                }
-                None => src_a,
-            };
-
-            let tgt_word_byte_offset = (dst.1.0 >> 5) << 2;
-            grouped
-                .entry(dst.0)
-                .or_default()
-                .entry(tgt_word_byte_offset)
-                .or_default()
-                .push(BasicGateInstruction {
-                    op: BasicGateOp::from_gate(gate),
-                    dst_bit_in_word: Bits(dst.1.0 % 32),
-                    src_a,
-                    src_b,
-                });
+    fn append_basic_gate_groups(into: &mut BasicGateGroups, from: BasicGateGroups) {
+        for (buffer_id, by_word) in from {
+            let buffer_groups = into.entry(buffer_id).or_default();
+            for (tgt_word_byte_offset, mut instructions) in by_word {
+                buffer_groups
+                    .entry(tgt_word_byte_offset)
+                    .or_default()
+                    .append(&mut instructions);
+            }
         }
-
-        let mut next_stack = Vec::with_capacity(parent_stack.len() + 1);
-        next_stack.extend_from_slice(parent_stack);
-        next_stack.push(node.id);
-
-        for (child_i, child) in node.children.iter().enumerate() {
-            rec_with_child_index(
-                child,
-                plans,
-                &next_stack,
-                by_id,
-                compiler,
-                grouped,
-                ChildId(child_i as u32),
-            )?;
-        }
-
-        Ok(())
     }
 
-    let mut grouped: HashMap<
-        crate::charge_buffer::BufferId,
-        HashMap<u32, Vec<BasicGateInstruction>>,
-    > = HashMap::default();
-    rec(root, plans, parent_stack, by_id, compiler, &mut grouped)?;
-
-    let mut buffer_ids: Vec<_> = grouped.keys().copied().collect();
-    buffer_ids.sort();
-
-    let mut out = Vec::new();
-
-    for buffer_id in buffer_ids {
-        let mut by_word: Vec<(u32, Vec<BasicGateInstruction>)> = grouped
-            .remove(&buffer_id)
-            .expect("buffer id collected from map keys")
-            .into_iter()
-            .collect();
+    fn pack_basic_gate_buffer(
+        buffer_id: crate::charge_buffer::BufferId,
+        mut by_word: Vec<(u32, Vec<BasicGateInstruction>)>,
+    ) -> Vec<PreparedBasicGates> {
         by_word.sort_by_key(|(tgt_word_byte_offset, _)| *tgt_word_byte_offset);
 
         let word_count = by_word.len();
+        let mut out = Vec::new();
         let mut cur = PreparedBasicGates {
             tgt_buffer: buffer_id,
             workers: Vec::with_capacity(MAX_KERNEL_WORKERS.min(word_count)),
@@ -910,7 +849,53 @@ fn lower_basic_gate_groups(
         if !cur.workers.is_empty() || !cur.instructions.is_empty() {
             out.push(cur);
         }
+
+        out
     }
+
+    let mut lowering_nodes = Vec::new();
+    collect_lowering_nodes(root, parent_stack, None, &mut lowering_nodes);
+
+    let local_groups: Vec<_> = lowering_nodes
+        .par_iter()
+        .map(|entry| {
+            lower_basic_gate_node(
+                entry.node,
+                plans,
+                &entry.parent_stack,
+                by_id,
+                compiler,
+                entry.child_index_in_parent,
+            )
+        })
+        .collect();
+
+    let mut grouped: BasicGateGroups = HashMap::default();
+    for local in local_groups {
+        append_basic_gate_groups(&mut grouped, local?);
+    }
+
+    let mut buffer_ids: Vec<_> = grouped.keys().copied().collect();
+    buffer_ids.sort();
+
+    let ordered_work: Vec<_> = buffer_ids
+        .into_iter()
+        .map(|buffer_id| {
+            let by_word = grouped
+                .remove(&buffer_id)
+                .expect("buffer id collected from map keys")
+                .into_iter()
+                .collect();
+            (buffer_id, by_word)
+        })
+        .collect();
+
+    let ordered_chunks: Vec<_> = ordered_work
+        .into_par_iter()
+        .map(|(buffer_id, by_word)| pack_basic_gate_buffer(buffer_id, by_word))
+        .collect();
+
+    let out = ordered_chunks.into_iter().flatten().collect();
 
     Ok(out)
 }
@@ -1840,7 +1825,7 @@ mod tests {
 
         assert_eq!(info.outline.layout, CompileLayout::Inline);
         assert_eq!(info.self_bits.len(), 40);
-        assert!(info.self_bits.iter().all(|bit| bit.1.0 < 32));
+        assert!(info.self_bits.iter().all(|bit| bit.1 .0 < 32));
         assert!(
             info.self_bits
                 .iter()

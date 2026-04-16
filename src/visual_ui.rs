@@ -1,5 +1,6 @@
 use egui::{Color32, PointerButton, Pos2, Rect, Sense, Ui, Vec2};
 use foldhash::HashMap;
+use rayon::prelude::*;
 use std::sync::Arc;
 
 use crate::gate_plans::{
@@ -177,7 +178,7 @@ fn build_focused_scene_with_index(
 
     let gates = plan
         .gates
-        .iter()
+        .par_iter()
         .copied()
         .enumerate()
         .map(|(index, gate)| {
@@ -186,8 +187,7 @@ fn build_focused_scene_with_index(
             let gy = index / grid_dims[0];
             let min = grid_rect.min + Vec2::new(gx as f32 * CELL, gy as f32 * CELL);
             let input_sources = gate.input_refs().map(|source| {
-                source
-                    .and_then(|signal| source_gate_of_ref(focus, signal, &ctx, plans, &by_id).ok())
+                source.and_then(|signal| source_gate_of_ref(focus, signal, &ctx, plans, by_id).ok())
             });
             PlacedGate {
                 id: GateId(index),
@@ -201,9 +201,9 @@ fn build_focused_scene_with_index(
     let mut next_parent_stack = Vec::with_capacity(parent_stack.len() + 1);
     next_parent_stack.extend_from_slice(parent_stack);
     next_parent_stack.push(focus.id);
-    let children = focus
+    let child_results = focus
         .children
-        .iter()
+        .par_iter()
         .enumerate()
         .map(|(child_i, child)| {
             let child_id = ChildId(child_i as u32);
@@ -258,7 +258,8 @@ fn build_focused_scene_with_index(
                 scene: Box::new(scene),
             })
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Vec<_>>();
+    let children = child_results.into_iter().collect::<Result<Vec<_>, _>>()?;
 
     let ancestor_ports = parent_stack
         .last()
