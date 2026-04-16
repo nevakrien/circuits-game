@@ -15,7 +15,7 @@ use circuits_game::{
         DEFAULT_TICK_RATE, FAST_RATE_FACTOR, MAX_FRAME_STEP_BUDGET, PAUSED_VISUAL_RATE_FACTOR,
         STEP_RATE_FACTOR,
     },
-    viewer_frame::render_viewer_frame,
+    viewer_frame::{ViewerRenderMode, render_viewer_frame},
     visual_ui::{
         FocusedScene, SceneAction, ViewportState, build_focused_scene, child_ids_of,
         interact_focused_scene, parent_stack_to,
@@ -210,6 +210,27 @@ async fn run() {
                                 }
                             });
                             ui.horizontal(|ui| {
+                                ui.label("Render:");
+                                if ui
+                                    .selectable_label(
+                                        matches!(viewer.render_mode, ViewerRenderMode::Run),
+                                        "Run",
+                                    )
+                                    .clicked()
+                                {
+                                    viewer.render_mode = ViewerRenderMode::Run;
+                                }
+                                if ui
+                                    .selectable_label(
+                                        matches!(viewer.render_mode, ViewerRenderMode::EditPreview),
+                                        "Edit Preview",
+                                    )
+                                    .clicked()
+                                {
+                                    viewer.render_mode = ViewerRenderMode::EditPreview;
+                                }
+                            });
+                            ui.horizontal(|ui| {
                                 ui.label("Tick speed:");
                                 ui.add(
                                     egui::Slider::new(&mut viewer.tick_rate, 1..=25)
@@ -244,7 +265,7 @@ async fn run() {
                                 }
                             });
                             ui.label("Drag to pan, use arrow keys to move, ctrl/cmd+wheel or trackpad pinch to zoom, click child blocks to drill into them.");
-                            ui.label("Hotkeys: R run, T slow-step, F fast, P pause, Space single-step. Pause freezes the simulation state but keeps charge flow animated on screen.");
+                            ui.label("Hotkeys: E toggle edit preview, R run, T slow-step, F fast, P pause, Space single-step. Pause freezes the simulation state but keeps charge flow animated on screen.");
                         });
 
                         egui::CentralPanel::default()
@@ -285,6 +306,7 @@ async fn run() {
                         hover_world,
                         pixels_per_point,
                         &viewer.viewport,
+                        viewer.render_mode,
                         &runtime.charge_buffers[runtime.current_read],
                         &runtime.charge_buffers[(runtime.current_read + 1) % runtime.charge_buffers.len()],
                         animation_started_at.elapsed().as_secs_f32(),
@@ -449,6 +471,7 @@ struct ViewerState {
     child_ids: Vec<circuits_game::gate_plans::NodeId>,
     scene: FocusedScene,
     viewport: ViewportState,
+    render_mode: ViewerRenderMode,
     simulation_mode: SimulationMode,
     tick_rate: u32,
     last_frame_at: Instant,
@@ -480,6 +503,7 @@ impl ViewerState {
             child_ids: child_ids_of(&runtime.root, focus_node),
             scene,
             viewport: ViewportState::default(),
+            render_mode: ViewerRenderMode::Run,
             simulation_mode: SimulationMode::Paused,
             tick_rate: DEFAULT_TICK_RATE,
             last_frame_at: Instant::now(),
@@ -602,6 +626,12 @@ impl ViewerState {
                 continue;
             }
             match key {
+                egui::Key::E if !repeat => {
+                    self.render_mode = match self.render_mode {
+                        ViewerRenderMode::Run => ViewerRenderMode::EditPreview,
+                        ViewerRenderMode::EditPreview => ViewerRenderMode::Run,
+                    }
+                }
                 egui::Key::R if !repeat => self.set_simulation_mode(SimulationMode::Running),
                 egui::Key::T if !repeat => self.set_simulation_mode(SimulationMode::Stepping),
                 egui::Key::F if !repeat => self.set_simulation_mode(SimulationMode::FastForward),

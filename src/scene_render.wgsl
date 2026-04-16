@@ -83,12 +83,6 @@ struct WireVsOut {
 @group(0) @binding(0)
 var<uniform> uniforms: SceneUniform;
 
-@group(0) @binding(1)
-var<storage, read> current_charge: array<u32>;
-
-@group(0) @binding(2)
-var<storage, read> next_charge: array<u32>;
-
 fn quad_pos(vertex_index: u32) -> vec2<f32> {
     let positions = array<vec2<f32>, 6>(
         vec2<f32>(0.0, 0.0),
@@ -115,20 +109,6 @@ fn world_to_screen(world: vec2<f32>) -> vec2<f32> {
 
 fn world_to_clip(world: vec2<f32>) -> vec4<f32> {
     return screen_to_clip(world_to_screen(world));
-}
-
-fn charge_active(charge: vec4<u32>) -> bool {
-    let source_mode = charge.z;
-    if source_mode == 2u {
-        return false;
-    }
-    let absolute_word = charge.x * uniforms.scene_bits.x + (charge.y / 32u);
-    let bit_in_word = charge.y % 32u;
-    var word: u32 = current_charge[absolute_word];
-    if source_mode == 1u {
-        word = next_charge[absolute_word];
-    }
-    return ((word >> bit_in_word) & 1u) != 0u;
 }
 
 fn circle_alpha(local: vec2<f32>) -> f32 {

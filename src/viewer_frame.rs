@@ -4,6 +4,12 @@ use std::time::{Duration, Instant};
 
 use crate::{scene_render::SceneRenderer, visual_ui::ViewportState};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewerRenderMode {
+    Run,
+    EditPreview,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ViewerFrameStats {
     pub texture_updates: Duration,
@@ -23,6 +29,7 @@ pub fn render_viewer_frame(
     hover_world: Option<Pos2>,
     pixels_per_point: f32,
     viewport: &ViewportState,
+    render_mode: ViewerRenderMode,
     current_charge: &wgpu::Buffer,
     next_charge: &wgpu::Buffer,
     time: f32,
@@ -53,21 +60,36 @@ pub fn render_viewer_frame(
     let output_view = frame
         .texture
         .create_view(&wgpu::TextureViewDescriptor::default());
-    scene_renderer.draw(
-        device,
-        queue,
-        &mut encoder,
-        &output_view,
-        [config.width, config.height],
-        scene_rect,
-        hover_world,
-        pixels_per_point,
-        viewport,
-        current_charge,
-        next_charge,
-        time,
-        pulse_rate_hz,
-    );
+    match render_mode {
+        ViewerRenderMode::Run => scene_renderer.draw(
+            device,
+            queue,
+            &mut encoder,
+            &output_view,
+            [config.width, config.height],
+            scene_rect,
+            hover_world,
+            pixels_per_point,
+            viewport,
+            current_charge,
+            next_charge,
+            time,
+            pulse_rate_hz,
+        ),
+        ViewerRenderMode::EditPreview => scene_renderer.draw_edit(
+            device,
+            queue,
+            &mut encoder,
+            &output_view,
+            [config.width, config.height],
+            scene_rect,
+            hover_world,
+            pixels_per_point,
+            viewport,
+            time,
+            pulse_rate_hz,
+        ),
+    }
 
     {
         let mut pass = encoder
