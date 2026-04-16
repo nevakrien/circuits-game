@@ -124,10 +124,12 @@ struct UploadedScene {
     children: Vec<UploadedChild>,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 struct UploadedChildMeta {
     id: crate::gate_plans::ChildId,
     rect: Rect,
+    inputs: Vec<ScenePortKey>,
+    outputs: Vec<ScenePortKey>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -162,6 +164,12 @@ struct SceneWireKey {
     source_gate: Option<(NodeId, crate::gate_plans::GateId)>,
     color: [u8; 4],
     points: Vec<[u32; 2]>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct ScenePortKey {
+    source_gate: (NodeId, crate::gate_plans::GateId),
+    anchor: [u32; 2],
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1234,6 +1242,22 @@ fn edit_scene_level_key(
             .map(|child| UploadedChildMeta {
                 id: child.id,
                 rect: child.rect,
+                inputs: child
+                    .inputs
+                    .iter()
+                    .map(|port| ScenePortKey {
+                        source_gate: port.source_gate,
+                        anchor: pos_key(port.anchor),
+                    })
+                    .collect(),
+                outputs: child
+                    .outputs
+                    .iter()
+                    .map(|port| ScenePortKey {
+                        source_gate: port.source_gate,
+                        anchor: pos_key(port.anchor),
+                    })
+                    .collect(),
             })
             .collect(),
         wires: scene
@@ -1794,7 +1818,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::{gate_plans::ChildId, visual_ui::FocusedScene};
+    use crate::{
+        gate_plans::{ChildId, GateId, PortId, PortLocation},
+        visual_ui::{FocusedScene, PlacedPort},
+    };
     use foldhash::HashMap;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1882,6 +1909,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn edit_scene_level_key_changes_when_child_ports_change() {
+        let mut scene = test_scene(0, None, vec![test_child(0, test_scene(1, None, vec![]))]);
+        scene.children[0]
+            .inputs
+            .push(test_port(0, Pos2::new(24.0, 52.0)));
+
+        let before = edit_scene_level_key(&scene, false, SceneTransform::identity(), scene.bounds);
+
+        scene.children[0].inputs[0].anchor = Pos2::new(28.0, 52.0);
+
+        let after = edit_scene_level_key(&scene, false, SceneTransform::identity(), scene.bounds);
+
+        assert!(before != after);
+    }
+
     fn focused_scene_layer_order(scene: &FocusedScene) -> Vec<(NodeId, LayerKind)> {
         let mut order = Vec::new();
         collect_focused_scene_solids(scene, &mut order);
@@ -1940,6 +1983,16 @@ mod tests {
             inputs: Vec::new(),
             outputs: Vec::new(),
             scene: Box::new(scene),
+        }
+    }
+
+    fn test_port(id: u32, anchor: Pos2) -> PlacedPort {
+        PlacedPort {
+            id: PortId(id),
+            source_gate: (NodeId(7), GateId(9)),
+            anchor,
+            location: PortLocation { x: 0, y: 0 },
+            label: String::new(),
         }
     }
 }
