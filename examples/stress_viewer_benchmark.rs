@@ -6,16 +6,14 @@ use std::{
 
 use circuits_game::{
     gate_plans::{
-        compile_component_tree, ChildPlacement, Component, ComponentPlan, ComponentPlans, Gate,
-        GateId, SignalRef,
+        ChildPlacement, Component, ComponentPlan, ComponentPlans, Gate, GateId, SignalRef,
+        compile_component_tree,
     },
     kernel::{GateKernel, UploadedGpuPlan},
     scene_render::SceneRenderer,
     setup,
-    viewer_frame::{render_viewer_frame, ViewerRenderMode},
-    visual_ui::{
-        build_focused_scene_with_preview_depth, interact_focused_scene, FocusedScene, ViewportState,
-    },
+    viewer_frame::{ViewerRenderMode, render_viewer_frame},
+    visual_ui::{FocusedScene, ViewportState, build_focused_scene, interact_focused_scene},
 };
 use egui_wgpu::wgpu;
 use egui_winit::winit;
@@ -29,7 +27,6 @@ const DEFAULT_FRAMES: u32 = 600;
 const DEFAULT_TICKS_PER_FRAME: u32 = 1;
 const DEFAULT_ZOOM: f32 = 2.0;
 const DEFAULT_VISIBLE_SECONDS: f32 = 8.0;
-const BENCH_PREVIEW_DEPTH: usize = 1;
 const MIN_VIEWPORT_ZOOM: f32 = 0.01;
 
 fn main() {
@@ -68,13 +65,12 @@ fn run(args: Args) {
     let runtime_build = runtime_started_at.elapsed();
 
     let focused_scene_started_at = Instant::now();
-    let scene = build_focused_scene_with_preview_depth(
+    let scene = build_focused_scene(
         &runtime.root,
         &runtime.plans,
         runtime.root.id,
         runtime.gate_store.clone(),
         runtime.words_per_buffer,
-        BENCH_PREVIEW_DEPTH,
     )
     .expect("focused scene should build");
     let focused_scene_build = focused_scene_started_at.elapsed();
@@ -92,7 +88,7 @@ fn run(args: Args) {
     let egui_renderer =
         egui_wgpu::Renderer::new(device, config.format, egui_wgpu::RendererOptions::default());
     let mut scene_renderer = SceneRenderer::new(device, config.format);
-    scene_renderer.upload_scene(device, queue, &scene);
+    scene_renderer.upload_runtime_scene(device, queue, &scene);
 
     let mut bench = ViewerBenchState {
         args,
@@ -509,13 +505,13 @@ fn centered_zoom_viewport(
     const SCREENS_RIGHT: f32 = 2.5;
     const SCREENS_DOWN: f32 = 2.5;
 
-    ViewportState {
+    ViewportState::new(
         zoom,
         // Start a few viewport widths/heights into the scene so the benchmark lands on
         // the more populated interior instead of the sparse origin area.
-        pan: egui::vec2(24.0, 24.0)
+        egui::vec2(24.0, 24.0)
             - egui::vec2(available.x * SCREENS_RIGHT, available.y * SCREENS_DOWN),
-    }
+    )
 }
 
 fn choose_present_mode(modes: &[wgpu::PresentMode]) -> wgpu::PresentMode {

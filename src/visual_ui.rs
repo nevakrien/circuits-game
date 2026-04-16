@@ -15,6 +15,14 @@ const MIN_VIEWPORT_ZOOM: f32 = 0.01;
 pub struct ViewportState {
     pub zoom: f32,
     pub pan: Vec2,
+    drag_child: Option<ChildDragState>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChildDragState {
+    child: ChildId,
+    start_world: Pos2,
+    applied_cells: [i32; 2],
 }
 
 impl Default for ViewportState {
@@ -22,6 +30,17 @@ impl Default for ViewportState {
         Self {
             zoom: 1.0,
             pan: Vec2::ZERO,
+            drag_child: None,
+        }
+    }
+}
+
+impl ViewportState {
+    pub fn new(zoom: f32, pan: Vec2) -> Self {
+        Self {
+            zoom,
+            pan,
+            drag_child: None,
         }
     }
 }
@@ -39,6 +58,7 @@ pub struct FocusedScene {
     pub output_ports: Vec<PlacedPort>,
     pub gates: Vec<PlacedGate>,
     pub children: Vec<PlacedChild>,
+    pub drill_child: Option<ChildId>,
     pub ancestor_ports: Vec<ExternalPort>,
     pub wires: Vec<VisualWire>,
 }
@@ -90,6 +110,11 @@ pub struct VisualWire {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SceneAction {
     FocusChild(NodeId),
+    SelectChild(ChildId),
+    MoveChild {
+        child: ChildId,
+        delta_cells: [i32; 2],
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -97,6 +122,7 @@ pub struct SceneViewportOutput {
     pub rect: Rect,
     pub action: Option<SceneAction>,
     pub hover_world: Option<Pos2>,
+    pub viewport_changed: bool,
 }
 
 pub fn build_focused_scene(
@@ -105,24 +131,6 @@ pub fn build_focused_scene(
     focused: NodeId,
     gate_store: Arc<HashMap<(NodeId, GateId), GateStoreLocation>>,
     words_per_buffer: u32,
-) -> Result<FocusedScene, CompileError> {
-    build_focused_scene_with_preview_depth(
-        root,
-        plans,
-        focused,
-        gate_store,
-        words_per_buffer,
-        usize::MAX,
-    )
-}
-
-pub fn build_focused_scene_with_preview_depth(
-    root: &Component,
-    plans: &ComponentPlans,
-    focused: NodeId,
-    gate_store: Arc<HashMap<(NodeId, GateId), GateStoreLocation>>,
-    words_per_buffer: u32,
-    preview_depth: usize,
 ) -> Result<FocusedScene, CompileError> {
     let by_id = collect_components(root);
     build_focused_scene_with_index(
@@ -133,7 +141,6 @@ pub fn build_focused_scene_with_preview_depth(
         focused,
         gate_store,
         words_per_buffer,
-        preview_depth,
     )
 }
 
@@ -145,7 +152,6 @@ fn build_focused_scene_with_index(
     focused: NodeId,
     gate_store: Arc<HashMap<(NodeId, GateId), GateStoreLocation>>,
     words_per_buffer: u32,
-    preview_depth: usize,
 ) -> Result<FocusedScene, CompileError> {
     let focus = by_id
         .get(&focused)
@@ -210,76 +216,67 @@ fn build_focused_scene_with_index(
         })
         .collect::<Vec<_>>();
 
-    let children = if preview_depth == 0 {
-        Vec::new()
-    } else {
-        let mut next_parent_stack = Vec::with_capacity(parent_stack.len() + 1);
-        next_parent_stack.extend_from_slice(parent_stack);
-        next_parent_stack.push(focus.id);
-        focus
-            .children
-            .iter()
-            .enumerate()
-            .map(|(child_i, child)| {
-                let child_id = ChildId(child_i as u32);
-                let child_plan = plans
-                    .get(child.plan)
-                    .ok_or(CompileError::MissingPlan(child.plan))?;
-                let placement = focus
-                    .layout
-                    .child_placements
-                    .get(child_i)
-                    .copied()
-                    .unwrap_or(ChildPlacement::ONE_CELL);
-                let rect = child_rect_from_placement(
-                    grid_rect,
-                    grid_dims,
-                    child_plan.grid_size,
-                    placement,
-                );
-                let inputs = child_plan
-                    .inputs
-                    .iter()
-                    .map(|port| PlacedPort {
-                        id: port.id,
-                        source_gate: (child.id, port.gate),
-                        anchor: child_port_anchor(rect, child_plan.grid_size, port.location),
-                        location: port.location,
-                        label: port.label.clone().unwrap_or_default(),
-                    })
-                    .collect();
-                let outputs = child_plan
-                    .outputs
-                    .iter()
-                    .map(|port| PlacedPort {
-                        id: port.id,
-                        source_gate: (child.id, port.gate),
-                        anchor: child_port_anchor(rect, child_plan.grid_size, port.location),
-                        location: port.location,
-                        label: port.label.clone().unwrap_or_default(),
-                    })
-                    .collect();
-                let scene = build_focused_scene_with_index(
-                    plans,
-                    by_id,
-                    &next_parent_stack,
-                    root,
-                    child.id,
-                    gate_store.clone(),
-                    words_per_buffer,
-                    preview_depth.saturating_sub(1),
-                )?;
-                Ok(PlacedChild {
-                    id: child_id,
-                    node: child.id,
-                    rect,
-                    inputs,
-                    outputs,
-                    scene: Box::new(scene),
+    let mut next_parent_stack = Vec::with_capacity(parent_stack.len() + 1);
+    next_parent_stack.extend_from_slice(parent_stack);
+    next_parent_stack.push(focus.id);
+    let children = focus
+        .children
+        .iter()
+        .enumerate()
+        .map(|(child_i, child)| {
+            let child_id = ChildId(child_i as u32);
+            let child_plan = plans
+                .get(child.plan)
+                .ok_or(CompileError::MissingPlan(child.plan))?;
+            let placement = focus
+                .layout
+                .child_placements
+                .get(child_i)
+                .copied()
+                .unwrap_or(ChildPlacement::ONE_CELL);
+            let rect =
+                child_rect_from_placement(grid_rect, grid_dims, child_plan.grid_size, placement);
+            let inputs = child_plan
+                .inputs
+                .iter()
+                .map(|port| PlacedPort {
+                    id: port.id,
+                    source_gate: (child.id, port.gate),
+                    anchor: child_port_anchor(rect, child_plan.grid_size, port.location),
+                    location: port.location,
+                    label: port.label.clone().unwrap_or_default(),
                 })
+                .collect();
+            let outputs = child_plan
+                .outputs
+                .iter()
+                .map(|port| PlacedPort {
+                    id: port.id,
+                    source_gate: (child.id, port.gate),
+                    anchor: child_port_anchor(rect, child_plan.grid_size, port.location),
+                    location: port.location,
+                    label: port.label.clone().unwrap_or_default(),
+                })
+                .collect();
+            let scene = build_focused_scene_with_index(
+                plans,
+                by_id,
+                &next_parent_stack,
+                root,
+                child.id,
+                gate_store.clone(),
+                words_per_buffer,
+            )?;
+            Ok(PlacedChild {
+                id: child_id,
+                node: child.id,
+                rect,
+                inputs,
+                outputs,
+                scene: Box::new(scene),
             })
-            .collect::<Result<Vec<_>, _>>()?
-    };
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     let ancestor_ports = parent_stack
         .last()
@@ -361,6 +358,7 @@ fn build_focused_scene_with_index(
         output_ports,
         gates,
         children,
+        drill_child: None,
         ancestor_ports,
         wires,
     })
@@ -408,12 +406,32 @@ pub fn interact_focused_scene(
 ) -> SceneViewportOutput {
     let available = ui.available_size_before_wrap();
     let (rect, response) = ui.allocate_exact_size(available, Sense::click_and_drag());
+    let mut viewport_changed = false;
 
-    if response.dragged_by(PointerButton::Middle) || response.dragged_by(PointerButton::Primary) {
+    if response.dragged_by(PointerButton::Middle) {
         viewport.pan += ui.ctx().input(|input| input.pointer.delta());
+        viewport_changed = true;
     }
-    if response.hovered() {
-        let zoom_delta = ui.ctx().input(|input| input.zoom_delta());
+    let pointer_over_viewport = ui.ctx().input(|input| {
+        input
+            .pointer
+            .hover_pos()
+            .is_some_and(|pointer| rect.contains(pointer))
+    });
+    if pointer_over_viewport {
+        let zoom_delta = ui.ctx().input(|input| {
+            let pinch_zoom = input.zoom_delta();
+            if (pinch_zoom - 1.0).abs() > f32::EPSILON {
+                pinch_zoom
+            } else {
+                let scroll_y = if input.smooth_scroll_delta.y.abs() > f32::EPSILON {
+                    input.smooth_scroll_delta.y
+                } else {
+                    input.raw_scroll_delta.y
+                };
+                (scroll_y * 0.0015).exp()
+            }
+        });
         if (zoom_delta - 1.0).abs() > f32::EPSILON {
             let old_zoom = viewport.zoom;
             let new_zoom = (old_zoom * zoom_delta).max(MIN_VIEWPORT_ZOOM);
@@ -424,6 +442,7 @@ pub fn interact_focused_scene(
                     viewport.pan = local - world * new_zoom;
                 }
                 viewport.zoom = new_zoom;
+                viewport_changed = true;
             }
         }
     }
@@ -443,13 +462,52 @@ pub fn interact_focused_scene(
     let mut action = None;
     for child in &scene.children {
         let child_hit = camera.rect(child.rect);
-        let response = ui.interact(
-            child_hit,
-            ui.make_persistent_id((scene.node.0, child.id.0, "child-rect")),
-            Sense::click(),
-        );
-        if response.clicked() {
+        let child_drag_id = ui.make_persistent_id((scene.node.0, child.id.0, "child-rect"));
+        let response = ui.interact(child_hit, child_drag_id, Sense::click_and_drag());
+        if response.drag_started_by(PointerButton::Primary) {
+            if let Some(pointer) = response.interact_pointer_pos() {
+                viewport.drag_child = Some(ChildDragState {
+                    child: child.id,
+                    start_world: screen_to_world(pointer, rect, viewport),
+                    applied_cells: [0, 0],
+                });
+            }
+        }
+        if response.dragged_by(PointerButton::Primary) {
+            let Some(pointer) = response.interact_pointer_pos() else {
+                continue;
+            };
+            let Some(mut drag_state) = viewport.drag_child.filter(|state| state.child == child.id)
+            else {
+                continue;
+            };
+            let delta = screen_to_world(pointer, rect, viewport) - drag_state.start_world;
+            let total_delta_cells = [quantize_drag_axis(delta.x), quantize_drag_axis(delta.y)];
+            let delta_cells = [
+                total_delta_cells[0] - drag_state.applied_cells[0],
+                total_delta_cells[1] - drag_state.applied_cells[1],
+            ];
+            if delta_cells != [0, 0] {
+                drag_state.applied_cells = total_delta_cells;
+                viewport.drag_child = Some(drag_state);
+                action = Some(SceneAction::MoveChild {
+                    child: child.id,
+                    delta_cells,
+                });
+                continue;
+            }
+        }
+        if response.drag_stopped_by(PointerButton::Primary)
+            && viewport
+                .drag_child
+                .is_some_and(|drag_state| drag_state.child == child.id)
+        {
+            viewport.drag_child = None;
+        }
+        if response.double_clicked() {
             action = Some(SceneAction::FocusChild(child.node));
+        } else if response.clicked() {
+            action = Some(SceneAction::SelectChild(child.id));
         }
     }
 
@@ -457,6 +515,23 @@ pub fn interact_focused_scene(
         rect,
         action,
         hover_world,
+        viewport_changed,
+    }
+}
+
+fn screen_to_world(pointer: Pos2, rect: Rect, viewport: &ViewportState) -> Pos2 {
+    let local = pointer - rect.min;
+    Pos2::new(
+        (local.x - viewport.pan.x) / viewport.zoom.max(f32::EPSILON),
+        (local.y - viewport.pan.y) / viewport.zoom.max(f32::EPSILON),
+    )
+}
+
+fn quantize_drag_axis(delta: f32) -> i32 {
+    if delta >= 0.0 {
+        (delta / CELL).floor() as i32
+    } else {
+        (delta / CELL).ceil() as i32
     }
 }
 

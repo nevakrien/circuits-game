@@ -4,7 +4,7 @@ use std::{
 };
 
 use circuits_game::{
-    editor::{ComponentDefId, EDIT_PREVIEW_DEPTH, EditableComponentDef, EditorDocument},
+    editor::{ComponentDefId, EditableComponentDef, EditorDocument},
     gate_plans::{
         ChildId, ChildInputConnection, ChildPlacement, Component, ComponentLayout, ComponentPlan,
         ComponentPlans, ComponentPort, Gate, GateId, PlanId, PortId, PortLocation, SignalRef,
@@ -44,6 +44,19 @@ fn runtime_bits_per_buffer(device: &wgpu::Device) -> u32 {
     let max_storage_bytes = device.limits().max_storage_buffer_binding_size;
     let max_storage_bits = max_storage_bytes.saturating_mul(8);
     (max_storage_bits & !31).max(32)
+}
+
+fn upload_viewer_scene(
+    scene_renderer: &mut SceneRenderer,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    viewer: &ViewerState,
+) {
+    if viewer.is_editing() {
+        scene_renderer.upload_edit_scene(device, queue, &viewer.scene);
+    } else {
+        scene_renderer.upload_runtime_scene(device, queue, &viewer.scene);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,7 +106,7 @@ async fn run() {
     let mut viewer = ViewerState::new(&document).expect("viewer should build initial scene");
     let animation_started_at = Instant::now();
     let mut scene_renderer = SceneRenderer::new(device, config.format);
-    scene_renderer.upload_scene(device, queue, &viewer.scene);
+    upload_viewer_scene(&mut scene_renderer, device, queue, &viewer);
     let zero_charge_buffer = GateKernel::create_io_buffer(device, 1, "viewer-zero-charge-buffer");
 
     let egui_ctx = egui::Context::default();
@@ -132,25 +145,29 @@ async fn run() {
                     if hotkeys.switch_to_edit && viewer.is_running_mode() {
                         runtime = None;
                         viewer.enter_edit(&document).expect("edit scene should rebuild");
-                        scene_renderer.upload_scene(device, queue, &viewer.scene);
+                        upload_viewer_scene(&mut scene_renderer, device, queue, &viewer);
                     }
                     if hotkeys.switch_to_run && viewer.is_editing() {
                         let compiled = DemoRuntime::new(device, queue, scene_label, &document)
                             .expect("run mode compile should succeed");
                         viewer.enter_run(&compiled).expect("run scene should rebuild");
-                        scene_renderer.upload_scene(device, queue, &viewer.scene);
+                        upload_viewer_scene(&mut scene_renderer, device, queue, &viewer);
                         runtime = Some(compiled);
                     }
                     if viewer.is_editing() && hotkeys.undo {
                         if document.undo().expect("undo should succeed") {
-                            viewer.rebuild_scene(runtime.as_ref(), &document).expect("scene should rebuild after undo");
-                            scene_renderer.upload_scene(device, queue, &viewer.scene);
+                            viewer
+                                .rebuild_scene(runtime.as_ref(), &document, None)
+                                .expect("scene should rebuild after undo");
+                            upload_viewer_scene(&mut scene_renderer, device, queue, &viewer);
                         }
                     }
                     if viewer.is_editing() && hotkeys.redo {
                         if document.redo().expect("redo should succeed") {
-                            viewer.rebuild_scene(runtime.as_ref(), &document).expect("scene should rebuild after redo");
-                            scene_renderer.upload_scene(device, queue, &viewer.scene);
+                            viewer
+                                .rebuild_scene(runtime.as_ref(), &document, None)
+                                .expect("scene should rebuild after redo");
+                            upload_viewer_scene(&mut scene_renderer, device, queue, &viewer);
                         }
                     }
 
@@ -226,7 +243,7 @@ async fn run() {
                                 {
                                     runtime = None;
                                     viewer.enter_edit(&document).expect("edit scene should rebuild");
-                                    scene_renderer.upload_scene(device, queue, &viewer.scene);
+                                    upload_viewer_scene(&mut scene_renderer, device, queue, &viewer);
                                 }
                                 if ui
                                     .selectable_label(viewer.is_running_mode(), "Run")
@@ -236,7 +253,7 @@ async fn run() {
                                     let compiled = DemoRuntime::new(device, queue, scene_label, &document)
                                         .expect("run mode compile should succeed");
                                     viewer.enter_run(&compiled).expect("run scene should rebuild");
-                                    scene_renderer.upload_scene(device, queue, &viewer.scene);
+                                    upload_viewer_scene(&mut scene_renderer, device, queue, &viewer);
                                     runtime = Some(compiled);
                                 }
                             });
@@ -312,9 +329,9 @@ async fn run() {
                                         if ui.button(format!("def {}", component.0)).clicked() {
                                             viewer.pop_edit_focus_to(i + 1);
                                             viewer.reset_camera();
-                                            viewer.rebuild_scene(runtime.as_ref(), &document)
+                                            viewer.rebuild_scene(runtime.as_ref(), &document, None)
                                                 .expect("focused edit scene should rebuild");
-                                            scene_renderer.upload_scene(device, queue, &viewer.scene);
+                                            upload_viewer_scene(&mut scene_renderer, device, queue, &viewer);
                                         }
                                     }
                                 } else if let Some(runtime) = runtime.as_ref() {
@@ -328,9 +345,9 @@ async fn run() {
                                         if ui.button(format!("{}", node.0)).clicked() {
                                             viewer.focus_runtime_child(node);
                                             viewer.reset_camera();
-                                            viewer.rebuild_scene(Some(runtime), &document)
+                                            viewer.rebuild_scene(Some(runtime), &document, None)
                                                 .expect("focused runtime scene should rebuild");
-                                            scene_renderer.upload_scene(device, queue, &viewer.scene);
+                                            upload_viewer_scene(&mut scene_renderer, device, queue, &viewer);
                                         }
                                     }
                                 }
@@ -339,16 +356,16 @@ async fn run() {
                                 ui.horizontal(|ui| {
                                     if ui.button("Undo").clicked() {
                                         if document.undo().expect("undo should succeed") {
-                                            viewer.rebuild_scene(runtime.as_ref(), &document)
+                                            viewer.rebuild_scene(runtime.as_ref(), &document, None)
                                                 .expect("scene should rebuild after undo");
-                                            scene_renderer.upload_scene(device, queue, &viewer.scene);
+                                            upload_viewer_scene(&mut scene_renderer, device, queue, &viewer);
                                         }
                                     }
                                     if ui.button("Redo").clicked() {
                                         if document.redo().expect("redo should succeed") {
-                                            viewer.rebuild_scene(runtime.as_ref(), &document)
+                                            viewer.rebuild_scene(runtime.as_ref(), &document, None)
                                                 .expect("scene should rebuild after redo");
-                                            scene_renderer.upload_scene(device, queue, &viewer.scene);
+                                            upload_viewer_scene(&mut scene_renderer, device, queue, &viewer);
                                         }
                                     }
                                     ui.monospace(format!(
@@ -358,7 +375,7 @@ async fn run() {
                                     ));
                                 });
                             }
-                            ui.label("Drag to pan, use arrow keys to move, ctrl/cmd+wheel or trackpad pinch to zoom, click child blocks to drill into them.");
+                            ui.label("Drag child blocks to move them, middle-drag or WASD/arrow keys to pan, ctrl/cmd+wheel or trackpad pinch to zoom, double-click child blocks to drill into them.");
                             ui.label("Hotkeys: E edit mode, R run mode, ctrl/cmd+z undo, ctrl/cmd+y redo, T step, F fast, P pause, Space single-step.");
                         });
 
@@ -393,57 +410,32 @@ async fn run() {
                                         if let Some(child_id) = viewer.selected_edit_child() {
                                             ui.separator();
                                             ui.label(format!("Selected child {}", child_id.0));
-                                            ui.horizontal(|ui| {
+                                            if let Some(child_component) =
+                                                document.child_component(active, child_id)
+                                            {
+                                                ui.monospace(format!("def {}", child_component.0));
                                                 if ui.button("Open").clicked() {
-                                                    if let Some(child_component) =
-                                                        document.child_component(active, child_id)
-                                                    {
-                                                        viewer.push_edit_focus(child_component);
-                                                        viewer.reset_camera();
-                                                        viewer.rebuild_scene(runtime.as_ref(), &document)
-                                                            .expect("child edit scene should rebuild");
-                                                        scene_renderer.upload_scene(device, queue, &viewer.scene);
-                                                    }
+                                                    viewer.push_edit_focus(child_component);
+                                                    viewer.reset_camera();
+                                                    viewer.rebuild_scene(
+                                                        runtime.as_ref(),
+                                                        &document,
+                                                        None,
+                                                    )
+                                                        .expect("child edit scene should rebuild");
+                                                    upload_viewer_scene(&mut scene_renderer, device, queue, &viewer);
                                                 }
-                                                if ui.button("Up").clicked()
-                                                    && document
-                                                        .move_child_by(active, child_id, [0, -1])
-                                                        .expect("move up should succeed")
-                                                {
-                                                    viewer.rebuild_scene(runtime.as_ref(), &document)
-                                                        .expect("scene should rebuild after move");
-                                                    scene_renderer.upload_scene(device, queue, &viewer.scene);
-                                                }
-                                            });
-                                            ui.horizontal(|ui| {
-                                                if ui.button("Left").clicked()
-                                                    && document
-                                                        .move_child_by(active, child_id, [-1, 0])
-                                                        .expect("move left should succeed")
-                                                {
-                                                    viewer.rebuild_scene(runtime.as_ref(), &document)
-                                                        .expect("scene should rebuild after move");
-                                                    scene_renderer.upload_scene(device, queue, &viewer.scene);
-                                                }
-                                                if ui.button("Down").clicked()
-                                                    && document
-                                                        .move_child_by(active, child_id, [0, 1])
-                                                        .expect("move down should succeed")
-                                                {
-                                                    viewer.rebuild_scene(runtime.as_ref(), &document)
-                                                        .expect("scene should rebuild after move");
-                                                    scene_renderer.upload_scene(device, queue, &viewer.scene);
-                                                }
-                                                if ui.button("Right").clicked()
-                                                    && document
-                                                        .move_child_by(active, child_id, [1, 0])
-                                                        .expect("move right should succeed")
-                                                {
-                                                    viewer.rebuild_scene(runtime.as_ref(), &document)
-                                                        .expect("scene should rebuild after move");
-                                                    scene_renderer.upload_scene(device, queue, &viewer.scene);
-                                                }
-                                            });
+                                            }
+                                            if let Some(placement) = component
+                                                .layout
+                                                .child_placements
+                                                .get(child_id.0 as usize)
+                                            {
+                                                ui.monospace(format!(
+                                                    "grid [{}, {}]",
+                                                    placement.min[0], placement.min[1]
+                                                ));
+                                            }
                                         }
                                     }
                                 });
@@ -452,13 +444,41 @@ async fn run() {
                         egui::CentralPanel::default()
                             .frame(egui::Frame::NONE.fill(egui::Color32::TRANSPARENT))
                             .show(ctx, |ui| {
-                                viewer.fit_camera_if_needed(ui.available_size_before_wrap());
+                                let available = ui.available_size_before_wrap();
+                                let size_changed = viewer.edit_available_size != available;
+                                viewer.edit_available_size = available;
+                                viewer.fit_camera_if_needed(available);
                                 let viewport_output =
                                     interact_focused_scene(ui, &viewer.scene, &mut viewer.viewport);
                                 scene_rect = Some(viewport_output.rect);
                                 hover_world = viewport_output.hover_world;
+                                let hover_changed = viewer.edit_hover_world != hover_world;
+                                viewer.edit_hover_world = hover_world;
+                                let mut scene_rebuilt = false;
                                 if let Some(action) = viewport_output.action {
                                     match action {
+                                        SceneAction::SelectChild(child) => {
+                                            if viewer.is_editing() {
+                                                viewer.select_edit_child(Some(child));
+                                            }
+                                        }
+                                        SceneAction::MoveChild { child, delta_cells } => {
+                                            if viewer.is_editing()
+                                                && document
+                                                    .move_child_by(viewer.active_edit_component(), child, delta_cells)
+                                                    .expect("drag move should succeed")
+                                            {
+                                                viewer.select_edit_child(Some(child));
+                                                viewer.rebuild_scene(
+                                                    runtime.as_ref(),
+                                                    &document,
+                                                    hover_world,
+                                                )
+                                                    .expect("scene should rebuild after drag move");
+                                                upload_viewer_scene(&mut scene_renderer, device, queue, &viewer);
+                                                scene_rebuilt = true;
+                                            }
+                                        }
                                         SceneAction::FocusChild(node) => {
                                             if viewer.is_editing() {
                                                 viewer.push_edit_focus(ComponentDefId(node.0 as usize));
@@ -466,11 +486,22 @@ async fn run() {
                                                 viewer.focus_runtime_child(node);
                                             }
                                             viewer.reset_camera();
-                                            viewer.rebuild_scene(runtime.as_ref(), &document)
+                                            viewer.rebuild_scene(runtime.as_ref(), &document, None)
                                                 .expect("child focus scene should rebuild");
-                                            scene_renderer.upload_scene(device, queue, &viewer.scene);
+                                            upload_viewer_scene(&mut scene_renderer, device, queue, &viewer);
+                                            scene_rebuilt = true;
                                         }
                                     }
+                                }
+                                if viewer.is_editing()
+                                    && !scene_rebuilt
+                                    && (viewport_output.viewport_changed
+                                        || size_changed
+                                        || hover_changed)
+                                {
+                                    viewer.rebuild_edit_scene(&document, hover_world)
+                                        .expect("edit scene should rebuild after viewport or hover change");
+                                    upload_viewer_scene(&mut scene_renderer, device, queue, &viewer);
                                 }
                             });
                     });
@@ -533,7 +564,7 @@ async fn run() {
                         runtime = None;
                         viewer = ViewerState::new(&document)
                             .expect("viewer should rebuild for requested scene");
-                        scene_renderer.upload_scene(device, queue, &viewer.scene);
+                        upload_viewer_scene(&mut scene_renderer, device, queue, &viewer);
                     }
 
                     if !response.repaint {
@@ -678,10 +709,12 @@ struct ViewerState {
     mode: AppMode,
     edit_focus_stack: Vec<ComponentDefId>,
     selected_edit_child: Option<ChildId>,
+    edit_hover_world: Option<egui::Pos2>,
     run_focus_node: circuits_game::gate_plans::NodeId,
     child_ids: Vec<circuits_game::gate_plans::NodeId>,
     scene: FocusedScene,
     viewport: ViewportState,
+    edit_available_size: egui::Vec2,
     pending_camera_fit: bool,
     simulation_mode: SimulationMode,
     tick_rate: u32,
@@ -704,10 +737,17 @@ impl ViewerState {
             mode: AppMode::Edit,
             edit_focus_stack: vec![document.root],
             selected_edit_child: None,
+            edit_hover_world: None,
             run_focus_node: circuits_game::gate_plans::NodeId(0),
             child_ids: Vec::new(),
-            scene: document.build_edit_scene(document.root, EDIT_PREVIEW_DEPTH)?,
+            scene: document.build_edit_scene(
+                document.root,
+                &ViewportState::default(),
+                egui::Vec2::ZERO,
+                None,
+            )?,
             viewport: ViewportState::default(),
+            edit_available_size: egui::Vec2::ZERO,
             pending_camera_fit: true,
             simulation_mode: SimulationMode::Paused,
             tick_rate: DEFAULT_TICK_RATE,
@@ -789,8 +829,17 @@ impl ViewerState {
             .expect("edit focus stack should never be empty")
     }
 
-    fn rebuild_edit_scene(&mut self, document: &EditorDocument) -> Result<(), String> {
-        self.scene = document.build_edit_scene(self.active_edit_component(), EDIT_PREVIEW_DEPTH)?;
+    fn rebuild_edit_scene(
+        &mut self,
+        document: &EditorDocument,
+        hover_world: Option<egui::Pos2>,
+    ) -> Result<(), String> {
+        self.scene = document.build_edit_scene(
+            self.active_edit_component(),
+            &self.viewport,
+            self.edit_available_size,
+            hover_world,
+        )?;
         Ok(())
     }
 
@@ -822,8 +871,9 @@ impl ViewerState {
         self.edit_focus_stack.clear();
         self.edit_focus_stack.push(document.root);
         self.selected_edit_child = None;
+        self.edit_hover_world = None;
         self.child_ids.clear();
-        self.rebuild_edit_scene(document)?;
+        self.rebuild_edit_scene(document, None)?;
         self.reset_camera();
         Ok(())
     }
@@ -831,6 +881,7 @@ impl ViewerState {
     fn reset_to_runtime_root(&mut self, runtime: &DemoRuntime) -> Result<(), String> {
         self.run_focus_node = runtime.root.id;
         self.selected_edit_child = None;
+        self.edit_hover_world = None;
         self.rebuild_run_scene(runtime)?;
         self.reset_camera();
         Ok(())
@@ -850,11 +901,13 @@ impl ViewerState {
     fn pop_edit_focus_to(&mut self, len: usize) {
         self.edit_focus_stack.truncate(len);
         self.selected_edit_child = None;
+        self.edit_hover_world = None;
     }
 
     fn push_edit_focus(&mut self, component: ComponentDefId) {
         self.edit_focus_stack.push(component);
         self.selected_edit_child = None;
+        self.edit_hover_world = None;
     }
 
     fn select_edit_child(&mut self, child: Option<ChildId>) {
@@ -865,11 +918,17 @@ impl ViewerState {
         self.selected_edit_child
     }
 
-    fn rebuild_scene(&mut self, runtime: Option<&DemoRuntime>, document: &EditorDocument) -> Result<(), String> {
+    fn rebuild_scene(
+        &mut self,
+        runtime: Option<&DemoRuntime>,
+        document: &EditorDocument,
+        hover_world: Option<egui::Pos2>,
+    ) -> Result<(), String> {
         match self.mode {
-            AppMode::Edit => self.rebuild_edit_scene(document),
-            AppMode::Run => self
-                .rebuild_run_scene(runtime.ok_or_else(|| "missing runtime in run mode".to_owned())?),
+            AppMode::Edit => self.rebuild_edit_scene(document, hover_world),
+            AppMode::Run => self.rebuild_run_scene(
+                runtime.ok_or_else(|| "missing runtime in run mode".to_owned())?,
+            ),
         }
     }
 
@@ -962,7 +1021,12 @@ fn count_gates(root: &Component, plans: &ComponentPlans) -> Result<u64, String> 
     let plan = plans
         .get(root.plan)
         .ok_or_else(|| format!("missing plan {:?}", root.plan))?;
-    Ok(plan.gates.len() as u64 + root.children.iter().map(|child| count_gates(child, plans)).sum::<Result<u64, _>>()?)
+    Ok(plan.gates.len() as u64
+        + root
+            .children
+            .iter()
+            .map(|child| count_gates(child, plans))
+            .sum::<Result<u64, _>>()?)
 }
 
 fn count_depth(root: &Component) -> u32 {
@@ -981,13 +1045,12 @@ fn fit_viewport_to_scene(available: egui::Vec2, scene: &FocusedScene) -> Viewpor
     const VIEWPORT_MARGIN: f32 = 0.92;
 
     let scene_size = scene.bounds.size();
-    let zoom = (available.x / scene_size.x.max(1.0))
-        .min(available.y / scene_size.y.max(1.0))
+    let zoom = (available.x / scene_size.x.max(1.0)).min(available.y / scene_size.y.max(1.0))
         * VIEWPORT_MARGIN;
     let zoom = zoom.max(0.01);
     let content_size = scene_size * zoom;
     let pan = (available - content_size) * 0.5 - scene.bounds.min.to_vec2() * zoom;
-    ViewportState { zoom, pan }
+    ViewportState::new(zoom, pan)
 }
 
 fn seed_demo_words(
@@ -1112,6 +1175,7 @@ fn build_starter_demo_circuit() -> DemoSceneSpec {
                 plan: child_plan,
                 children: Vec::new(),
                 child_input_connections: Vec::new(),
+                dangling_wires: Vec::new(),
                 layout: ComponentLayout::default(),
             },
             EditableComponentDef {
@@ -1129,6 +1193,7 @@ fn build_starter_demo_circuit() -> DemoSceneSpec {
                         src: this_ref(1),
                     },
                 ],
+                dangling_wires: Vec::new(),
                 layout: ComponentLayout::default()
                     .with_child_placements(vec![ChildPlacement::at([2, 2])]),
             },
@@ -1153,16 +1218,17 @@ fn build_stress_demo_circuit() -> DemoSceneSpec {
         ComponentPlan::new(build_stress_gates(STRESS_GATES_PER_COMPONENT))
             .with_grid_size([128, 64]),
     );
-        plans.insert(
-            branch_plan,
-            ComponentPlan::new(build_stress_gates(STRESS_GATES_PER_COMPONENT))
+    plans.insert(
+        branch_plan,
+        ComponentPlan::new(build_stress_gates(STRESS_GATES_PER_COMPONENT))
             .with_grid_size([256, 160]),
-        );
+    );
 
     let mut components = vec![EditableComponentDef {
         plan: leaf_plan,
         children: Vec::new(),
         child_input_connections: Vec::new(),
+        dangling_wires: Vec::new(),
         layout: ComponentLayout::default(),
     }];
     for _ in 0..STRESS_DEPTH {
@@ -1171,6 +1237,7 @@ fn build_stress_demo_circuit() -> DemoSceneSpec {
             plan: branch_plan,
             children: vec![previous; STRESS_BRANCH_FACTOR],
             child_input_connections: Vec::new(),
+            dangling_wires: Vec::new(),
             layout: ComponentLayout::default().with_child_placements(vec![
                 ChildPlacement::at([0, 0]),
                 ChildPlacement::at([128, 0]),
@@ -1180,8 +1247,8 @@ fn build_stress_demo_circuit() -> DemoSceneSpec {
         });
     }
     let root = ComponentDefId(components.len() - 1);
-    let document = EditorDocument::new(plans, components, root)
-        .expect("stress demo document should build");
+    let document =
+        EditorDocument::new(plans, components, root).expect("stress demo document should build");
 
     DemoSceneSpec {
         kind: DemoSceneKind::Stress,

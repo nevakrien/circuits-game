@@ -13,8 +13,6 @@ use crate::visual_ui::{
     ExternalPort, FocusedScene, PlacedChild, PlacedGate, PlacedPort, VisualWire,
 };
 
-pub const EDIT_PREVIEW_DEPTH: usize = 2;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ComponentDefId(pub usize);
 
@@ -23,24 +21,41 @@ pub struct EditableComponentDef {
     pub plan: PlanId,
     pub children: Vec<ComponentDefId>,
     pub child_input_connections: Vec<ChildInputConnection>,
+    pub dangling_wires: Vec<DanglingWire>,
     pub layout: ComponentLayout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DanglingWire {
+    pub src: SignalRef,
+    pub target: WirePoint,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct EditHistory {
-    actions: Vec<EditAction>,
+    actions: Vec<EditorCommand>,
     cursor: usize,
 }
 
 #[derive(Debug, Clone)]
-pub enum EditAction {
-    MoveChild {
-        component: ComponentDefId,
-        child: ChildId,
-        from: ChildPlacement,
-        to: ChildPlacement,
-    },
-    Batch(Vec<EditAction>),
+pub struct MoveChildCommand {
+    pub component: ComponentDefId,
+    pub child: ChildId,
+    pub from: ChildPlacement,
+    pub to: ChildPlacement,
+    before_component: EditableComponentDef,
+    after_component: EditableComponentDef,
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchCommand {
+    pub commands: Vec<EditorCommand>,
+}
+
+#[derive(Debug, Clone)]
+pub enum EditorCommand {
+    MoveChild(MoveChildCommand),
+    Batch(BatchCommand),
 }
 
 #[derive(Debug, Clone)]
@@ -51,50 +66,35 @@ pub struct EditorDocument {
     history: EditHistory,
 }
 
-impl EditAction {
+impl EditorCommand {
     pub fn inverse(&self) -> Self {
         match self {
-            Self::MoveChild {
-                component,
-                child,
-                from,
-                to,
-            } => Self::MoveChild {
-                component: *component,
-                child: *child,
-                from: *to,
-                to: *from,
-            },
-            Self::Batch(actions) => Self::Batch(actions.iter().rev().map(Self::inverse).collect()),
+            Self::MoveChild(command) => Self::MoveChild(MoveChildCommand {
+                component: command.component,
+                child: command.child,
+                from: command.to,
+                to: command.from,
+                before_component: command.after_component.clone(),
+                after_component: command.before_component.clone(),
+            }),
+            Self::Batch(command) => Self::Batch(BatchCommand {
+                commands: command.commands.iter().rev().map(Self::inverse).collect(),
+            }),
         }
     }
 
     fn apply(&self, doc: &mut EditorDocument) -> Result<(), String> {
         match self {
-            Self::MoveChild {
-                component,
-                child,
-                to,
-                ..
-            } => {
-                let component_id = *component;
-                doc.components
-                    .get(component_id.0)
-                    .ok_or_else(|| format!("missing component {:?}", component_id))?;
-                let plan = doc
+            Self::MoveChild(command) => {
+                let component = doc
                     .components
-                    .get_mut(component_id.0)
-                    .ok_or_else(|| format!("missing component {:?}", component_id))?;
-                let slot = plan
-                    .layout
-                    .child_placements
-                    .get_mut(child.0 as usize)
-                    .ok_or_else(|| format!("missing child placement {:?}", child))?;
-                *slot = *to;
+                    .get_mut(command.component.0)
+                    .ok_or_else(|| format!("missing component {:?}", command.component))?;
+                *component = command.after_component.clone();
                 Ok(())
             }
-            Self::Batch(actions) => {
-                for action in actions {
+            Self::Batch(command) => {
+                for action in &command.commands {
                     action.apply(doc)?;
                 }
                 Ok(())
@@ -115,7 +115,7 @@ impl EditHistory {
     fn push_and_apply(
         &mut self,
         doc: &mut EditorDocument,
-        action: EditAction,
+        action: EditorCommand,
     ) -> Result<(), String> {
         if self.cursor < self.actions.len() {
             self.actions.truncate(self.cursor);
@@ -211,12 +211,26 @@ impl EditorDocument {
     pub fn build_edit_scene(
         &self,
         focused: ComponentDefId,
-        preview_depth: usize,
+        viewport: &crate::visual_ui::ViewportState,
+        available: Vec2,
+        hover_world: Option<Pos2>,
     ) -> Result<FocusedScene, String> {
-        self.build_edit_scene_with_stack(&[], focused, preview_depth)
+        if available.x <= 0.0 || available.y <= 0.0 {
+            return self.build_edit_probe_scene(focused);
+        }
+        self.build_edit_scene_with_stack(
+            &[],
+            focused,
+            Some(EditViewportHint::root(viewport, available, hover_world)),
+            EditSceneDetail::Full,
+        )
     }
 
-    pub fn apply_action(&mut self, action: EditAction) -> Result<(), String> {
+    fn build_edit_probe_scene(&self, focused: ComponentDefId) -> Result<FocusedScene, String> {
+        self.build_edit_scene_with_stack(&[], focused, None, EditSceneDetail::Probe)
+    }
+
+    pub fn apply_command(&mut self, action: EditorCommand) -> Result<(), String> {
         let mut history = std::mem::take(&mut self.history);
         let result = history.push_and_apply(self, action);
         self.history = history;
@@ -260,13 +274,52 @@ impl EditorDocument {
         if to == from {
             return Ok(false);
         }
-        self.apply_action(EditAction::MoveChild {
+        let command = self.move_child_command(component, child, to)?;
+        self.apply_command(EditorCommand::MoveChild(command))?;
+        Ok(true)
+    }
+
+    fn move_child_command(
+        &self,
+        component: ComponentDefId,
+        child: ChildId,
+        to: ChildPlacement,
+    ) -> Result<MoveChildCommand, String> {
+        let before_component = self
+            .component(component)
+            .cloned()
+            .ok_or_else(|| format!("missing component {:?}", component))?;
+        let from = *before_component
+            .layout
+            .child_placements
+            .get(child.0 as usize)
+            .ok_or_else(|| format!("missing child placement {:?}", child))?;
+        let mut after_component = before_component.clone();
+        let detached_wires = self.detached_child_dangling_wires(component, child, from)?;
+        let slot = after_component
+            .layout
+            .child_placements
+            .get_mut(child.0 as usize)
+            .ok_or_else(|| format!("missing child placement {:?}", child))?;
+        *slot = to;
+        after_component
+            .child_input_connections
+            .retain(|connection| connection.child != child);
+        after_component.dangling_wires.extend(detached_wires);
+        let (reattached, retained_dangling) =
+            self.auto_attach_child_inputs(component, child, to, &after_component.dangling_wires)?;
+        after_component.dangling_wires = retained_dangling;
+        after_component.child_input_connections.extend(reattached);
+        after_component.layout.wires =
+            self.refreshed_component_wires(component, &after_component)?;
+        Ok(MoveChildCommand {
             component,
             child,
             from,
             to,
-        })?;
-        Ok(true)
+            before_component,
+            after_component,
+        })
     }
 
     pub fn undo(&mut self) -> Result<bool, String> {
@@ -303,7 +356,8 @@ impl EditorDocument {
         &self,
         parent_stack: &[ComponentDefId],
         focused: ComponentDefId,
-        preview_depth: usize,
+        viewport_hint: Option<EditViewportHint>,
+        detail: EditSceneDetail,
     ) -> Result<FocusedScene, String> {
         let component = self
             .component(focused)
@@ -314,6 +368,16 @@ impl EditorDocument {
         let grid_dims = plan.grid_size;
         let grid_size = Vec2::new(grid_dims[0] as f32 * CELL, grid_dims[1] as f32 * CELL);
         let grid_rect = Rect::from_min_size(Pos2::new(PAD, PAD + 36.0), grid_size);
+        let bounds = Rect::from_min_max(
+            Pos2::ZERO,
+            Pos2::new(grid_rect.right() + PAD, grid_rect.bottom() + PAD),
+        );
+
+        if matches!(detail, EditSceneDetail::Placeholder) {
+            return Ok(placeholder_edit_scene(
+                focused, bounds, grid_rect, grid_dims,
+            ));
+        }
 
         let input_ports: Vec<_> = plan
             .inputs
@@ -366,7 +430,24 @@ impl EditorDocument {
             })
             .collect::<Vec<_>>();
 
-        let children = if preview_depth == 0 {
+        let focused_child_index = viewport_hint.and_then(|hint| {
+            select_preview_child_index(
+                component,
+                self,
+                grid_rect,
+                grid_dims,
+                hint.visible_world_rect,
+                hint.hover_world,
+            )
+        });
+
+        let child_detail = match detail {
+            EditSceneDetail::Full => ChildSceneDetail::SelectedPathOnly,
+            EditSceneDetail::Probe => ChildSceneDetail::PlaceholderChildren,
+            EditSceneDetail::Placeholder => ChildSceneDetail::PlaceholderOnly,
+        };
+
+        let children = if component.children.is_empty() {
             Vec::new()
         } else {
             let mut next_parent_stack = Vec::with_capacity(parent_stack.len() + 1);
@@ -418,10 +499,27 @@ impl EditorDocument {
                             label: port.label.clone().unwrap_or_default(),
                         })
                         .collect();
+                    let (next_detail, next_viewport_hint) = match child_detail {
+                        ChildSceneDetail::SelectedPathOnly
+                            if focused_child_index == Some(child_i) =>
+                        {
+                            (
+                                EditSceneDetail::Full,
+                                viewport_hint
+                                    .map(|hint| hint.for_child(child_plan.grid_size, rect)),
+                            )
+                        }
+                        ChildSceneDetail::SelectedPathOnly => (EditSceneDetail::Placeholder, None),
+                        ChildSceneDetail::PlaceholderChildren => {
+                            (EditSceneDetail::Placeholder, None)
+                        }
+                        ChildSceneDetail::PlaceholderOnly => (EditSceneDetail::Placeholder, None),
+                    };
                     let scene = self.build_edit_scene_with_stack(
                         &next_parent_stack,
                         *child_component,
-                        preview_depth.saturating_sub(1),
+                        next_viewport_hint,
+                        next_detail,
                     )?;
                     Ok(PlacedChild {
                         id: child_id,
@@ -503,11 +601,6 @@ impl EditorDocument {
 
         let wires = build_component_wires(component, focused, &ctx, self, &lookup)?;
 
-        let bounds = Rect::from_min_max(
-            Pos2::ZERO,
-            Pos2::new(grid_rect.right() + PAD, grid_rect.bottom() + PAD),
-        );
-
         Ok(FocusedScene {
             node: component_node_id(focused),
             title: format!("Component Def {}", focused.0),
@@ -520,9 +613,157 @@ impl EditorDocument {
             output_ports,
             gates,
             children,
+            drill_child: focused_child_index.map(|index| ChildId(index as u32)),
             ancestor_ports,
             wires,
         })
+    }
+
+    fn refreshed_component_wires(
+        &self,
+        component_id: ComponentDefId,
+        next_component: &EditableComponentDef,
+    ) -> Result<Vec<WireLayout>, String> {
+        let mut temp = self.clone();
+        let previous_component = temp
+            .components
+            .get_mut(component_id.0)
+            .ok_or_else(|| format!("missing component {:?}", component_id))?;
+        *previous_component = next_component.clone();
+        let ctx = VisualCtx {
+            parent_stack: &[],
+            child_defs: &next_component.children,
+        };
+        let expected = temp.expected_component_wires(component_id, &ctx)?;
+        let preserved: HashMap<_, _> = next_component
+            .layout
+            .wires
+            .iter()
+            .cloned()
+            .map(|wire| ((wire.from, wire.to), wire))
+            .collect();
+        Ok(expected
+            .into_iter()
+            .map(|wire| {
+                preserved
+                    .get(&(wire.layout.from, wire.layout.to))
+                    .cloned()
+                    .unwrap_or(wire.layout)
+            })
+            .collect())
+    }
+
+    fn auto_attach_child_inputs(
+        &self,
+        component_id: ComponentDefId,
+        child_id: ChildId,
+        placement: ChildPlacement,
+        dangling_wires: &[DanglingWire],
+    ) -> Result<(Vec<ChildInputConnection>, Vec<DanglingWire>), String> {
+        let mut temp = self.clone();
+        let component = temp
+            .components
+            .get_mut(component_id.0)
+            .ok_or_else(|| format!("missing component {:?}", component_id))?;
+        let slot = component
+            .layout
+            .child_placements
+            .get_mut(child_id.0 as usize)
+            .ok_or_else(|| format!("missing child placement {:?}", child_id))?;
+        *slot = placement;
+        component
+            .child_input_connections
+            .retain(|connection| connection.child != child_id);
+        component.dangling_wires = dangling_wires.to_vec();
+
+        let scene = temp.build_edit_probe_scene(component_id)?;
+        let target_child = scene
+            .children
+            .get(child_id.0 as usize)
+            .ok_or_else(|| format!("missing child scene {:?}", child_id))?;
+        let mut connections = Vec::new();
+        let mut remaining_dangling = dangling_wires.to_vec();
+        let mut used_wire_indices = HashSet::default();
+        for port in &target_child.inputs {
+            let best_match = remaining_dangling
+                .iter()
+                .enumerate()
+                .filter_map(|(index, wire)| {
+                    (!used_wire_indices.contains(&index)).then_some((
+                        index,
+                        wire.src,
+                        port.anchor.distance(local_wire_point_to_pos(&wire.target)),
+                    ))
+                })
+                .filter(|(_, src, _)| {
+                    !matches!(
+                        src,
+                        SignalRef::ChildOutput {
+                            child: source_child,
+                            ..
+                        } if *source_child == child_id
+                    )
+                })
+                .filter(|(_, _, distance)| *distance <= CELL * 0.35)
+                .min_by(|a, b| a.2.total_cmp(&b.2));
+            if let Some((wire_index, src, _)) = best_match {
+                used_wire_indices.insert(wire_index);
+                connections.push(ChildInputConnection {
+                    child: child_id,
+                    input: port.id,
+                    src,
+                });
+            }
+        }
+        remaining_dangling = remaining_dangling
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, wire)| (!used_wire_indices.contains(&index)).then_some(wire))
+            .collect();
+        connections.sort_by_key(|connection| connection.input.0);
+        Ok((connections, remaining_dangling))
+    }
+
+    fn detached_child_dangling_wires(
+        &self,
+        component_id: ComponentDefId,
+        child_id: ChildId,
+        placement: ChildPlacement,
+    ) -> Result<Vec<DanglingWire>, String> {
+        let mut temp = self.clone();
+        let component = temp
+            .components
+            .get_mut(component_id.0)
+            .ok_or_else(|| format!("missing component {:?}", component_id))?;
+        let slot = component
+            .layout
+            .child_placements
+            .get_mut(child_id.0 as usize)
+            .ok_or_else(|| format!("missing child placement {:?}", child_id))?;
+        *slot = placement;
+        let scene = temp.build_edit_probe_scene(component_id)?;
+        let target_child = scene
+            .children
+            .get(child_id.0 as usize)
+            .ok_or_else(|| format!("missing child scene {:?}", child_id))?;
+        let editable = self
+            .component(component_id)
+            .ok_or_else(|| format!("missing component {:?}", component_id))?;
+        Ok(editable
+            .child_input_connections
+            .iter()
+            .filter(|connection| connection.child == child_id)
+            .filter_map(|connection| {
+                target_child
+                    .inputs
+                    .iter()
+                    .find(|port| port.id == connection.input)
+                    .map(|port| DanglingWire {
+                        src: connection.src,
+                        target: pos_to_wire_point(port.anchor),
+                    })
+            })
+            .collect())
     }
 }
 
@@ -554,10 +795,87 @@ fn component_node_id(component: ComponentDefId) -> NodeId {
     NodeId(component.0 as u32)
 }
 
+fn placeholder_edit_scene(
+    focused: ComponentDefId,
+    bounds: Rect,
+    grid_rect: Rect,
+    grid_dims: [u32; 2],
+) -> FocusedScene {
+    FocusedScene {
+        node: component_node_id(focused),
+        title: format!("Component Def {}", focused.0),
+        bounds,
+        words_per_buffer: 0,
+        gate_store: Arc::new(HashMap::default()),
+        grid_rect,
+        grid_dims,
+        input_ports: Vec::new(),
+        output_ports: Vec::new(),
+        gates: Vec::new(),
+        children: Vec::new(),
+        drill_child: None,
+        ancestor_ports: Vec::new(),
+        wires: Vec::new(),
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct VisualCtx<'a> {
     parent_stack: &'a [ComponentDefId],
     child_defs: &'a [ComponentDefId],
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EditViewportHint {
+    visible_world_rect: Rect,
+    hover_world: Option<Pos2>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditSceneDetail {
+    Full,
+    Probe,
+    Placeholder,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildSceneDetail {
+    SelectedPathOnly,
+    PlaceholderChildren,
+    PlaceholderOnly,
+}
+
+impl EditViewportHint {
+    fn root(
+        viewport: &crate::visual_ui::ViewportState,
+        available: Vec2,
+        hover_world: Option<Pos2>,
+    ) -> Self {
+        Self {
+            visible_world_rect: visible_world_rect(viewport, available),
+            hover_world,
+        }
+    }
+
+    fn for_child(self, child_grid_size: [u32; 2], child_rect: Rect) -> Self {
+        let source = child_scene_grid_rect(child_grid_size);
+        let scale = (child_rect.width() / source.width().max(f32::EPSILON))
+            .min(child_rect.height() / source.height().max(f32::EPSILON));
+        let fitted_size = source.size() * scale;
+        let target_min = child_rect.center() - fitted_size * 0.5;
+        Self {
+            visible_world_rect: inverse_transform_rect(
+                self.visible_world_rect,
+                source.min,
+                target_min,
+                scale,
+            ),
+            hover_world: self
+                .hover_world
+                .filter(|hover| child_rect.contains(*hover))
+                .map(|hover| inverse_transform_pos(hover, source.min, target_min, scale)),
+        }
+    }
 }
 
 fn source_gate_of_ref(
@@ -991,7 +1309,7 @@ fn build_component_wires(
         overrides.entry((wire.from, wire.to)).or_insert(wire);
     }
 
-    let mut wires = Vec::with_capacity(expected.len());
+    let mut wires = Vec::with_capacity(expected.len() + component.dangling_wires.len());
     for expected_wire in expected {
         let layout = overrides
             .get(&(expected_wire.layout.from, expected_wire.layout.to))
@@ -1003,6 +1321,18 @@ fn build_component_wires(
                 color: palette_color(wires.len()),
                 points,
             });
+        }
+    }
+    for dangling in &component.dangling_wires {
+        if let Some(start) = lookup.anchor(signal_to_wire_endpoint(dangling.src)) {
+            let end = local_wire_point_to_pos(&dangling.target);
+            if let Some(points) = orth_wire_points(Some(start), Some(end)) {
+                wires.push(VisualWire {
+                    source_gate: source_gate_of_ref(component_id, dangling.src, ctx, doc).ok(),
+                    color: palette_color(wires.len()),
+                    points,
+                });
+            }
         }
     }
     Ok(wires)
@@ -1112,4 +1442,399 @@ fn local_wire_point_to_pos(point: &WirePoint) -> Pos2 {
         PAD + (point.x as f32 / WIRE_POINT_UNITS_PER_CELL) * CELL,
         PAD + 36.0 + (point.y as f32 / WIRE_POINT_UNITS_PER_CELL) * CELL,
     )
+}
+
+fn pos_to_wire_point(pos: Pos2) -> WirePoint {
+    WirePoint {
+        x: (((pos.x - PAD) / CELL) * WIRE_POINT_UNITS_PER_CELL).round() as i32,
+        y: (((pos.y - PAD - 36.0) / CELL) * WIRE_POINT_UNITS_PER_CELL).round() as i32,
+    }
+}
+
+fn visible_world_rect(viewport: &crate::visual_ui::ViewportState, available: Vec2) -> Rect {
+    Rect::from_min_max(
+        Pos2::new(
+            (-viewport.pan.x) / viewport.zoom.max(f32::EPSILON),
+            (-viewport.pan.y) / viewport.zoom.max(f32::EPSILON),
+        ),
+        Pos2::new(
+            (available.x - viewport.pan.x) / viewport.zoom.max(f32::EPSILON),
+            (available.y - viewport.pan.y) / viewport.zoom.max(f32::EPSILON),
+        ),
+    )
+}
+
+fn select_preview_child_index(
+    component: &EditableComponentDef,
+    doc: &EditorDocument,
+    grid_rect: Rect,
+    grid_dims: [u32; 2],
+    visible_world_rect: Rect,
+    hover_world: Option<Pos2>,
+) -> Option<usize> {
+    if let Some(hover_world) = hover_world {
+        if let Some((child_i, _)) =
+            component
+                .children
+                .iter()
+                .enumerate()
+                .find(|(child_i, child_component)| {
+                    let Some(child_component_data) = doc.component(**child_component) else {
+                        return false;
+                    };
+                    let Some(child_plan) = doc.plan(child_component_data.plan) else {
+                        return false;
+                    };
+                    let placement = component
+                        .layout
+                        .child_placements
+                        .get(*child_i)
+                        .copied()
+                        .unwrap_or(ChildPlacement::ONE_CELL);
+                    child_rect_from_placement(grid_rect, grid_dims, child_plan.grid_size, placement)
+                        .contains(hover_world)
+                })
+        {
+            return Some(child_i);
+        }
+    }
+
+    let mut best = None;
+    let mut second_best = None;
+    for (child_i, child_component) in component.children.iter().enumerate() {
+        let Some(child_component_data) = doc.component(*child_component) else {
+            continue;
+        };
+        let Some(child_plan) = doc.plan(child_component_data.plan) else {
+            continue;
+        };
+        let placement = component
+            .layout
+            .child_placements
+            .get(child_i)
+            .copied()
+            .unwrap_or(ChildPlacement::ONE_CELL);
+        let rect = child_rect_from_placement(grid_rect, grid_dims, child_plan.grid_size, placement);
+        let Some(coverage) = focused_child_visible_coverage(rect, visible_world_rect) else {
+            continue;
+        };
+        match best {
+            None => best = Some((coverage, child_i)),
+            Some((best_coverage, best_child_i)) if coverage > best_coverage => {
+                second_best = Some((best_coverage, best_child_i));
+                best = Some((coverage, child_i));
+            }
+            _ => {
+                second_best = Some(match second_best {
+                    Some((second_coverage, second_child_i)) if second_coverage >= coverage => {
+                        (second_coverage, second_child_i)
+                    }
+                    _ => (coverage, child_i),
+                });
+            }
+        }
+    }
+    match (best, second_best) {
+        (Some((best_coverage, child_i)), Some((next_coverage, _)))
+            if best_coverage >= AUTO_DRILL_DOMINANT_VISIBLE_COVERAGE
+                && best_coverage - next_coverage >= AUTO_DRILL_MIN_MARGIN =>
+        {
+            Some(child_i)
+        }
+        (Some((best_coverage, child_i)), None)
+            if best_coverage >= AUTO_DRILL_DOMINANT_VISIBLE_COVERAGE =>
+        {
+            Some(child_i)
+        }
+        _ => None,
+    }
+}
+
+fn focused_child_visible_coverage(rect: Rect, visible_world_rect: Rect) -> Option<f32> {
+    let viewport_area = rect_area(visible_world_rect).max(f32::EPSILON);
+    let viewport_center = visible_world_rect.center();
+    child_focus_rect(rect)
+        .contains(viewport_center)
+        .then(|| rect_area(rect.intersect(visible_world_rect)) / viewport_area)
+        .filter(|coverage| *coverage >= DRILL_IN_VISIBLE_COVERAGE_THRESHOLD)
+}
+
+fn child_scene_grid_rect(grid_dims: [u32; 2]) -> Rect {
+    Rect::from_min_size(
+        Pos2::new(PAD, PAD + 36.0),
+        Vec2::new(grid_dims[0] as f32 * CELL, grid_dims[1] as f32 * CELL),
+    )
+}
+
+fn inverse_transform_rect(rect: Rect, source_min: Pos2, target_min: Pos2, scale: f32) -> Rect {
+    Rect::from_min_max(
+        inverse_transform_pos(rect.min, source_min, target_min, scale),
+        inverse_transform_pos(rect.max, source_min, target_min, scale),
+    )
+}
+
+fn inverse_transform_pos(pos: Pos2, source_min: Pos2, target_min: Pos2, scale: f32) -> Pos2 {
+    source_min + (pos - target_min) / scale.max(f32::EPSILON)
+}
+
+fn child_focus_rect(rect: Rect) -> Rect {
+    Rect::from_center_size(rect.center(), rect.size() * DRILL_IN_FOCUS_REGION)
+}
+
+fn rect_area(rect: Rect) -> f32 {
+    rect.width().max(0.0) * rect.height().max(0.0)
+}
+
+const DRILL_IN_VISIBLE_COVERAGE_THRESHOLD: f32 = 0.20;
+const DRILL_IN_FOCUS_REGION: f32 = 0.55;
+const AUTO_DRILL_DOMINANT_VISIBLE_COVERAGE: f32 = 0.35;
+const AUTO_DRILL_MIN_MARGIN: f32 = 0.05;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gate_plans::ComponentPort;
+
+    const INPUT_A: PortId = PortId(10);
+    const INPUT_B: PortId = PortId(11);
+    const OUTPUT_Y: PortId = PortId(20);
+    const OUTPUT_Z: PortId = PortId(21);
+
+    #[test]
+    fn auto_attach_does_not_snap_to_the_childs_own_outputs() {
+        let document = sample_document();
+        let component = document.component(ComponentDefId(1)).unwrap();
+        let placement = component.layout.child_placements[0];
+
+        let inferred = document
+            .auto_attach_child_inputs(
+                ComponentDefId(1),
+                ChildId(0),
+                placement,
+                &document
+                    .component(ComponentDefId(1))
+                    .unwrap()
+                    .dangling_wires,
+            )
+            .expect("current placement should infer child attachments");
+
+        assert!(inferred.0.iter().all(|connection| {
+            !matches!(
+                connection.src,
+                SignalRef::ChildOutput {
+                    child: ChildId(0),
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn move_child_commands_round_trip_through_history() {
+        let mut document = sample_document();
+        let before = document.component(ComponentDefId(1)).unwrap().clone();
+
+        assert!(
+            document
+                .move_child_by(ComponentDefId(1), ChildId(0), [-2, -2])
+                .expect("move should succeed")
+        );
+        assert_eq!(document.history().applied_len(), 1);
+        assert_eq!(document.history().redo_len(), 0);
+        assert_ne!(
+            document.component(ComponentDefId(1)).unwrap().layout,
+            before.layout
+        );
+
+        assert!(document.undo().expect("undo should succeed"));
+        assert_eq!(
+            document.component(ComponentDefId(1)).unwrap().layout,
+            before.layout
+        );
+        assert_eq!(
+            document
+                .component(ComponentDefId(1))
+                .unwrap()
+                .child_input_connections,
+            before.child_input_connections
+        );
+
+        assert!(document.redo().expect("redo should succeed"));
+        assert_eq!(document.history().applied_len(), 1);
+        assert_eq!(document.history().redo_len(), 0);
+    }
+
+    #[test]
+    fn move_child_detaches_into_dangling_wires_instead_of_deleting_connections() {
+        let mut document = sample_document();
+
+        assert!(
+            document
+                .move_child_by(ComponentDefId(1), ChildId(0), [-2, -2])
+                .expect("move should succeed")
+        );
+
+        let component = document.component(ComponentDefId(1)).unwrap();
+        assert!(component.child_input_connections.is_empty());
+        assert_eq!(component.dangling_wires.len(), 2);
+        assert_eq!(
+            component
+                .dangling_wires
+                .iter()
+                .map(|wire| wire.src)
+                .collect::<Vec<_>>(),
+            vec![
+                SignalRef::ThisGate(GateId(0)),
+                SignalRef::ThisGate(GateId(1)),
+            ]
+        );
+    }
+
+    #[test]
+    fn move_child_back_onto_dangling_wires_reattaches_connections() {
+        let mut document = sample_document();
+        let original = document.component(ComponentDefId(1)).unwrap().clone();
+
+        assert!(
+            document
+                .move_child_by(ComponentDefId(1), ChildId(0), [-2, -2])
+                .expect("move away should succeed")
+        );
+        assert!(
+            document
+                .move_child_by(ComponentDefId(1), ChildId(0), [2, 2])
+                .expect("move back should succeed")
+        );
+
+        let component = document.component(ComponentDefId(1)).unwrap();
+        assert_eq!(
+            component.child_input_connections,
+            original.child_input_connections
+        );
+        assert!(component.dangling_wires.is_empty());
+    }
+
+    fn sample_document() -> EditorDocument {
+        let child_plan = PlanId(0);
+        let root_plan = PlanId(1);
+        let mut plans = HashMap::default();
+        plans.insert(
+            child_plan,
+            ComponentPlan::with_ports(
+                vec![
+                    Gate::BitNop {
+                        src: SignalRef::InputPort(INPUT_A),
+                    },
+                    Gate::BitNop {
+                        src: SignalRef::InputPort(INPUT_B),
+                    },
+                    Gate::BitXOR {
+                        a: SignalRef::ThisGate(GateId(0)),
+                        b: SignalRef::ThisGate(GateId(1)),
+                    },
+                    Gate::BitAND {
+                        a: SignalRef::ThisGate(GateId(0)),
+                        b: SignalRef::ThisGate(GateId(1)),
+                    },
+                    Gate::BitNot {
+                        src: SignalRef::ThisGate(GateId(0)),
+                    },
+                ],
+                vec![port(INPUT_A, 0, 0, 1, "A"), port(INPUT_B, 1, 0, 2, "B")],
+                vec![
+                    port(OUTPUT_Y, 2, u16::MAX, 1, "sum"),
+                    port(OUTPUT_Z, 4, u16::MAX, 2, "carry"),
+                ],
+            )
+            .with_grid_size([3, 2]),
+        );
+        plans.insert(
+            root_plan,
+            ComponentPlan::with_ports(
+                vec![
+                    Gate::BitNot {
+                        src: SignalRef::ThisGate(GateId(0)),
+                    },
+                    Gate::BitNop {
+                        src: SignalRef::ThisGate(GateId(0)),
+                    },
+                    Gate::BitXOR {
+                        a: SignalRef::ThisGate(GateId(0)),
+                        b: SignalRef::ThisGate(GateId(1)),
+                    },
+                    Gate::BitNop {
+                        src: SignalRef::ChildOutput {
+                            child: ChildId(0),
+                            port: OUTPUT_Y,
+                        },
+                    },
+                    Gate::BitNot {
+                        src: SignalRef::ChildOutput {
+                            child: ChildId(0),
+                            port: OUTPUT_Y,
+                        },
+                    },
+                    Gate::BitNop {
+                        src: SignalRef::ChildOutput {
+                            child: ChildId(0),
+                            port: OUTPUT_Z,
+                        },
+                    },
+                    Gate::BitOR {
+                        a: SignalRef::ThisGate(GateId(2)),
+                        b: SignalRef::ThisGate(GateId(5)),
+                    },
+                ],
+                vec![],
+                vec![
+                    port(OUTPUT_Y, 3, u16::MAX, 1, "sum"),
+                    port(OUTPUT_Z, 6, u16::MAX, 3, "carry"),
+                ],
+            )
+            .with_grid_size([5, 5]),
+        );
+
+        EditorDocument::new(
+            plans,
+            vec![
+                EditableComponentDef {
+                    plan: child_plan,
+                    children: Vec::new(),
+                    child_input_connections: Vec::new(),
+                    dangling_wires: Vec::new(),
+                    layout: ComponentLayout::default(),
+                },
+                EditableComponentDef {
+                    plan: root_plan,
+                    children: vec![ComponentDefId(0)],
+                    child_input_connections: vec![
+                        ChildInputConnection {
+                            child: ChildId(0),
+                            input: INPUT_A,
+                            src: SignalRef::ThisGate(GateId(0)),
+                        },
+                        ChildInputConnection {
+                            child: ChildId(0),
+                            input: INPUT_B,
+                            src: SignalRef::ThisGate(GateId(1)),
+                        },
+                    ],
+                    dangling_wires: Vec::new(),
+                    layout: ComponentLayout::default()
+                        .with_child_placements(vec![ChildPlacement::at([2, 2])]),
+                },
+            ],
+            ComponentDefId(1),
+        )
+        .expect("sample document should build")
+    }
+
+    fn port(id: PortId, gate: u32, x: u16, y: u16, label: &str) -> ComponentPort {
+        ComponentPort {
+            id,
+            gate: GateId(gate),
+            location: PortLocation { x, y },
+            label: Some(label.to_owned()),
+        }
+    }
 }

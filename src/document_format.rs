@@ -342,6 +342,7 @@ fn decode_components(
             plan,
             children,
             child_input_connections,
+            dangling_wires: Vec::new(),
             layout: ComponentLayout {
                 child_placements,
                 wires,
@@ -825,6 +826,7 @@ mod tests {
                     plan: child_plan,
                     children: Vec::new(),
                     child_input_connections: Vec::new(),
+                    dangling_wires: Vec::new(),
                     layout: ComponentLayout::default(),
                 },
                 EditableComponentDef {
@@ -842,6 +844,7 @@ mod tests {
                             src: this_ref(1),
                         },
                     ],
+                    dangling_wires: Vec::new(),
                     layout: ComponentLayout::default()
                         .with_child_placements(vec![ChildPlacement::at([1, 1])]),
                 },

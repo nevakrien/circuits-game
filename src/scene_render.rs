@@ -105,12 +105,16 @@ struct UploadedChild {
     scene: Box<UploadedScene>,
 }
 
-struct UploadedScene {
+struct UploadedBuffers {
     grid_buffer: wgpu::Buffer,
     gate_buffer: wgpu::Buffer,
     port_buffer: wgpu::Buffer,
     child_frame_buffer: wgpu::Buffer,
     wire_buffer: wgpu::Buffer,
+}
+
+struct UploadedScene {
+    buffers: UploadedBuffers,
     grid_count: u32,
     gate_count: u32,
     port_count: u32,
@@ -118,6 +122,65 @@ struct UploadedScene {
     wire_count: u32,
     words_per_buffer: u32,
     children: Vec<UploadedChild>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct UploadedChildMeta {
+    id: crate::gate_plans::ChildId,
+    rect: Rect,
+}
+
+#[derive(Clone, PartialEq)]
+struct EditSceneLevelKey {
+    node: NodeId,
+    bounds: Rect,
+    grid_rect: Rect,
+    grid_dims: [u32; 2],
+    words_per_buffer: u32,
+    drill_child: Option<crate::gate_plans::ChildId>,
+    input_ports: Vec<[u32; 2]>,
+    output_ports: Vec<[u32; 2]>,
+    ancestor_ports: Vec<[u32; 2]>,
+    gates: Vec<SceneGateKey>,
+    children: Vec<UploadedChildMeta>,
+    wires: Vec<SceneWireKey>,
+    nested: bool,
+    transform: SceneTransformKey,
+    clip_rect: Rect,
+}
+
+#[derive(Clone, PartialEq)]
+struct SceneGateKey {
+    id: crate::gate_plans::GateId,
+    gate: Gate,
+    rect: Rect,
+    input_sources: [Option<(NodeId, crate::gate_plans::GateId)>; 2],
+}
+
+#[derive(Clone, PartialEq)]
+struct SceneWireKey {
+    source_gate: Option<(NodeId, crate::gate_plans::GateId)>,
+    color: [u8; 4],
+    points: Vec<[u32; 2]>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct SceneTransformKey {
+    source_min: [u32; 2],
+    target_min: [u32; 2],
+    scale: u32,
+}
+
+struct UploadedEditSceneLevel {
+    key: EditSceneLevelKey,
+    clip_rect: Rect,
+    buffers: UploadedBuffers,
+    grid_count: u32,
+    gate_count: u32,
+    port_count: u32,
+    child_frame_count: u32,
+    wire_count: u32,
+    words_per_buffer: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -166,6 +229,7 @@ pub struct SceneRenderer {
     edit_pipelines: ScenePipelines,
     uniform_buffer: wgpu::Buffer,
     uploaded_scene: Option<UploadedScene>,
+    uploaded_edit_stack: Vec<UploadedEditSceneLevel>,
 }
 
 struct ScenePipelines {
@@ -301,10 +365,11 @@ impl SceneRenderer {
             edit_pipelines,
             uniform_buffer,
             uploaded_scene: None,
+            uploaded_edit_stack: Vec::new(),
         }
     }
 
-    pub fn upload_scene(
+    pub fn upload_runtime_scene(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -317,6 +382,44 @@ impl SceneRenderer {
             false,
             SceneTransform::identity(),
         ));
+        self.uploaded_edit_stack.clear();
+    }
+
+    pub fn upload_edit_scene(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: &FocusedScene,
+    ) {
+        self.uploaded_scene = None;
+        let mut levels = Vec::new();
+        collect_edit_scene_levels(
+            scene,
+            false,
+            SceneTransform::identity(),
+            scene.bounds,
+            &mut levels,
+        );
+
+        let shared_prefix = self
+            .uploaded_edit_stack
+            .iter()
+            .zip(levels.iter())
+            .take_while(|(uploaded, next)| uploaded.key == next.key)
+            .count();
+
+        let mut reusable_suffix = self
+            .uploaded_edit_stack
+            .split_off(shared_prefix)
+            .into_iter();
+        for level in levels.into_iter().skip(shared_prefix) {
+            self.uploaded_edit_stack.push(upload_edit_scene_level(
+                device,
+                queue,
+                reusable_suffix.next(),
+                level,
+            ));
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -384,7 +487,7 @@ impl SceneRenderer {
         output_view: &wgpu::TextureView,
         surface_size: [u32; 2],
         scene_rect: Option<Rect>,
-        hover_world: Option<Pos2>,
+        _hover_world: Option<Pos2>,
         pixels_per_point: f32,
         viewport: &ViewportState,
         time: f32,
@@ -393,9 +496,9 @@ impl SceneRenderer {
         let Some(scene_rect) = scene_rect else {
             return;
         };
-        let Some(_uploaded_scene) = &self.uploaded_scene else {
+        if self.uploaded_edit_stack.is_empty() {
             return;
-        };
+        }
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(SCENE_RENDER_EDIT_BIND_GROUP_LABEL),
@@ -406,7 +509,7 @@ impl SceneRenderer {
             }],
         });
 
-        self.draw_uploaded_scene(
+        self.draw_uploaded_edit_stack(
             queue,
             encoder,
             output_view,
@@ -414,7 +517,6 @@ impl SceneRenderer {
             &self.edit_pipelines,
             surface_size,
             scene_rect,
-            hover_world,
             pixels_per_point,
             viewport,
             time,
@@ -442,7 +544,24 @@ impl SceneRenderer {
             return;
         };
         let scene_rect_px = rect_to_pixels(scene_rect, pixels_per_point);
-        self.draw_scene_tree(
+        self.draw_scene_tree_solids(
+            queue,
+            encoder,
+            output_view,
+            &bind_group,
+            pipelines,
+            surface_size,
+            scene_rect_px,
+            uploaded_scene,
+            scene_rect_px,
+            hover_world,
+            viewport,
+            pixels_per_point,
+            time,
+            pulse_rate_hz,
+            false,
+        );
+        self.draw_scene_tree_wires(
             queue,
             encoder,
             output_view,
@@ -462,7 +581,137 @@ impl SceneRenderer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn draw_scene_tree(
+    fn draw_uploaded_edit_stack(
+        &self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        output_view: &wgpu::TextureView,
+        bind_group: &wgpu::BindGroup,
+        pipelines: &ScenePipelines,
+        surface_size: [u32; 2],
+        scene_rect: Rect,
+        pixels_per_point: f32,
+        viewport: &ViewportState,
+        time: f32,
+        pulse_rate_hz: f32,
+    ) {
+        let scene_rect_px = rect_to_pixels(scene_rect, pixels_per_point);
+        for (level_index, level) in self.uploaded_edit_stack.iter().enumerate() {
+            let clip_world_rect = if level_index == 0 {
+                scene_rect_px
+            } else {
+                level.clip_rect
+            };
+            let Some((scissor_x, scissor_y, scissor_width, scissor_height)) = self
+                .write_scene_uniforms(
+                    queue,
+                    surface_size,
+                    scene_rect_px,
+                    clip_world_rect,
+                    viewport,
+                    pixels_per_point,
+                    time,
+                    pulse_rate_hz,
+                    level.words_per_buffer,
+                    level_index > 0,
+                )
+            else {
+                continue;
+            };
+
+            self.draw_instance_pass(
+                encoder,
+                output_view,
+                bind_group,
+                &pipelines.grid_pipeline,
+                level.buffers.grid_buffer.slice(..),
+                level.grid_count,
+                scissor_x,
+                scissor_y,
+                scissor_width,
+                scissor_height,
+                "scene-render-edit-grid-pass",
+            );
+            self.draw_instance_pass(
+                encoder,
+                output_view,
+                bind_group,
+                &pipelines.child_frame_pipeline,
+                level.buffers.child_frame_buffer.slice(..),
+                level.child_frame_count,
+                scissor_x,
+                scissor_y,
+                scissor_width,
+                scissor_height,
+                "scene-render-edit-child-frame-pass",
+            );
+            self.draw_instance_pass(
+                encoder,
+                output_view,
+                bind_group,
+                &pipelines.gate_pipeline,
+                level.buffers.gate_buffer.slice(..),
+                level.gate_count,
+                scissor_x,
+                scissor_y,
+                scissor_width,
+                scissor_height,
+                "scene-render-edit-gate-pass",
+            );
+            self.draw_instance_pass(
+                encoder,
+                output_view,
+                bind_group,
+                &pipelines.port_pipeline,
+                level.buffers.port_buffer.slice(..),
+                level.port_count,
+                scissor_x,
+                scissor_y,
+                scissor_width,
+                scissor_height,
+                "scene-render-edit-port-pass",
+            );
+        }
+        for (level_index, level) in self.uploaded_edit_stack.iter().enumerate() {
+            let clip_world_rect = if level_index == 0 {
+                scene_rect_px
+            } else {
+                level.clip_rect
+            };
+            let Some((scissor_x, scissor_y, scissor_width, scissor_height)) = self
+                .write_scene_uniforms(
+                    queue,
+                    surface_size,
+                    scene_rect_px,
+                    clip_world_rect,
+                    viewport,
+                    pixels_per_point,
+                    time,
+                    pulse_rate_hz,
+                    level.words_per_buffer,
+                    level_index > 0,
+                )
+            else {
+                continue;
+            };
+            self.draw_instance_pass(
+                encoder,
+                output_view,
+                bind_group,
+                &pipelines.wire_pipeline,
+                level.buffers.wire_buffer.slice(..),
+                level.wire_count,
+                scissor_x,
+                scissor_y,
+                scissor_width,
+                scissor_height,
+                "scene-render-edit-wire-pass",
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_scene_tree_solids(
         &self,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
@@ -502,7 +751,7 @@ impl SceneRenderer {
             output_view,
             bind_group,
             &pipelines.grid_pipeline,
-            scene.grid_buffer.slice(..),
+            scene.buffers.grid_buffer.slice(..),
             scene.grid_count,
             scissor_x,
             scissor_y,
@@ -515,7 +764,7 @@ impl SceneRenderer {
             output_view,
             bind_group,
             &pipelines.child_frame_pipeline,
-            scene.child_frame_buffer.slice(..),
+            scene.buffers.child_frame_buffer.slice(..),
             scene.child_frame_count,
             scissor_x,
             scissor_y,
@@ -528,7 +777,7 @@ impl SceneRenderer {
             output_view,
             bind_group,
             &pipelines.gate_pipeline,
-            scene.gate_buffer.slice(..),
+            scene.buffers.gate_buffer.slice(..),
             scene.gate_count,
             scissor_x,
             scissor_y,
@@ -541,7 +790,7 @@ impl SceneRenderer {
             output_view,
             bind_group,
             &pipelines.port_pipeline,
-            scene.port_buffer.slice(..),
+            scene.buffers.port_buffer.slice(..),
             scene.port_count,
             scissor_x,
             scissor_y,
@@ -555,7 +804,7 @@ impl SceneRenderer {
             viewport_visible_world_rect(scene_rect_px, viewport, pixels_per_point),
             hover_world,
         ) {
-            self.draw_scene_tree(
+            self.draw_scene_tree_solids(
                 queue,
                 encoder,
                 output_view,
@@ -573,13 +822,50 @@ impl SceneRenderer {
                 true,
             );
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_scene_tree_wires(
+        &self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        output_view: &wgpu::TextureView,
+        bind_group: &wgpu::BindGroup,
+        pipelines: &ScenePipelines,
+        surface_size: [u32; 2],
+        scene_rect_px: Rect,
+        scene: &UploadedScene,
+        clip_world_rect: Rect,
+        hover_world: Option<Pos2>,
+        viewport: &ViewportState,
+        pixels_per_point: f32,
+        time: f32,
+        pulse_rate_hz: f32,
+        nested: bool,
+    ) {
+        let Some((scissor_x, scissor_y, scissor_width, scissor_height)) = self
+            .write_scene_uniforms(
+                queue,
+                surface_size,
+                scene_rect_px,
+                clip_world_rect,
+                viewport,
+                pixels_per_point,
+                time,
+                pulse_rate_hz,
+                scene.words_per_buffer,
+                nested,
+            )
+        else {
+            return;
+        };
 
         self.draw_instance_pass(
             encoder,
             output_view,
             bind_group,
             &pipelines.wire_pipeline,
-            scene.wire_buffer.slice(..),
+            scene.buffers.wire_buffer.slice(..),
             scene.wire_count,
             scissor_x,
             scissor_y,
@@ -587,6 +873,30 @@ impl SceneRenderer {
             scissor_height,
             "scene-render-wire-pass",
         );
+
+        if let Some(child) = select_drill_child(
+            scene,
+            viewport_visible_world_rect(scene_rect_px, viewport, pixels_per_point),
+            hover_world,
+        ) {
+            self.draw_scene_tree_wires(
+                queue,
+                encoder,
+                output_view,
+                bind_group,
+                pipelines,
+                surface_size,
+                scene_rect_px,
+                &child.scene,
+                child.rect,
+                hover_world,
+                viewport,
+                pixels_per_point,
+                time,
+                pulse_rate_hz,
+                true,
+            );
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -713,11 +1023,13 @@ fn upload_scene_tree(
         .collect();
 
     UploadedScene {
-        grid_buffer,
-        gate_buffer,
-        port_buffer,
-        child_frame_buffer,
-        wire_buffer,
+        buffers: UploadedBuffers {
+            grid_buffer,
+            gate_buffer,
+            port_buffer,
+            child_frame_buffer,
+            wire_buffer,
+        },
         grid_count: cached.grids.len() as u32,
         gate_count: cached.gates.len() as u32,
         port_count: cached.ports.len() as u32,
@@ -746,6 +1058,205 @@ fn upload_buffer<T: Pod>(
         queue.write_buffer(&buffer, 0, bytemuck::cast_slice(values));
     }
     buffer
+}
+
+fn collect_edit_scene_levels<'a>(
+    scene: &'a FocusedScene,
+    nested: bool,
+    transform: SceneTransform,
+    clip_rect: Rect,
+    out: &mut Vec<EditSceneLevelUpload<'a>>,
+) {
+    out.push(EditSceneLevelUpload {
+        key: edit_scene_level_key(scene, nested, transform, clip_rect),
+        scene,
+        nested,
+        transform,
+        clip_rect,
+    });
+
+    let Some(drill_child) = scene.drill_child else {
+        return;
+    };
+    let Some(child) = scene.children.iter().find(|child| child.id == drill_child) else {
+        return;
+    };
+    let child_rect = transform.rect(child.rect);
+    collect_edit_scene_levels(
+        &child.scene,
+        true,
+        SceneTransform::fit(child.scene.grid_rect, child_rect),
+        child_rect,
+        out,
+    );
+}
+
+struct EditSceneLevelUpload<'a> {
+    key: EditSceneLevelKey,
+    scene: &'a FocusedScene,
+    nested: bool,
+    transform: SceneTransform,
+    clip_rect: Rect,
+}
+
+fn upload_edit_scene_level(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    previous: Option<UploadedEditSceneLevel>,
+    level: EditSceneLevelUpload<'_>,
+) -> UploadedEditSceneLevel {
+    let cached = build_scene_instances(level.scene, level.nested, level.transform);
+    let mut buffers = previous
+        .map(|level| level.buffers)
+        .unwrap_or_else(|| UploadedBuffers {
+            grid_buffer: upload_buffer(device, queue, GRID_BUFFER_LABEL, &[] as &[GridInstance]),
+            gate_buffer: upload_buffer(device, queue, GATE_BUFFER_LABEL, &[] as &[GateInstance]),
+            port_buffer: upload_buffer(device, queue, PORT_BUFFER_LABEL, &[] as &[PortInstance]),
+            child_frame_buffer: upload_buffer(
+                device,
+                queue,
+                CHILD_FRAME_BUFFER_LABEL,
+                &[] as &[ChildFrameInstance],
+            ),
+            wire_buffer: upload_buffer(device, queue, WIRE_BUFFER_LABEL, &[] as &[WireInstance]),
+        });
+    write_buffer_reuse(
+        device,
+        queue,
+        &mut buffers.grid_buffer,
+        GRID_BUFFER_LABEL,
+        &cached.grids,
+    );
+    write_buffer_reuse(
+        device,
+        queue,
+        &mut buffers.gate_buffer,
+        GATE_BUFFER_LABEL,
+        &cached.gates,
+    );
+    write_buffer_reuse(
+        device,
+        queue,
+        &mut buffers.port_buffer,
+        PORT_BUFFER_LABEL,
+        &cached.ports,
+    );
+    write_buffer_reuse(
+        device,
+        queue,
+        &mut buffers.child_frame_buffer,
+        CHILD_FRAME_BUFFER_LABEL,
+        &cached.child_frames,
+    );
+    write_buffer_reuse(
+        device,
+        queue,
+        &mut buffers.wire_buffer,
+        WIRE_BUFFER_LABEL,
+        &cached.wires,
+    );
+
+    UploadedEditSceneLevel {
+        key: level.key,
+        clip_rect: level.clip_rect,
+        buffers,
+        grid_count: cached.grids.len() as u32,
+        gate_count: cached.gates.len() as u32,
+        port_count: cached.ports.len() as u32,
+        child_frame_count: cached.child_frames.len() as u32,
+        wire_count: cached.wires.len() as u32,
+        words_per_buffer: level.scene.words_per_buffer,
+    }
+}
+
+fn write_buffer_reuse<T: Pod>(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    buffer: &mut wgpu::Buffer,
+    label: &str,
+    values: &[T],
+) {
+    let required_size = (values.len().max(1) * std::mem::size_of::<T>()) as u64;
+    if buffer.size() < required_size {
+        *buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: required_size,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+    }
+    if !values.is_empty() {
+        queue.write_buffer(buffer, 0, bytemuck::cast_slice(values));
+    }
+}
+
+fn edit_scene_level_key(
+    scene: &FocusedScene,
+    nested: bool,
+    transform: SceneTransform,
+    clip_rect: Rect,
+) -> EditSceneLevelKey {
+    EditSceneLevelKey {
+        node: scene.node,
+        bounds: scene.bounds,
+        grid_rect: scene.grid_rect,
+        grid_dims: scene.grid_dims,
+        words_per_buffer: scene.words_per_buffer,
+        drill_child: scene.drill_child,
+        input_ports: scene
+            .input_ports
+            .iter()
+            .map(|port| pos_key(port.anchor))
+            .collect(),
+        output_ports: scene
+            .output_ports
+            .iter()
+            .map(|port| pos_key(port.anchor))
+            .collect(),
+        ancestor_ports: scene
+            .ancestor_ports
+            .iter()
+            .map(|port| pos_key(port.anchor))
+            .collect(),
+        gates: scene
+            .gates
+            .iter()
+            .map(|gate| SceneGateKey {
+                id: gate.id,
+                gate: gate.gate,
+                rect: gate.rect,
+                input_sources: gate.input_sources,
+            })
+            .collect(),
+        children: scene
+            .children
+            .iter()
+            .map(|child| UploadedChildMeta {
+                id: child.id,
+                rect: child.rect,
+            })
+            .collect(),
+        wires: scene
+            .wires
+            .iter()
+            .map(|wire| SceneWireKey {
+                source_gate: wire.source_gate,
+                color: wire.color.to_array(),
+                points: wire.points.iter().map(|point| pos_key(*point)).collect(),
+            })
+            .collect(),
+        nested,
+        transform: SceneTransformKey {
+            source_min: pos_key(transform.source_min),
+            target_min: pos_key(transform.target_min),
+            scale: transform.scale.to_bits(),
+        },
+        clip_rect,
+    }
+}
+
+fn pos_key(pos: Pos2) -> [u32; 2] {
+    [pos.x.to_bits(), pos.y.to_bits()]
 }
 
 struct CachedInstances {
@@ -1092,29 +1603,47 @@ fn select_drill_child(
     visible_world_rect: Rect,
     hover_world: Option<Pos2>,
 ) -> Option<&UploadedChild> {
+    select_drill_child_index(
+        scene.children.len(),
+        |index| scene.children[index].rect,
+        visible_world_rect,
+        hover_world,
+    )
+    .and_then(|index| scene.children.get(index))
+}
+
+fn select_drill_child_index(
+    child_count: usize,
+    child_rect: impl Fn(usize) -> Rect,
+    visible_world_rect: Rect,
+    hover_world: Option<Pos2>,
+) -> Option<usize> {
     let viewport_area = rect_area(visible_world_rect).max(f32::EPSILON);
     let viewport_center = visible_world_rect.center();
     if let Some(hover_world) = hover_world {
-        if let Some(child) = scene
-            .children
-            .iter()
-            .find(|child| child.rect.contains(hover_world))
-        {
-            return Some(child);
+        for index in 0..child_count {
+            if child_rect(index).contains(hover_world) {
+                return Some(index);
+            }
         }
     }
-    scene
-        .children
-        .iter()
-        .filter(|child| child_focus_rect(child.rect).contains(viewport_center))
-        .filter_map(|child| {
-            let overlap = child.rect.intersect(visible_world_rect);
+    let mut candidates = (0..child_count)
+        .filter(|&index| child_focus_rect(child_rect(index)).contains(viewport_center))
+        .filter_map(|index| {
+            let rect = child_rect(index);
+            let overlap = rect.intersect(visible_world_rect);
             let visible_coverage = rect_area(overlap) / viewport_area;
             (visible_coverage >= DRILL_IN_VISIBLE_COVERAGE_THRESHOLD)
-                .then_some((visible_coverage, child))
+                .then_some((visible_coverage, index))
         })
-        .max_by(|(a, _), (b, _)| a.total_cmp(b))
-        .map(|(_, child)| child)
+        .collect::<Vec<_>>();
+    candidates.sort_by(|(a, _), (b, _)| b.total_cmp(a));
+    match candidates.as_slice() {
+        [] => None,
+        [(_, index)] => Some(*index),
+        [(best, index), (next, _), ..] if (best - next).abs() > 0.001 => Some(*index),
+        _ => None,
+    }
 }
 
 fn child_focus_rect(rect: Rect) -> Rect {
@@ -1257,6 +1786,161 @@ fn wire_layout() -> wgpu::VertexBufferLayout<'static> {
         array_stride: std::mem::size_of::<WireInstance>() as u64,
         step_mode: wgpu::VertexStepMode::Instance,
         attributes: &WIRE_ATTRIBUTES,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::{gate_plans::ChildId, visual_ui::FocusedScene};
+    use foldhash::HashMap;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum LayerKind {
+        Solids,
+        Wires,
+    }
+
+    #[test]
+    fn hover_selection_picks_hovered_child() {
+        let children = [
+            Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(40.0, 40.0)),
+            Rect::from_min_max(Pos2::new(60.0, 0.0), Pos2::new(100.0, 40.0)),
+        ];
+
+        let selected = select_drill_child_index(
+            children.len(),
+            |index| children[index],
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(100.0, 100.0)),
+            Some(Pos2::new(75.0, 20.0)),
+        );
+
+        assert_eq!(selected, Some(1));
+    }
+
+    #[test]
+    fn ambiguous_auto_selection_returns_none() {
+        let children = [
+            Rect::from_min_max(Pos2::new(10.0, 10.0), Pos2::new(60.0, 60.0)),
+            Rect::from_min_max(Pos2::new(40.0, 10.0), Pos2::new(90.0, 60.0)),
+        ];
+
+        let selected = select_drill_child_index(
+            children.len(),
+            |index| children[index],
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(100.0, 100.0)),
+            None,
+        );
+
+        assert_eq!(selected, None);
+    }
+
+    #[test]
+    fn dominant_auto_selection_picks_larger_child() {
+        let children = [
+            Rect::from_min_max(Pos2::new(5.0, 5.0), Pos2::new(85.0, 85.0)),
+            Rect::from_min_max(Pos2::new(70.0, 70.0), Pos2::new(95.0, 95.0)),
+        ];
+
+        let selected = select_drill_child_index(
+            children.len(),
+            |index| children[index],
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(100.0, 100.0)),
+            None,
+        );
+
+        assert_eq!(selected, Some(0));
+    }
+
+    #[test]
+    fn focused_scene_layer_order_draws_all_solids_before_any_wires() {
+        let scene = test_scene(
+            0,
+            Some(ChildId(0)),
+            vec![test_child(
+                0,
+                test_scene(
+                    1,
+                    Some(ChildId(0)),
+                    vec![test_child(0, test_scene(2, None, vec![]))],
+                ),
+            )],
+        );
+
+        assert_eq!(
+            focused_scene_layer_order(&scene),
+            vec![
+                (NodeId(0), LayerKind::Solids),
+                (NodeId(1), LayerKind::Solids),
+                (NodeId(2), LayerKind::Solids),
+                (NodeId(0), LayerKind::Wires),
+                (NodeId(1), LayerKind::Wires),
+                (NodeId(2), LayerKind::Wires),
+            ]
+        );
+    }
+
+    fn focused_scene_layer_order(scene: &FocusedScene) -> Vec<(NodeId, LayerKind)> {
+        let mut order = Vec::new();
+        collect_focused_scene_solids(scene, &mut order);
+        collect_focused_scene_wires(scene, &mut order);
+        order
+    }
+
+    fn collect_focused_scene_solids(scene: &FocusedScene, out: &mut Vec<(NodeId, LayerKind)>) {
+        out.push((scene.node, LayerKind::Solids));
+        if let Some(child) = selected_focused_child(scene) {
+            collect_focused_scene_solids(&child.scene, out);
+        }
+    }
+
+    fn collect_focused_scene_wires(scene: &FocusedScene, out: &mut Vec<(NodeId, LayerKind)>) {
+        out.push((scene.node, LayerKind::Wires));
+        if let Some(child) = selected_focused_child(scene) {
+            collect_focused_scene_wires(&child.scene, out);
+        }
+    }
+
+    fn selected_focused_child(scene: &FocusedScene) -> Option<&crate::visual_ui::PlacedChild> {
+        let drill_child = scene.drill_child?;
+        scene.children.iter().find(|child| child.id == drill_child)
+    }
+
+    fn test_scene(
+        node: u32,
+        drill_child: Option<ChildId>,
+        children: Vec<crate::visual_ui::PlacedChild>,
+    ) -> FocusedScene {
+        let grid_rect = Rect::from_min_max(Pos2::new(8.0, 32.0), Pos2::new(88.0, 112.0));
+        FocusedScene {
+            node: NodeId(node),
+            title: format!("Scene {node}"),
+            bounds: Rect::from_min_max(Pos2::ZERO, Pos2::new(96.0, 120.0)),
+            words_per_buffer: 0,
+            gate_store: Arc::new(HashMap::default()),
+            grid_rect,
+            grid_dims: [2, 2],
+            input_ports: Vec::new(),
+            output_ports: Vec::new(),
+            gates: Vec::new(),
+            children,
+            drill_child,
+            ancestor_ports: Vec::new(),
+            wires: Vec::new(),
+        }
+    }
+
+    fn test_child(id: u32, scene: FocusedScene) -> crate::visual_ui::PlacedChild {
+        crate::visual_ui::PlacedChild {
+            id: ChildId(id),
+            node: scene.node,
+            rect: Rect::from_min_max(Pos2::new(20.0, 40.0), Pos2::new(76.0, 96.0)),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            scene: Box::new(scene),
+        }
     }
 }
 
