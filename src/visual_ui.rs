@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use crate::gate_plans::{
     ChildId, ChildPlacement, CompileError, Component, ComponentPlans, Gate, GateId,
-    GateStoreLocation, NodeId, PortId, PortLocation, SignalRef,
+    GateStoreLocation, NodeId, PortId, PortLocation, SignalRef, WireEndpoint, WireLayout,
+    WirePoint,
 };
 use crate::ui_config::{CELL, CHILD_PORT_INSET, PAD};
 
@@ -98,17 +99,6 @@ pub struct SceneViewportOutput {
     pub hover_world: Option<Pos2>,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum Endpoint {
-    GateOutput(GateId),
-    GateInput(GateId, usize),
-    ComponentInput(PortId),
-    ComponentOutput(PortId),
-    ChildOutput(ChildId, PortId),
-    ChildInput(ChildId, PortId),
-    AncestorOutput(PortId),
-}
-
 pub fn build_focused_scene(
     root: &Component,
     plans: &ComponentPlans,
@@ -182,7 +172,7 @@ fn build_focused_scene_with_index(
             source_gate: (focused, port.gate),
             anchor: grid_anchor_for_port(grid_rect, grid_dims, port.location),
             location: port.location,
-            label: port.label.unwrap_or_default().to_owned(),
+            label: port.label.clone().unwrap_or_default(),
         })
         .collect();
     let output_ports: Vec<_> = plan
@@ -193,7 +183,7 @@ fn build_focused_scene_with_index(
             source_gate: (focused, port.gate),
             anchor: grid_anchor_for_port(grid_rect, grid_dims, port.location),
             location: port.location,
-            label: port.label.unwrap_or_default().to_owned(),
+            label: port.label.clone().unwrap_or_default(),
         })
         .collect();
 
@@ -235,7 +225,8 @@ fn build_focused_scene_with_index(
                 let child_plan = plans
                     .get(child.plan)
                     .ok_or(CompileError::MissingPlan(child.plan))?;
-                let placement = plan
+                let placement = focus
+                    .layout
                     .child_placements
                     .get(child_i)
                     .copied()
@@ -254,7 +245,7 @@ fn build_focused_scene_with_index(
                         source_gate: (child.id, port.gate),
                         anchor: child_port_anchor(rect, child_plan.grid_size, port.location),
                         location: port.location,
-                        label: port.label.unwrap_or_default().to_owned(),
+                        label: port.label.clone().unwrap_or_default(),
                     })
                     .collect();
                 let outputs = child_plan
@@ -265,7 +256,7 @@ fn build_focused_scene_with_index(
                         source_gate: (child.id, port.gate),
                         anchor: child_port_anchor(rect, child_plan.grid_size, port.location),
                         location: port.location,
-                        label: port.label.unwrap_or_default().to_owned(),
+                        label: port.label.clone().unwrap_or_default(),
                     })
                     .collect();
                 let scene = build_focused_scene_with_index(
@@ -308,7 +299,7 @@ fn build_focused_scene_with_index(
                         grid_rect.left() - 28.0,
                         grid_rect.top() + 20.0 + i as f32 * 32.0,
                     ),
-                    label: port.label.unwrap_or_default().to_owned(),
+                    label: port.label.clone().unwrap_or_default(),
                 })
                 .collect::<Vec<_>>()
         })
@@ -351,52 +342,7 @@ fn build_focused_scene_with_index(
             .collect(),
     };
 
-    let mut wires = Vec::new();
-    for (gate_i, gate) in plan.gates.iter().copied().enumerate() {
-        let target_gate = GateId(gate_i as u32);
-        for (input_i, source_ref) in gate.input_refs().into_iter().flatten().enumerate() {
-            let src_endpoint = resolve_endpoint(focus, source_ref, &ctx, plans, &by_id)?;
-            let src_gate = source_gate_of_ref(focus, source_ref, &ctx, plans, &by_id).ok();
-            if let Some(points) = orth_wire_points(
-                lookup.anchor(src_endpoint),
-                lookup.anchor(Endpoint::GateInput(target_gate, input_i)),
-            ) {
-                wires.push(VisualWire {
-                    source_gate: src_gate,
-                    color: palette_color(wires.len()),
-                    points,
-                });
-            }
-        }
-    }
-
-    for connection in &focus.child_input_connections {
-        let src_endpoint = resolve_endpoint(focus, connection.src, &ctx, plans, &by_id)?;
-        let src_gate = source_gate_of_ref(focus, connection.src, &ctx, plans, &by_id).ok();
-        if let Some(points) = orth_wire_points(
-            lookup.anchor(src_endpoint),
-            lookup.anchor(Endpoint::ChildInput(connection.child, connection.input)),
-        ) {
-            wires.push(VisualWire {
-                source_gate: src_gate,
-                color: palette_color(wires.len()),
-                points,
-            });
-        }
-    }
-
-    for output in &plan.outputs {
-        if let Some(points) = orth_wire_points(
-            lookup.anchor(Endpoint::GateOutput(output.gate)),
-            lookup.anchor(Endpoint::ComponentOutput(output.id)),
-        ) {
-            wires.push(VisualWire {
-                source_gate: Some((focused, output.gate)),
-                color: palette_color(wires.len()),
-                points,
-            });
-        }
-    }
+    let wires = build_component_wires(focus, plan, &ctx, plans, &by_id, &lookup)?;
 
     let bounds = Rect::from_min_max(
         Pos2::ZERO,
@@ -499,7 +445,7 @@ pub fn interact_focused_scene(
         let child_hit = camera.rect(child.rect);
         let response = ui.interact(
             child_hit,
-            ui.make_persistent_id((scene.node.0, child.node.0, "child-rect")),
+            ui.make_persistent_id((scene.node.0, child.id.0, "child-rect")),
             Sense::click(),
         );
         if response.clicked() {
@@ -631,48 +577,6 @@ fn gate_anchor(rect: Rect, gate: Gate, input: Option<usize>) -> Pos2 {
     )
 }
 
-fn resolve_endpoint(
-    node: &Component,
-    signal: SignalRef,
-    ctx: &VisualCtx<'_>,
-    plans: &ComponentPlans,
-    by_id: &HashMap<NodeId, &Component>,
-) -> Result<Endpoint, CompileError> {
-    match signal {
-        SignalRef::ThisGate(gate) => Ok(Endpoint::GateOutput(gate)),
-        SignalRef::InputPort(port) => Ok(Endpoint::ComponentInput(port)),
-        SignalRef::ChildOutput { child, port } => Ok(Endpoint::ChildOutput(child, port)),
-        SignalRef::AncestorOutput { depth, port } => {
-            let depth = depth.0 as usize;
-            if depth == 0 || depth > ctx.parent_stack.len() {
-                return Err(CompileError::InvalidGateRef {
-                    from_node: node.id,
-                    from_gate: GateId(u32::MAX),
-                    bad_ref: signal,
-                    reason: "ancestor does not exist from this location",
-                });
-            }
-            let ancestor = ctx.parent_stack[ctx.parent_stack.len() - depth];
-            let ancestor_node = by_id
-                .get(&ancestor)
-                .copied()
-                .ok_or(CompileError::MissingNode(ancestor))?;
-            let ancestor_plan = plans
-                .get(ancestor_node.plan)
-                .ok_or(CompileError::MissingPlan(ancestor_node.plan))?;
-            ancestor_plan
-                .outputs
-                .iter()
-                .find(|output| output.id == port)
-                .ok_or(CompileError::MissingOutputPort {
-                    node: ancestor,
-                    port,
-                })?;
-            Ok(Endpoint::AncestorOutput(port))
-        }
-    }
-}
-
 fn source_gate_of_ref(
     node: &Component,
     signal: SignalRef,
@@ -767,21 +671,25 @@ struct Lookup {
 }
 
 impl Lookup {
-    fn anchor(&self, endpoint: Endpoint) -> Option<Pos2> {
+    fn anchor(&self, endpoint: WireEndpoint) -> Option<Pos2> {
         match endpoint {
-            Endpoint::GateOutput(gate) => {
+            WireEndpoint::GateOutput(gate) => {
                 let (rect, gate_kind) = self.gates.get(&gate)?;
                 Some(gate_anchor(*rect, *gate_kind, None))
             }
-            Endpoint::GateInput(gate, input) => {
+            WireEndpoint::GateInput { gate, input } => {
                 let (rect, gate_kind) = self.gates.get(&gate)?;
-                Some(gate_anchor(*rect, *gate_kind, Some(input)))
+                Some(gate_anchor(*rect, *gate_kind, Some(input as usize)))
             }
-            Endpoint::ComponentInput(port) => self.input_ports.get(&port).copied(),
-            Endpoint::ComponentOutput(port) => self.output_ports.get(&port).copied(),
-            Endpoint::ChildOutput(child, port) => self.child_outputs.get(&(child, port)).copied(),
-            Endpoint::ChildInput(child, port) => self.child_inputs.get(&(child, port)).copied(),
-            Endpoint::AncestorOutput(port) => self.ancestor_outputs.get(&port).copied(),
+            WireEndpoint::ComponentInput(port) => self.input_ports.get(&port).copied(),
+            WireEndpoint::ComponentOutput(port) => self.output_ports.get(&port).copied(),
+            WireEndpoint::ChildOutput { child, port } => {
+                self.child_outputs.get(&(child, port)).copied()
+            }
+            WireEndpoint::ChildInput { child, port } => {
+                self.child_inputs.get(&(child, port)).copied()
+            }
+            WireEndpoint::AncestorOutput { port, .. } => self.ancestor_outputs.get(&port).copied(),
         }
     }
 }
@@ -800,6 +708,129 @@ fn orth_wire_points(start: Option<Pos2>, end: Option<Pos2>) -> Option<Vec<Pos2>>
         Pos2::new(mid_x, end.y),
         end,
     ])
+}
+
+const WIRE_POINT_UNITS_PER_CELL: f32 = 256.0;
+
+#[derive(Debug, Clone)]
+struct ExpectedWire {
+    layout: WireLayout,
+    source_gate: Option<(NodeId, GateId)>,
+}
+
+fn build_component_wires(
+    component: &Component,
+    plan: &crate::gate_plans::ComponentPlan,
+    ctx: &VisualCtx<'_>,
+    plans: &ComponentPlans,
+    by_id: &HashMap<NodeId, &Component>,
+    lookup: &Lookup,
+) -> Result<Vec<VisualWire>, CompileError> {
+    let expected = expected_component_wires(component, plan, ctx, plans, by_id)?;
+    let mut overrides = HashMap::default();
+    for wire in &component.layout.wires {
+        overrides.entry((wire.from, wire.to)).or_insert(wire);
+    }
+
+    let mut wires = Vec::with_capacity(expected.len());
+    for expected_wire in expected {
+        let layout = overrides
+            .get(&(expected_wire.layout.from, expected_wire.layout.to))
+            .copied()
+            .unwrap_or(&expected_wire.layout);
+        if let Some(points) = wire_points(layout, lookup) {
+            wires.push(VisualWire {
+                source_gate: expected_wire.source_gate,
+                color: palette_color(wires.len()),
+                points,
+            });
+        }
+    }
+    Ok(wires)
+}
+
+fn expected_component_wires(
+    component: &Component,
+    plan: &crate::gate_plans::ComponentPlan,
+    ctx: &VisualCtx<'_>,
+    plans: &ComponentPlans,
+    by_id: &HashMap<NodeId, &Component>,
+) -> Result<Vec<ExpectedWire>, CompileError> {
+    let mut wires = Vec::new();
+
+    for (gate_i, gate) in plan.gates.iter().copied().enumerate() {
+        let target_gate = GateId(gate_i as u32);
+        for (input_i, source_ref) in gate.input_refs().into_iter().flatten().enumerate() {
+            wires.push(ExpectedWire {
+                layout: WireLayout {
+                    from: signal_to_wire_endpoint(source_ref),
+                    to: WireEndpoint::GateInput {
+                        gate: target_gate,
+                        input: input_i as u8,
+                    },
+                    bends: Vec::new(),
+                },
+                source_gate: source_gate_of_ref(component, source_ref, ctx, plans, by_id).ok(),
+            });
+        }
+    }
+
+    for connection in &component.child_input_connections {
+        wires.push(ExpectedWire {
+            layout: WireLayout {
+                from: signal_to_wire_endpoint(connection.src),
+                to: WireEndpoint::ChildInput {
+                    child: connection.child,
+                    port: connection.input,
+                },
+                bends: Vec::new(),
+            },
+            source_gate: source_gate_of_ref(component, connection.src, ctx, plans, by_id).ok(),
+        });
+    }
+
+    for output in &plan.outputs {
+        wires.push(ExpectedWire {
+            layout: WireLayout {
+                from: WireEndpoint::GateOutput(output.gate),
+                to: WireEndpoint::ComponentOutput(output.id),
+                bends: Vec::new(),
+            },
+            source_gate: Some((component.id, output.gate)),
+        });
+    }
+
+    Ok(wires)
+}
+
+fn signal_to_wire_endpoint(signal: SignalRef) -> WireEndpoint {
+    match signal {
+        SignalRef::ThisGate(gate) => WireEndpoint::GateOutput(gate),
+        SignalRef::InputPort(port) => WireEndpoint::ComponentInput(port),
+        SignalRef::ChildOutput { child, port } => WireEndpoint::ChildOutput { child, port },
+        SignalRef::AncestorOutput { depth, port } => WireEndpoint::AncestorOutput { depth, port },
+    }
+}
+
+fn wire_points(layout: &WireLayout, lookup: &Lookup) -> Option<Vec<Pos2>> {
+    let start = lookup.anchor(layout.from)?;
+    let end = lookup.anchor(layout.to)?;
+    if layout.bends.is_empty() {
+        return orth_wire_points(Some(start), Some(end));
+    }
+
+    let mut points = Vec::with_capacity(layout.bends.len() + 2);
+    points.push(start);
+    points.extend(layout.bends.iter().map(local_wire_point_to_pos));
+    points.push(end);
+    Some(points)
+}
+
+fn local_wire_point_to_pos(point: &WirePoint) -> Pos2 {
+    Pos2::new(
+        PAD + (point.x as f32 / WIRE_POINT_UNITS_PER_CELL) * CELL,
+        PAD + 36.0 + (point.y as f32 / WIRE_POINT_UNITS_PER_CELL) * CELL,
+    )
 }
 
 fn collect_components<'a>(root: &'a Component) -> HashMap<NodeId, &'a Component> {

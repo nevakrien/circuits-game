@@ -6,8 +6,8 @@ use std::{
 use circuits_game::{
     editor::{ComponentDefId, EDIT_PREVIEW_DEPTH, EditableComponentDef, EditorDocument},
     gate_plans::{
-        ChildId, ChildInputConnection, ChildPlacement, Component, ComponentPlan, ComponentPlans,
-        ComponentPort, Gate, GateId, PlanId, PortId, PortLocation, SignalRef,
+        ChildId, ChildInputConnection, ChildPlacement, Component, ComponentLayout, ComponentPlan,
+        ComponentPlans, ComponentPort, Gate, GateId, PlanId, PortId, PortLocation, SignalRef,
         compile_component_tree,
     },
     kernel::{GateKernel, UploadedGpuPlan},
@@ -1103,8 +1103,7 @@ fn build_starter_demo_circuit() -> DemoSceneSpec {
                 port_named(OUTPUT_Z, 6, u16::MAX, 3, LABEL_CARRY),
             ],
         )
-        .with_grid_size([5, 5])
-        .with_child_placements(vec![ChildPlacement::at([2, 2])]),
+        .with_grid_size([5, 5]),
     );
     let document = EditorDocument::new(
         plans,
@@ -1113,6 +1112,7 @@ fn build_starter_demo_circuit() -> DemoSceneSpec {
                 plan: child_plan,
                 children: Vec::new(),
                 child_input_connections: Vec::new(),
+                layout: ComponentLayout::default(),
             },
             EditableComponentDef {
                 plan: root_plan,
@@ -1129,6 +1129,8 @@ fn build_starter_demo_circuit() -> DemoSceneSpec {
                         src: this_ref(1),
                     },
                 ],
+                layout: ComponentLayout::default()
+                    .with_child_placements(vec![ChildPlacement::at([2, 2])]),
             },
         ],
         ComponentDefId(1),
@@ -1151,22 +1153,17 @@ fn build_stress_demo_circuit() -> DemoSceneSpec {
         ComponentPlan::new(build_stress_gates(STRESS_GATES_PER_COMPONENT))
             .with_grid_size([128, 64]),
     );
-    plans.insert(
-        branch_plan,
-        ComponentPlan::new(build_stress_gates(STRESS_GATES_PER_COMPONENT))
-            .with_grid_size([256, 160])
-            .with_child_placements(vec![
-                ChildPlacement::at([0, 0]),
-                ChildPlacement::at([128, 0]),
-                ChildPlacement::at([0, 80]),
-                ChildPlacement::at([128, 80]),
-            ]),
-    );
+        plans.insert(
+            branch_plan,
+            ComponentPlan::new(build_stress_gates(STRESS_GATES_PER_COMPONENT))
+            .with_grid_size([256, 160]),
+        );
 
     let mut components = vec![EditableComponentDef {
         plan: leaf_plan,
         children: Vec::new(),
         child_input_connections: Vec::new(),
+        layout: ComponentLayout::default(),
     }];
     for _ in 0..STRESS_DEPTH {
         let previous = ComponentDefId(components.len() - 1);
@@ -1174,6 +1171,12 @@ fn build_stress_demo_circuit() -> DemoSceneSpec {
             plan: branch_plan,
             children: vec![previous; STRESS_BRANCH_FACTOR],
             child_input_connections: Vec::new(),
+            layout: ComponentLayout::default().with_child_placements(vec![
+                ChildPlacement::at([0, 0]),
+                ChildPlacement::at([128, 0]),
+                ChildPlacement::at([0, 80]),
+                ChildPlacement::at([128, 80]),
+            ]),
         });
     }
     let root = ComponentDefId(components.len() - 1);
@@ -1242,6 +1245,6 @@ fn port_named(id: PortId, gate: u32, x: u16, y: u16, label: &'static str) -> Com
         id,
         gate: GateId(gate),
         location: PortLocation { x, y },
-        label: Some(label),
+        label: Some(label.to_owned()),
     }
 }

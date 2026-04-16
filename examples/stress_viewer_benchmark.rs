@@ -699,13 +699,7 @@ fn build_stress_demo_circuit() -> DemoSceneSpec {
     );
     let branch_plan = plans.insert(
         ComponentPlan::new(build_stress_gates(STRESS_GATES_PER_COMPONENT))
-            .with_grid_size([256, 160])
-            .with_child_placements(vec![
-                ChildPlacement::at([0, 0]),
-                ChildPlacement::at([128, 0]),
-                ChildPlacement::at([0, 80]),
-                ChildPlacement::at([128, 80]),
-            ]),
+            .with_grid_size([256, 160]),
     );
     let root = build_stress_component_tree(branch_plan, leaf_plan, STRESS_DEPTH);
 
@@ -731,7 +725,17 @@ fn build_stress_component_tree(
     let children = (0..STRESS_BRANCH_FACTOR)
         .map(|_| build_stress_component_tree(branch_plan, leaf_plan, depth - 1))
         .collect();
-    Component::new(branch_plan, children)
+    Component::with_layout_and_child_input_connections(
+        branch_plan,
+        children,
+        Vec::new(),
+        circuits_game::gate_plans::ComponentLayout::default().with_child_placements(vec![
+            ChildPlacement::at([0, 0]),
+            ChildPlacement::at([128, 0]),
+            ChildPlacement::at([0, 80]),
+            ChildPlacement::at([128, 80]),
+        ]),
+    )
 }
 
 fn build_stress_gates(gate_count: u32) -> Vec<Gate> {

@@ -38,15 +38,15 @@ impl PortLocation {
     };
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ComponentPort {
     pub id: PortId,
     pub gate: GateId,
     pub location: PortLocation,
-    pub label: Option<&'static str>,
+    pub label: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChildPlacement {
     pub min: [u32; 2],
 }
@@ -56,6 +56,48 @@ impl ChildPlacement {
 
     pub const fn at(min: [u32; 2]) -> Self {
         Self { min }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WireEndpoint {
+    GateOutput(GateId),
+    GateInput { gate: GateId, input: u8 },
+    ComponentInput(PortId),
+    ComponentOutput(PortId),
+    ChildOutput { child: ChildId, port: PortId },
+    ChildInput { child: ChildId, port: PortId },
+    AncestorOutput { depth: AncestorDepth, port: PortId },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WirePoint {
+    pub x: i32,
+    pub y: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WireLayout {
+    pub from: WireEndpoint,
+    pub to: WireEndpoint,
+    pub bends: Vec<WirePoint>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ComponentLayout {
+    pub child_placements: Vec<ChildPlacement>,
+    pub wires: Vec<WireLayout>,
+}
+
+impl ComponentLayout {
+    pub fn with_child_placements(mut self, child_placements: Vec<ChildPlacement>) -> Self {
+        self.child_placements = child_placements;
+        self
+    }
+
+    pub fn with_wires(mut self, wires: Vec<WireLayout>) -> Self {
+        self.wires = wires;
+        self
     }
 }
 
@@ -113,7 +155,6 @@ pub struct ComponentPlan {
     pub gates: Vec<Gate>,
     pub inputs: Vec<ComponentPort>,
     pub outputs: Vec<ComponentPort>,
-    pub child_placements: Vec<ChildPlacement>,
 }
 
 impl ComponentPlan {
@@ -123,7 +164,6 @@ impl ComponentPlan {
             gates,
             inputs: Vec::new(),
             outputs: Vec::new(),
-            child_placements: Vec::new(),
         }
     }
 
@@ -137,17 +177,11 @@ impl ComponentPlan {
             gates,
             inputs,
             outputs,
-            child_placements: Vec::new(),
         }
     }
 
     pub fn with_grid_size(mut self, grid_size: [u32; 2]) -> Self {
         self.grid_size = [grid_size[0].max(1), grid_size[1].max(1)];
-        self
-    }
-
-    pub fn with_child_placements(mut self, child_placements: Vec<ChildPlacement>) -> Self {
-        self.child_placements = child_placements;
         self
     }
 
@@ -211,6 +245,7 @@ pub struct Component {
     pub plan: PlanId,
     pub children: Vec<Component>,
     pub child_input_connections: Vec<ChildInputConnection>,
+    pub layout: ComponentLayout,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -227,6 +262,7 @@ impl Component {
             plan,
             children,
             child_input_connections: Vec::new(),
+            layout: ComponentLayout::default(),
         }
     }
 
@@ -240,6 +276,22 @@ impl Component {
             plan,
             children,
             child_input_connections,
+            layout: ComponentLayout::default(),
+        }
+    }
+
+    pub fn with_layout_and_child_input_connections(
+        plan: PlanId,
+        children: Vec<Component>,
+        child_input_connections: Vec<ChildInputConnection>,
+        layout: ComponentLayout,
+    ) -> Self {
+        Self {
+            id: INVALID_NODE_ID,
+            plan,
+            children,
+            child_input_connections,
+            layout,
         }
     }
 
@@ -601,13 +653,13 @@ fn gate_store_map(compiler: &GateCompiler) -> HashMap<(NodeId, GateId), GateStor
         .bits
         .iter()
         .map(|(&(node, gate), &bit_index)| {
-            let bit_in_word = (bit_index.1.0 % 32) as u8;
+            let bit_in_word = (bit_index.1 .0 % 32) as u8;
             (
                 (node, gate),
                 GateStoreLocation {
                     buffer: bit_index.0,
                     bit: bit_index.1,
-                    word_byte_offset: (bit_index.1.0 >> 5) << 2,
+                    word_byte_offset: (bit_index.1 .0 >> 5) << 2,
                     bit_in_word,
                 },
             )
@@ -675,7 +727,7 @@ fn lower_basic_gate_groups(
                 None => src_a,
             };
 
-            let tgt_word_byte_offset = (dst.1.0 >> 5) << 2;
+            let tgt_word_byte_offset = (dst.1 .0 >> 5) << 2;
             grouped
                 .entry(dst.0)
                 .or_default()
@@ -683,7 +735,7 @@ fn lower_basic_gate_groups(
                 .or_default()
                 .push(BasicGateInstruction {
                     op: BasicGateOp::from_gate(gate),
-                    dst_bit_in_word: Bits(dst.1.0 % 32),
+                    dst_bit_in_word: Bits(dst.1 .0 % 32),
                     src_a,
                     src_b,
                 });
@@ -750,7 +802,7 @@ fn lower_basic_gate_groups(
                 None => src_a,
             };
 
-            let tgt_word_byte_offset = (dst.1.0 >> 5) << 2;
+            let tgt_word_byte_offset = (dst.1 .0 >> 5) << 2;
             grouped
                 .entry(dst.0)
                 .or_default()
@@ -758,7 +810,7 @@ fn lower_basic_gate_groups(
                 .or_default()
                 .push(BasicGateInstruction {
                     op: BasicGateOp::from_gate(gate),
-                    dst_bit_in_word: Bits(dst.1.0 % 32),
+                    dst_bit_in_word: Bits(dst.1 .0 % 32),
                     src_a,
                     src_b,
                 });
@@ -1788,7 +1840,7 @@ mod tests {
 
         assert_eq!(info.outline.layout, CompileLayout::Inline);
         assert_eq!(info.self_bits.len(), 40);
-        assert!(info.self_bits.iter().all(|bit| bit.1.0 < 32));
+        assert!(info.self_bits.iter().all(|bit| bit.1 .0 < 32));
         assert!(
             info.self_bits
                 .iter()
