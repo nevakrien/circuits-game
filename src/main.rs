@@ -868,9 +868,23 @@ async fn run() {
                                             viewport_output.hover_world,
                                         );
                                     } else if viewport_output.viewport_changed || size_changed || hover_changed {
-                                        viewer.rebuild_edit_scene(&document, hover_world)
-                                            .expect("edit scene should rebuild after viewport or hover change");
-                                        upload_viewer_scene(&mut scene_renderer, device, queue, &viewer);
+                                        if document
+                                            .refresh_edit_scene_drill_path(
+                                                viewer.active_edit_component(),
+                                                &mut viewer.scene,
+                                                &viewer.viewport,
+                                                viewer.edit_available_size,
+                                                hover_world,
+                                            )
+                                            .expect("edit drill path should refresh")
+                                        {
+                                            upload_viewer_scene(
+                                                &mut scene_renderer,
+                                                device,
+                                                queue,
+                                                &viewer,
+                                            );
+                                        }
                                     }
                                 }
                                 if viewer.is_editing() {

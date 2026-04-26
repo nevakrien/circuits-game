@@ -74,6 +74,9 @@ enum DragState {
 #[derive(Debug, Clone, Copy)]
 struct ChildDragState {
     child: ChildId,
+    origin_rect_min: Pos2,
+    origin_footprint_min: Pos2,
+    preview_footprint_min: Pos2,
     pointer_offset: Vec2,
     moved: bool,
 }
@@ -81,6 +84,8 @@ struct ChildDragState {
 #[derive(Debug, Clone, Copy)]
 struct GateDragState {
     gate: GateId,
+    origin_rect_min: Pos2,
+    preview_rect_min: Pos2,
     pointer_offset: Vec2,
     moved: bool,
 }
@@ -136,46 +141,34 @@ pub fn interact_edit_scene(
         if let (Some(pointer_world), Some(drag)) = (pointer_world, state.drag) {
             match drag {
                 DragState::Child(mut drag) => {
-                    let Some(child) = scene.children.iter().find(|child| child.id == drag.child)
-                    else {
+                    if !scene.children.iter().any(|child| child.id == drag.child) {
                         state.drag = None;
                         return None;
-                    };
-                    let current_footprint = child_footprint_rect(child.rect);
+                    }
                     let desired_min = pointer_world - drag.pointer_offset;
-                    let delta_world = desired_min - current_footprint.min;
+                    drag.preview_footprint_min = desired_min;
+                    let delta_world = desired_min - drag.origin_footprint_min;
                     let delta_cells = [
                         quantize_drag_axis(delta_world.x),
                         quantize_drag_axis(delta_world.y),
                     ];
                     drag.moved |= delta_cells != [0, 0];
                     state.drag = Some(DragState::Child(drag));
-                    if delta_cells != [0, 0] {
-                        return Some(EditSceneAction::MoveChild {
-                            child: drag.child,
-                            delta_cells,
-                        });
-                    }
                 }
                 DragState::Gate(mut drag) => {
-                    let Some(gate) = scene.gates.iter().find(|gate| gate.id == drag.gate) else {
+                    if !scene.gates.iter().any(|gate| gate.id == drag.gate) {
                         state.drag = None;
                         return None;
-                    };
+                    }
                     let desired_min = pointer_world - drag.pointer_offset;
-                    let delta_world = desired_min - gate.rect.min;
+                    drag.preview_rect_min = desired_min;
+                    let delta_world = desired_min - drag.origin_rect_min;
                     let delta_cells = [
                         quantize_drag_axis(delta_world.x),
                         quantize_drag_axis(delta_world.y),
                     ];
                     drag.moved |= delta_cells != [0, 0];
                     state.drag = Some(DragState::Gate(drag));
-                    if delta_cells != [0, 0] {
-                        return Some(EditSceneAction::MoveGate {
-                            gate: drag.gate,
-                            delta_cells,
-                        });
-                    }
                 }
                 DragState::WireBend(mut drag) => {
                     let point = pos_to_wire_point(pointer_world);
@@ -242,10 +235,27 @@ pub fn interact_edit_scene(
         }
     }
 
-    let drag_moved = state.drag.is_some_and(drag_moved);
     if viewport_output.primary_drag_stopped {
+        if let (Some(pointer_world), Some(drag)) = (pointer_world, state.drag) {
+            let action = match drag {
+                DragState::Child(mut drag) => {
+                    drag.preview_footprint_min = pointer_world - drag.pointer_offset;
+                    finish_child_drag(drag)
+                }
+                DragState::Gate(mut drag) => {
+                    drag.preview_rect_min = pointer_world - drag.pointer_offset;
+                    finish_gate_drag(drag)
+                }
+                DragState::WireBend(_) | DragState::WireEndpoint(_) => None,
+            };
+            state.drag = None;
+            if action.is_some() {
+                return action;
+            }
+        }
         state.drag = None;
     }
+    let drag_moved = state.drag.is_some_and(drag_moved);
     if drag_moved {
         return None;
     }
@@ -305,6 +315,8 @@ fn drag_target_at_pointer(scene: &FocusedScene, pointer_world: Pos2) -> Option<D
     if let Some(gate) = gate_at_pointer(scene, pointer_world) {
         return Some(DragState::Gate(GateDragState {
             gate: gate.id,
+            origin_rect_min: gate.rect.min,
+            preview_rect_min: gate.rect.min,
             pointer_offset: pointer_world - gate.rect.min,
             moved: false,
         }));
@@ -322,6 +334,9 @@ fn drag_target_at_pointer(scene: &FocusedScene, pointer_world: Pos2) -> Option<D
         let footprint = child_footprint_rect(child.rect);
         DragState::Child(ChildDragState {
             child: child.id,
+            origin_rect_min: child.rect.min,
+            origin_footprint_min: footprint.min,
+            preview_footprint_min: footprint.min,
             pointer_offset: pointer_world - footprint.min,
             moved: false,
         })
@@ -335,6 +350,30 @@ fn drag_moved(drag: DragState) -> bool {
         DragState::WireBend(drag) => drag.moved,
         DragState::WireEndpoint(drag) => drag.moved,
     }
+}
+
+fn finish_child_drag(drag: ChildDragState) -> Option<EditSceneAction> {
+    let delta_world = drag.preview_footprint_min - drag.origin_footprint_min;
+    let delta_cells = [
+        quantize_drag_axis(delta_world.x),
+        quantize_drag_axis(delta_world.y),
+    ];
+    (delta_cells != [0, 0]).then_some(EditSceneAction::MoveChild {
+        child: drag.child,
+        delta_cells,
+    })
+}
+
+fn finish_gate_drag(drag: GateDragState) -> Option<EditSceneAction> {
+    let delta_world = drag.preview_rect_min - drag.origin_rect_min;
+    let delta_cells = [
+        quantize_drag_axis(delta_world.x),
+        quantize_drag_axis(delta_world.y),
+    ];
+    (delta_cells != [0, 0]).then_some(EditSceneAction::MoveGate {
+        gate: drag.gate,
+        delta_cells,
+    })
 }
 
 pub fn child_at_pointer(scene: &FocusedScene, pointer_world: Option<Pos2>) -> Option<&PlacedChild> {
@@ -357,12 +396,62 @@ pub fn apply_edit_scene_drag_preview(
     state: &EditInteractionState,
     pointer_world: Option<Pos2>,
 ) -> bool {
-    let Some(pointer_world) = pointer_world else {
+    match state.drag {
+        Some(DragState::Child(drag)) => preview_child_drag(scene, drag),
+        Some(DragState::Gate(drag)) => preview_gate_drag(scene, drag),
+        Some(DragState::WireEndpoint(drag)) => {
+            let Some(pointer_world) = pointer_world else {
+                return false;
+            };
+            preview_wire_endpoint_drag(scene, drag, pointer_world)
+        }
+        Some(DragState::WireBend(_)) | None => false,
+    }
+}
+
+fn preview_child_drag(scene: &mut FocusedScene, drag: ChildDragState) -> bool {
+    let Some(child) = scene
+        .children
+        .iter_mut()
+        .find(|child| child.id == drag.child)
+    else {
         return false;
     };
-    let Some(DragState::WireEndpoint(drag)) = state.drag else {
+    let footprint_offset = drag.origin_footprint_min - drag.origin_rect_min;
+    let target_min = drag.preview_footprint_min - footprint_offset;
+    let delta = target_min - child.rect.min;
+    if delta == Vec2::ZERO {
+        return false;
+    }
+    child.rect = child.rect.translate(delta);
+    for port in &mut child.inputs {
+        port.anchor += delta;
+    }
+    for port in &mut child.outputs {
+        port.anchor += delta;
+    }
+    refresh_wire_points(scene);
+    true
+}
+
+fn preview_gate_drag(scene: &mut FocusedScene, drag: GateDragState) -> bool {
+    let Some(gate) = scene.gates.iter_mut().find(|gate| gate.id == drag.gate) else {
         return false;
     };
+    let delta = drag.preview_rect_min - gate.rect.min;
+    if delta == Vec2::ZERO {
+        return false;
+    }
+    gate.rect = gate.rect.translate(delta);
+    refresh_wire_points(scene);
+    true
+}
+
+fn preview_wire_endpoint_drag(
+    scene: &mut FocusedScene,
+    drag: WireEndpointDragState,
+    pointer_world: Pos2,
+) -> bool {
     let source_anchor = endpoint_anchor(scene, drag.from);
     let target_anchor = endpoint_anchor(scene, drag.to);
     let (start, end) = match drag.side {
@@ -393,17 +482,38 @@ pub fn apply_edit_scene_drag_preview(
     else {
         return false;
     };
-
-    wire.points = if wire.bends.is_empty() {
-        preview_orth_wire_points(start, end)
-    } else {
-        let mut points = Vec::with_capacity(wire.bends.len() + 2);
-        points.push(start);
-        points.extend(wire.bends.iter().map(local_wire_point_to_pos));
-        points.push(end);
-        points
-    };
+    wire.points = wire_points_from_layout(start, end, &wire.bends);
     true
+}
+
+fn refresh_wire_points(scene: &mut FocusedScene) {
+    for index in 0..scene.wires.len() {
+        let (from, to, bends) = {
+            let wire = &scene.wires[index];
+            (wire.from, wire.to, wire.bends.clone())
+        };
+        let Some((from, to)) = from.zip(to) else {
+            continue;
+        };
+        let Some(start) = endpoint_anchor(scene, from) else {
+            continue;
+        };
+        let Some(end) = endpoint_anchor(scene, to) else {
+            continue;
+        };
+        scene.wires[index].points = wire_points_from_layout(start, end, &bends);
+    }
+}
+
+fn wire_points_from_layout(start: Pos2, end: Pos2, bends: &[WirePoint]) -> Vec<Pos2> {
+    if bends.is_empty() {
+        return preview_orth_wire_points(start, end);
+    }
+    let mut points = Vec::with_capacity(bends.len() + 2);
+    points.push(start);
+    points.extend(bends.iter().map(local_wire_point_to_pos));
+    points.push(end);
+    points
 }
 
 fn source_endpoint_at_pointer(
@@ -725,8 +835,8 @@ mod tests {
     use foldhash::HashMap;
 
     #[test]
-    fn drag_tracks_non_origin_child_across_scene_rebuilds() {
-        let mut document = stress_drag_document();
+    fn child_drag_commits_single_snapped_move_on_release() {
+        let document = stress_drag_document();
         let viewport = ViewportState::default();
         let available = Vec2::new(6000.0, 4000.0);
         let focused = ComponentDefId(1);
@@ -760,33 +870,77 @@ mod tests {
             &drag_output(start + Vec2::new(-CELL * 1.2, 0.0), DragPhase::Dragging),
             &mut interaction,
         );
-        assert_eq!(
-            first_move,
-            Some(EditSceneAction::MoveChild {
-                child: target_child,
-                delta_cells: [-1, 0],
-            })
-        );
-        document
-            .move_child_by(focused, target_child, [-1, 0])
-            .expect("move should succeed");
+        assert_eq!(first_move, None);
 
-        let rebuilt_scene = document
-            .build_edit_scene(focused, &viewport, available, None)
-            .expect("rebuilt scene should build");
         let second_move = interact_edit_scene(
-            &rebuilt_scene,
+            &scene,
             &viewport,
             &drag_output(start + Vec2::new(-CELL * 2.2, 0.0), DragPhase::Dragging),
             &mut interaction,
         );
+        assert_eq!(second_move, None);
+
+        let commit_move = interact_edit_scene(
+            &scene,
+            &viewport,
+            &drag_output(start + Vec2::new(-CELL * 2.2, 0.0), DragPhase::Stopped),
+            &mut interaction,
+        );
         assert_eq!(
-            second_move,
+            commit_move,
             Some(EditSceneAction::MoveChild {
                 child: target_child,
-                delta_cells: [-1, 0],
+                delta_cells: [-2, 0],
             })
         );
+    }
+
+    #[test]
+    fn child_drag_preview_moves_rect_without_scene_rebuild() {
+        let document = stress_drag_document();
+        let viewport = ViewportState::default();
+        let available = Vec2::new(6000.0, 4000.0);
+        let focused = ComponentDefId(1);
+        let target_child = ChildId(3);
+        let mut interaction = EditInteractionState::default();
+
+        let scene = document
+            .build_edit_scene(focused, &viewport, available, None)
+            .expect("scene should build");
+        let child = scene
+            .children
+            .iter()
+            .find(|child| child.id == target_child)
+            .expect("target child should exist");
+        let footprint = child_footprint_rect(child.rect);
+        let start = footprint.min + Vec2::new(CELL * 0.5, CELL * 0.5);
+
+        interact_edit_scene(
+            &scene,
+            &viewport,
+            &drag_output(start, DragPhase::Started),
+            &mut interaction,
+        );
+        interact_edit_scene(
+            &scene,
+            &viewport,
+            &drag_output(start + Vec2::new(-CELL * 1.2, 0.0), DragPhase::Dragging),
+            &mut interaction,
+        );
+
+        let mut preview_scene = scene.clone();
+        assert!(apply_edit_scene_drag_preview(
+            &mut preview_scene,
+            &interaction,
+            Some(start + Vec2::new(-CELL * 1.2, 0.0)),
+        ));
+
+        let preview_child = preview_scene
+            .children
+            .iter()
+            .find(|child| child.id == target_child)
+            .expect("preview child should exist");
+        assert!(preview_child.rect.min.x < child.rect.min.x);
     }
 
     #[test]
@@ -885,6 +1039,7 @@ mod tests {
     enum DragPhase {
         Started,
         Dragging,
+        Stopped,
     }
 
     fn drag_output(pointer_world: Pos2, phase: DragPhase) -> SceneViewportOutput {
@@ -895,7 +1050,7 @@ mod tests {
             primary_double_clicked: false,
             primary_drag_started: matches!(phase, DragPhase::Started),
             primary_dragged: matches!(phase, DragPhase::Dragging),
-            primary_drag_stopped: false,
+            primary_drag_stopped: matches!(phase, DragPhase::Stopped),
             hover_world: Some(pointer_world),
             viewport_changed: false,
         }

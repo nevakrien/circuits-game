@@ -298,6 +298,25 @@ impl EditorDocument {
         self.build_edit_scene_with_stack(&[], focused, None, EditSceneDetail::Probe)
     }
 
+    pub fn refresh_edit_scene_drill_path(
+        &self,
+        focused: ComponentDefId,
+        scene: &mut FocusedScene,
+        viewport: &crate::visual_ui::ViewportState,
+        available: Vec2,
+        hover_world: Option<Pos2>,
+    ) -> Result<bool, String> {
+        if available.x <= 0.0 || available.y <= 0.0 {
+            return Ok(false);
+        }
+        self.refresh_edit_scene_drill_path_with_stack(
+            &[],
+            focused,
+            scene,
+            EditViewportHint::root(viewport, available, hover_world),
+        )
+    }
+
     pub fn apply_command(&mut self, action: EditorCommand) -> Result<(), String> {
         let mut history = std::mem::take(&mut self.history);
         let result = history.push_and_apply(self, action);
@@ -971,6 +990,71 @@ impl EditorDocument {
         })
     }
 
+    fn refresh_edit_scene_drill_path_with_stack(
+        &self,
+        parent_stack: &[ComponentDefId],
+        focused: ComponentDefId,
+        scene: &mut FocusedScene,
+        viewport_hint: EditViewportHint,
+    ) -> Result<bool, String> {
+        let component = self
+            .component(focused)
+            .ok_or_else(|| format!("missing component {:?}", focused))?;
+        let desired_child_index = select_preview_child_index(
+            component,
+            self,
+            scene.grid_rect,
+            scene.grid_dims,
+            viewport_hint.visible_world_rect,
+            viewport_hint.hover_world,
+        );
+        let desired_drill_child = desired_child_index.map(|index| ChildId(index as u32));
+        let mut changed = scene.drill_child != desired_drill_child;
+        scene.drill_child = desired_drill_child;
+
+        let Some(child_index) = desired_child_index else {
+            return Ok(changed);
+        };
+        let Some(child_component) = component.children.get(child_index).copied() else {
+            return Ok(changed);
+        };
+        let child_component_data = self
+            .component(child_component)
+            .ok_or_else(|| format!("missing child component {:?}", child_component))?;
+        let child_plan = self
+            .plan(child_component_data.plan)
+            .ok_or_else(|| format!("missing child plan {:?}", child_component_data.plan))?;
+        let Some(child) = scene.children.get_mut(child_index) else {
+            return Ok(changed);
+        };
+        let child_hint = viewport_hint.for_child(child_plan.grid_size, child.rect);
+
+        if is_placeholder_scene(&child.scene) {
+            let mut next_parent_stack = Vec::with_capacity(parent_stack.len() + 1);
+            next_parent_stack.extend_from_slice(parent_stack);
+            next_parent_stack.push(focused);
+            child.scene = Box::new(self.build_edit_scene_with_stack(
+                &next_parent_stack,
+                child_component,
+                Some(child_hint),
+                EditSceneDetail::Full,
+            )?);
+            changed = true;
+        } else {
+            let mut next_parent_stack = Vec::with_capacity(parent_stack.len() + 1);
+            next_parent_stack.extend_from_slice(parent_stack);
+            next_parent_stack.push(focused);
+            changed |= self.refresh_edit_scene_drill_path_with_stack(
+                &next_parent_stack,
+                child_component,
+                &mut child.scene,
+                child_hint,
+            )?;
+        }
+
+        Ok(changed)
+    }
+
     fn refreshed_component_wires(
         &self,
         component_id: ComponentDefId,
@@ -1169,6 +1253,15 @@ fn placeholder_edit_scene(
         ancestor_ports: Vec::new(),
         wires: Vec::new(),
     }
+}
+
+fn is_placeholder_scene(scene: &FocusedScene) -> bool {
+    scene.input_ports.is_empty()
+        && scene.output_ports.is_empty()
+        && scene.gates.is_empty()
+        && scene.children.is_empty()
+        && scene.ancestor_ports.is_empty()
+        && scene.wires.is_empty()
 }
 
 #[derive(Debug, Clone, Copy)]
