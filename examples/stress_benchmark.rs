@@ -6,8 +6,8 @@ use std::{
 
 use circuits_game::{
     gate_plans::{
-        compile_component_tree, ChildId, Component, ComponentPlan, ComponentPlans, Gate, GateId,
-        PortId, SignalRef,
+        ChildId, Component, ComponentPlan, ComponentPlans, Gate, GateId, PortId, SignalRef,
+        compile_component_tree,
     },
     kernel::{GateKernel, UploadedGpuPlan},
     setup,

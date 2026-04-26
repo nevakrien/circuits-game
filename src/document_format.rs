@@ -12,7 +12,7 @@ use crate::{
 };
 
 const MAGIC: [u8; 4] = *b"CGDF";
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 const SECTION_PLANS: [u8; 4] = *b"PLNS";
 const SECTION_COMPONENTS: [u8; 4] = *b"CMPS";
 const SECTION_ROOT: [u8; 4] = *b"ROOT";
@@ -150,7 +150,7 @@ pub fn decode_document(bytes: &[u8]) -> Result<EditorDocument, DocumentFormatErr
     }
 
     let version = reader.read_u16("file version")?;
-    if version != VERSION {
+    if !(1..=VERSION).contains(&version) {
         return Err(DocumentFormatError::UnsupportedVersion { version });
     }
     let _reserved = reader.read_u16("reserved header field")?;
@@ -176,6 +176,7 @@ pub fn decode_document(bytes: &[u8]) -> Result<EditorDocument, DocumentFormatErr
 
     let plans = decode_plans(
         plans_section.ok_or(DocumentFormatError::MissingSection { tag: SECTION_PLANS })?,
+        version,
     )?;
     let components = decode_components(components_section.ok_or(
         DocumentFormatError::MissingSection {
@@ -197,9 +198,11 @@ fn encode_plans(out: &mut Vec<u8>, document: &EditorDocument) -> Result<(), Docu
         put_u32(out, as_u32(id.0, "plan id")?);
         put_u32(out, plan.grid_size[0]);
         put_u32(out, plan.grid_size[1]);
-        put_u32(out, as_u32(plan.gates.len(), "gate count")?);
-        for gate in &plan.gates {
-            encode_gate(out, *gate);
+        let gates = plan.ordered_gates();
+        put_u32(out, as_u32(gates.len(), "gate count")?);
+        for (gate_id, gate) in gates {
+            put_u32(out, gate_id.0);
+            encode_gate(out, gate);
         }
         encode_ports(out, &plan.inputs)?;
         encode_ports(out, &plan.outputs)?;
@@ -263,6 +266,7 @@ fn encode_components(
 
 fn decode_plans(
     mut reader: Reader<'_>,
+    version: u16,
 ) -> Result<HashMap<PlanId, ComponentPlan>, DocumentFormatError> {
     let plan_count = reader.read_u32("plan count")?;
     let mut plans = HashMap::default();
@@ -273,15 +277,22 @@ fn decode_plans(
             reader.read_u32("plan grid height")?,
         ];
         let gate_count = reader.read_u32("gate count")?;
-        let mut gates = Vec::with_capacity(gate_count as usize);
-        for _ in 0..gate_count {
-            gates.push(decode_gate(&mut reader)?);
+        let mut gates = HashMap::default();
+        for gate_index in 0..gate_count {
+            let gate_id = if version >= 2 {
+                GateId(reader.read_u32("gate id")?)
+            } else {
+                GateId(gate_index)
+            };
+            gates.insert(gate_id, decode_gate(&mut reader)?);
         }
         let inputs = decode_ports(&mut reader)?;
         let outputs = decode_ports(&mut reader)?;
         plans.insert(
             plan_id,
-            ComponentPlan::with_ports(gates, inputs, outputs).with_grid_size(grid_size),
+            ComponentPlan::with_ports(Vec::new(), inputs, outputs)
+                .with_gate_map(gates)
+                .with_grid_size(grid_size),
         );
     }
     Ok(plans)
@@ -868,20 +879,21 @@ mod tests {
     }
 
     #[test]
-    fn fixture_binary_stays_stable() {
-        let document = sample_document();
-        let encoded = encode_document(&document).expect("document should encode");
+    fn legacy_v1_fixture_decodes_and_reencodes_as_v2() {
         let fixture = include_bytes!("../fixtures/sample_document_v1.cgdf");
-
-        assert_eq!(encoded.as_slice(), fixture);
 
         let decoded = decode_document(fixture).expect("fixture should decode");
         let reencoded = encode_document(&decoded).expect("fixture should re-encode");
-        assert_eq!(reencoded.as_slice(), fixture);
+
+        assert_eq!(&reencoded[0..4], &MAGIC);
+        assert_eq!(u16::from_le_bytes([reencoded[4], reencoded[5]]), VERSION);
+        assert_eq!(decoded.root, ComponentDefId(1));
+        assert_eq!(decoded.components.len(), 2);
+        assert_eq!(decoded.plans.len(), 2);
     }
 
     #[test]
-    fn python_codec_roundtrips_fixture_binary() {
+    fn python_codec_reads_legacy_v1_fixture_and_writes_v2() {
         let fixture = include_bytes!("../fixtures/sample_document_v1.cgdf");
         let temp = TestPaths::new("fixture_roundtrip");
         fs::write(&temp.input, fixture).expect("fixture input should be written");
@@ -889,7 +901,11 @@ mod tests {
         run_python_codec(&temp.input, &temp.output);
 
         let python_encoded = fs::read(&temp.output).expect("python output should exist");
-        assert_eq!(python_encoded.as_slice(), fixture);
+        assert_eq!(&python_encoded[0..4], &MAGIC);
+        assert_eq!(
+            u16::from_le_bytes([python_encoded[4], python_encoded[5]]),
+            VERSION
+        );
 
         let rust_decoded =
             decode_document(&python_encoded).expect("rust decoder should accept python output");
@@ -926,7 +942,7 @@ mod tests {
             .windows(4)
             .position(|window| window == SECTION_PLANS)
             .expect("plans section should exist");
-        let gate_kind_offset = plans_offset + 8 + 4 + 4 + 4 + 4 + 4;
+        let gate_kind_offset = plans_offset + 8 + 4 + 4 + 4 + 4 + 4 + 4;
         encoded[gate_kind_offset] = 99;
         encoded[gate_kind_offset + 1] = 0;
 

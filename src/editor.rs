@@ -16,7 +16,7 @@ use crate::visual_ui::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ComponentDefId(pub usize);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditableComponentDef {
     pub plan: PlanId,
     pub children: Vec<ComponentDefId>,
@@ -48,6 +48,30 @@ pub struct MoveChildCommand {
 }
 
 #[derive(Debug, Clone)]
+pub struct PlanEditCommand {
+    changes: Vec<PlanStateChange>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ComponentEditCommand {
+    changes: Vec<ComponentStateChange>,
+}
+
+#[derive(Debug, Clone)]
+struct PlanStateChange {
+    plan: PlanId,
+    before: ComponentPlan,
+    after: ComponentPlan,
+}
+
+#[derive(Debug, Clone)]
+struct ComponentStateChange {
+    component: ComponentDefId,
+    before: EditableComponentDef,
+    after: EditableComponentDef,
+}
+
+#[derive(Debug, Clone)]
 pub struct BatchCommand {
     pub commands: Vec<EditorCommand>,
 }
@@ -55,6 +79,8 @@ pub struct BatchCommand {
 #[derive(Debug, Clone)]
 pub enum EditorCommand {
     MoveChild(MoveChildCommand),
+    EditPlan(PlanEditCommand),
+    EditComponent(ComponentEditCommand),
     Batch(BatchCommand),
 }
 
@@ -77,6 +103,28 @@ impl EditorCommand {
                 before_component: command.after_component.clone(),
                 after_component: command.before_component.clone(),
             }),
+            Self::EditPlan(command) => Self::EditPlan(PlanEditCommand {
+                changes: command
+                    .changes
+                    .iter()
+                    .map(|change| PlanStateChange {
+                        plan: change.plan,
+                        before: change.after.clone(),
+                        after: change.before.clone(),
+                    })
+                    .collect(),
+            }),
+            Self::EditComponent(command) => Self::EditComponent(ComponentEditCommand {
+                changes: command
+                    .changes
+                    .iter()
+                    .map(|change| ComponentStateChange {
+                        component: change.component,
+                        before: change.after.clone(),
+                        after: change.before.clone(),
+                    })
+                    .collect(),
+            }),
             Self::Batch(command) => Self::Batch(BatchCommand {
                 commands: command.commands.iter().rev().map(Self::inverse).collect(),
             }),
@@ -91,6 +139,26 @@ impl EditorCommand {
                     .get_mut(command.component.0)
                     .ok_or_else(|| format!("missing component {:?}", command.component))?;
                 *component = command.after_component.clone();
+                Ok(())
+            }
+            Self::EditPlan(command) => {
+                for change in &command.changes {
+                    let plan = doc
+                        .plans
+                        .get_mut(&change.plan)
+                        .ok_or_else(|| format!("missing plan {:?}", change.plan))?;
+                    *plan = change.after.clone();
+                }
+                Ok(())
+            }
+            Self::EditComponent(command) => {
+                for change in &command.changes {
+                    let component = doc
+                        .components
+                        .get_mut(change.component.0)
+                        .ok_or_else(|| format!("missing component {:?}", change.component))?;
+                    *component = change.after.clone();
+                }
                 Ok(())
             }
             Self::Batch(command) => {
@@ -278,6 +346,186 @@ impl EditorDocument {
         Ok(true)
     }
 
+    pub fn move_gate_by(
+        &mut self,
+        component: ComponentDefId,
+        gate: GateId,
+        delta: [i32; 2],
+    ) -> Result<bool, String> {
+        let editable = self
+            .component(component)
+            .ok_or_else(|| format!("missing component {:?}", component))?;
+        let plan = self
+            .plan(editable.plan)
+            .ok_or_else(|| format!("missing plan {:?}", editable.plan))?;
+        if !plan.gates.contains_key(&gate) {
+            return Err(format!("missing gate {:?}", gate));
+        }
+        let width = plan.grid_size[0].max(1) as i32;
+        let height = plan.grid_size[1].max(1) as i32;
+        let from_x = gate.0 as i32 % width;
+        let from_y = gate.0 as i32 / width;
+        let target_x = (from_x + delta[0]).clamp(0, width.saturating_sub(1));
+        let target_y = (from_y + delta[1]).clamp(0, height.saturating_sub(1));
+        let target_index = (target_y.saturating_mul(width) + target_x) as u32;
+        if target_index == gate.0 {
+            return Ok(false);
+        }
+        let command = self.move_gate_command(editable.plan, gate, GateId(target_index))?;
+        self.apply_command(EditorCommand::Batch(BatchCommand { commands: command }))?;
+        Ok(true)
+    }
+
+    pub fn move_wire_bend_to(
+        &mut self,
+        component: ComponentDefId,
+        from: WireEndpoint,
+        to: WireEndpoint,
+        bend_index: usize,
+        point: WirePoint,
+    ) -> Result<bool, String> {
+        let before_component = self
+            .component(component)
+            .cloned()
+            .ok_or_else(|| format!("missing component {:?}", component))?;
+        let mut after_component = before_component.clone();
+        let Some(layout) = after_component
+            .layout
+            .wires
+            .iter_mut()
+            .find(|wire| wire.from == from && wire.to == to)
+        else {
+            return Ok(false);
+        };
+        if bend_index >= layout.bends.len() {
+            return Ok(false);
+        }
+        if layout.bends[bend_index] == point {
+            return Ok(false);
+        }
+        layout.bends[bend_index] = point;
+        self.apply_component_edit(component, before_component, after_component)?;
+        Ok(true)
+    }
+
+    pub fn insert_wire_bend(
+        &mut self,
+        component: ComponentDefId,
+        from: WireEndpoint,
+        to: WireEndpoint,
+        bend_index: usize,
+        point: WirePoint,
+    ) -> Result<Option<usize>, String> {
+        let before_component = self
+            .component(component)
+            .cloned()
+            .ok_or_else(|| format!("missing component {:?}", component))?;
+        let mut after_component = before_component.clone();
+        let Some(layout) = after_component
+            .layout
+            .wires
+            .iter_mut()
+            .find(|wire| wire.from == from && wire.to == to)
+        else {
+            return Ok(None);
+        };
+        let index = bend_index.min(layout.bends.len());
+        layout.bends.insert(index, point);
+        self.apply_component_edit(component, before_component, after_component)?;
+        Ok(Some(index))
+    }
+
+    pub fn rewire_source_endpoint(
+        &mut self,
+        component: ComponentDefId,
+        from: WireEndpoint,
+        to: WireEndpoint,
+        new_from: WireEndpoint,
+    ) -> Result<Option<(WireEndpoint, WireEndpoint)>, String> {
+        if from == new_from {
+            return Ok(None);
+        }
+        let Some(signal) = signal_ref_from_wire_endpoint(new_from) else {
+            return Ok(None);
+        };
+        let (plan_id, mut after_plan) = self.plan_for_component(component)?;
+        let before_plan = after_plan.clone();
+        let before_component = self
+            .component(component)
+            .cloned()
+            .ok_or_else(|| format!("missing component {:?}", component))?;
+        let mut after_component = before_component.clone();
+        if assign_target_source(&mut after_plan, &mut after_component, to, signal).is_err() {
+            return Ok(None);
+        }
+        if !move_wire_layout(&mut after_component, from, to, new_from, to) {
+            return Ok(None);
+        }
+        self.apply_plan_component_edits(
+            vec![(plan_id, before_plan, after_plan)],
+            vec![(component, before_component, after_component)],
+        )?;
+        Ok(Some((new_from, to)))
+    }
+
+    pub fn rewire_target_endpoint(
+        &mut self,
+        component: ComponentDefId,
+        from: WireEndpoint,
+        to: WireEndpoint,
+        new_to: WireEndpoint,
+    ) -> Result<Option<(WireEndpoint, WireEndpoint)>, String> {
+        if to == new_to {
+            return Ok(None);
+        }
+        let (plan_id, mut after_plan) = self.plan_for_component(component)?;
+        let before_plan = after_plan.clone();
+        let before_component = self
+            .component(component)
+            .cloned()
+            .ok_or_else(|| format!("missing component {:?}", component))?;
+        let mut after_component = before_component.clone();
+        let Ok(old_signal) = target_signal_ref(&after_plan, &after_component, to) else {
+            return Ok(None);
+        };
+        let displaced_signal = optional_target_signal_ref(&after_plan, &after_component, new_to)?;
+        if assign_target_source(&mut after_plan, &mut after_component, new_to, old_signal).is_err()
+        {
+            return Ok(None);
+        }
+        let new_from = signal_to_wire_endpoint(old_signal);
+        if let Some(displaced_signal) = displaced_signal {
+            if assign_target_source(&mut after_plan, &mut after_component, to, displaced_signal)
+                .is_err()
+            {
+                return Ok(None);
+            }
+            let displaced_from = signal_to_wire_endpoint(displaced_signal);
+            if !swap_wire_layout_targets(
+                &mut after_component,
+                from,
+                to,
+                displaced_from,
+                new_to,
+                new_from,
+            ) {
+                return Ok(None);
+            }
+        } else {
+            if clear_target_source(&mut after_plan, &mut after_component, to).is_err() {
+                return Ok(None);
+            }
+            if !move_wire_layout(&mut after_component, from, to, from, new_to) {
+                return Ok(None);
+            }
+        }
+        self.apply_plan_component_edits(
+            vec![(plan_id, before_plan, after_plan)],
+            vec![(component, before_component, after_component)],
+        )?;
+        Ok(Some((new_from, new_to)))
+    }
+
     fn move_child_command(
         &self,
         component: ComponentDefId,
@@ -319,6 +567,114 @@ impl EditorDocument {
             before_component,
             after_component,
         })
+    }
+
+    fn move_gate_command(
+        &self,
+        plan_id: PlanId,
+        from: GateId,
+        to: GateId,
+    ) -> Result<Vec<EditorCommand>, String> {
+        let before_plan = self
+            .plan(plan_id)
+            .cloned()
+            .ok_or_else(|| format!("missing plan {:?}", plan_id))?;
+        let width = before_plan.grid_size[0].max(1);
+        let height = before_plan.grid_size[1].max(1);
+        let max_gate_id = width.saturating_mul(height);
+        if from.0 >= max_gate_id || to.0 >= max_gate_id {
+            return Err(format!("gate move {:?} -> {:?} is out of range", from, to));
+        }
+        if !before_plan.gates.contains_key(&from) {
+            return Err(format!("missing gate {:?}", from));
+        }
+        let mut after_plan = before_plan.clone();
+        let moved_gate = after_plan
+            .gates
+            .remove(&from)
+            .ok_or_else(|| format!("missing gate {:?}", from))?;
+        let displaced_gate = after_plan.gates.remove(&to);
+        after_plan.gates.insert(to, moved_gate);
+        if let Some(displaced_gate) = displaced_gate {
+            after_plan.gates.insert(from, displaced_gate);
+        }
+        Ok(vec![EditorCommand::EditPlan(PlanEditCommand {
+            changes: vec![PlanStateChange {
+                plan: plan_id,
+                before: before_plan,
+                after: after_plan,
+            }],
+        })])
+    }
+
+    fn plan_for_component(
+        &self,
+        component: ComponentDefId,
+    ) -> Result<(PlanId, ComponentPlan), String> {
+        let editable = self
+            .component(component)
+            .ok_or_else(|| format!("missing component {:?}", component))?;
+        let plan = self
+            .plan(editable.plan)
+            .cloned()
+            .ok_or_else(|| format!("missing plan {:?}", editable.plan))?;
+        Ok((editable.plan, plan))
+    }
+
+    fn apply_component_edit(
+        &mut self,
+        component: ComponentDefId,
+        before: EditableComponentDef,
+        after: EditableComponentDef,
+    ) -> Result<(), String> {
+        if before == after {
+            return Ok(());
+        }
+        self.apply_command(EditorCommand::EditComponent(ComponentEditCommand {
+            changes: vec![ComponentStateChange {
+                component,
+                before,
+                after,
+            }],
+        }))
+    }
+
+    fn apply_plan_component_edits(
+        &mut self,
+        plan_changes: Vec<(PlanId, ComponentPlan, ComponentPlan)>,
+        component_changes: Vec<(ComponentDefId, EditableComponentDef, EditableComponentDef)>,
+    ) -> Result<(), String> {
+        let mut commands = Vec::new();
+        if !plan_changes.is_empty() {
+            commands.push(EditorCommand::EditPlan(PlanEditCommand {
+                changes: plan_changes
+                    .into_iter()
+                    .map(|(plan, before, after)| PlanStateChange {
+                        plan,
+                        before,
+                        after,
+                    })
+                    .collect(),
+            }));
+        }
+        let component_changes = component_changes
+            .into_iter()
+            .filter(|(_, before, after)| before != after)
+            .map(|(component, before, after)| ComponentStateChange {
+                component,
+                before,
+                after,
+            })
+            .collect::<Vec<_>>();
+        if !component_changes.is_empty() {
+            commands.push(EditorCommand::EditComponent(ComponentEditCommand {
+                changes: component_changes,
+            }));
+        }
+        if commands.is_empty() {
+            return Ok(());
+        }
+        self.apply_command(EditorCommand::Batch(BatchCommand { commands }))
     }
 
     pub fn undo(&mut self) -> Result<bool, String> {
@@ -408,20 +764,17 @@ impl EditorDocument {
         };
 
         let gates = plan
-            .gates
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(index, gate)| {
-                let index = index as u32;
-                let gx = index % grid_dims[0].max(1);
-                let gy = index / grid_dims[0].max(1);
+            .ordered_gates()
+            .into_iter()
+            .map(|(gate_id, gate)| {
+                let gx = gate_id.0 % grid_dims[0].max(1);
+                let gy = gate_id.0 / grid_dims[0].max(1);
                 let min = grid_rect.min + Vec2::new(gx as f32 * CELL, gy as f32 * CELL);
                 let input_sources = gate.input_refs().map(|source| {
                     source.and_then(|signal| source_gate_of_ref(focused, signal, &ctx, self).ok())
                 });
                 PlacedGate {
-                    id: GateId(index),
+                    id: gate_id,
                     gate,
                     input_sources,
                     rect: Rect::from_min_size(min, Vec2::splat(CELL)),
@@ -1099,7 +1452,7 @@ fn palette_color(index: usize) -> Color32 {
     PALETTE[index % PALETTE.len()]
 }
 
-const WIRE_POINT_UNITS_PER_CELL: f32 = 256.0;
+pub(crate) const WIRE_POINT_UNITS_PER_CELL: f32 = 256.0;
 
 #[derive(Debug, Clone)]
 struct ExpectedWire {
@@ -1253,8 +1606,7 @@ impl EditorDocument {
             .ok_or_else(|| format!("missing plan {:?}", component.plan))?;
         let mut wires = Vec::new();
 
-        for (gate_i, gate) in plan.gates.iter().copied().enumerate() {
-            let target_gate = GateId(gate_i as u32);
+        for (target_gate, gate) in plan.ordered_gates() {
             for (input_i, source_ref) in gate.input_refs().into_iter().flatten().enumerate() {
                 wires.push(ExpectedWire {
                     layout: WireLayout {
@@ -1323,6 +1675,9 @@ fn build_component_wires(
                 source_gate: expected_wire.source_gate,
                 color: palette_color(wires.len()),
                 points,
+                from: Some(layout.from),
+                to: Some(layout.to),
+                bends: layout.bends.clone(),
             });
         }
     }
@@ -1334,6 +1689,9 @@ fn build_component_wires(
                     source_gate: source_gate_of_ref(component_id, dangling.src, ctx, doc).ok(),
                     color: palette_color(wires.len()),
                     points,
+                    from: None,
+                    to: None,
+                    bends: Vec::new(),
                 });
             }
         }
@@ -1348,6 +1706,226 @@ fn signal_to_wire_endpoint(signal: SignalRef) -> WireEndpoint {
         SignalRef::ChildOutput { child, port } => WireEndpoint::ChildOutput { child, port },
         SignalRef::AncestorOutput { depth, port } => WireEndpoint::AncestorOutput { depth, port },
     }
+}
+
+fn signal_ref_from_wire_endpoint(endpoint: WireEndpoint) -> Option<SignalRef> {
+    match endpoint {
+        WireEndpoint::GateOutput(gate) => Some(SignalRef::ThisGate(gate)),
+        WireEndpoint::ComponentInput(port) => Some(SignalRef::InputPort(port)),
+        WireEndpoint::ChildOutput { child, port } => Some(SignalRef::ChildOutput { child, port }),
+        WireEndpoint::AncestorOutput { depth, port } => {
+            Some(SignalRef::AncestorOutput { depth, port })
+        }
+        WireEndpoint::GateInput { .. }
+        | WireEndpoint::ComponentOutput(_)
+        | WireEndpoint::ChildInput { .. } => None,
+    }
+}
+
+fn target_signal_ref(
+    plan: &ComponentPlan,
+    component: &EditableComponentDef,
+    target: WireEndpoint,
+) -> Result<SignalRef, String> {
+    match target {
+        WireEndpoint::GateInput { gate, input } => plan
+            .gates
+            .get(&gate)
+            .and_then(|gate| gate.input_refs().get(input as usize).copied().flatten())
+            .ok_or_else(|| format!("missing gate input {:?}:{input}", gate)),
+        WireEndpoint::ChildInput { child, port } => component
+            .child_input_connections
+            .iter()
+            .find(|connection| connection.child == child && connection.input == port)
+            .map(|connection| connection.src)
+            .ok_or_else(|| format!("missing child input {:?}:{:?}", child, port)),
+        WireEndpoint::ComponentOutput(port) => plan
+            .outputs
+            .iter()
+            .find(|output| output.id == port)
+            .map(|output| SignalRef::ThisGate(output.gate))
+            .ok_or_else(|| format!("missing component output {:?}", port)),
+        _ => Err(format!("invalid wire target {:?}", target)),
+    }
+}
+
+fn optional_target_signal_ref(
+    plan: &ComponentPlan,
+    component: &EditableComponentDef,
+    target: WireEndpoint,
+) -> Result<Option<SignalRef>, String> {
+    match target {
+        WireEndpoint::GateInput { gate, input } => plan
+            .gates
+            .get(&gate)
+            .and_then(|gate| gate.input_refs().get(input as usize).copied().flatten())
+            .ok_or_else(|| format!("missing gate input {:?}:{input}", gate))
+            .map(Some),
+        WireEndpoint::ChildInput { child, port } => Ok(component
+            .child_input_connections
+            .iter()
+            .find(|connection| connection.child == child && connection.input == port)
+            .map(|connection| connection.src)),
+        WireEndpoint::ComponentOutput(port) => plan
+            .outputs
+            .iter()
+            .find(|output| output.id == port)
+            .map(|output| Some(SignalRef::ThisGate(output.gate)))
+            .ok_or_else(|| format!("missing component output {:?}", port)),
+        _ => Err(format!("invalid wire target {:?}", target)),
+    }
+}
+
+fn assign_target_source(
+    plan: &mut ComponentPlan,
+    component: &mut EditableComponentDef,
+    target: WireEndpoint,
+    source: SignalRef,
+) -> Result<(), String> {
+    match target {
+        WireEndpoint::GateInput { gate, input } => {
+            let gate_ref = plan
+                .gates
+                .get_mut(&gate)
+                .ok_or_else(|| format!("missing gate {:?}", gate))?;
+            *gate_ref = set_gate_input_ref(*gate_ref, input as usize, source)?;
+            Ok(())
+        }
+        WireEndpoint::ChildInput { child, port } => {
+            let connection = component
+                .child_input_connections
+                .iter_mut()
+                .find(|connection| connection.child == child && connection.input == port)
+                .ok_or_else(|| format!("missing child input {:?}:{:?}", child, port))?;
+            connection.src = source;
+            Ok(())
+        }
+        WireEndpoint::ComponentOutput(port) => {
+            let WireEndpoint::GateOutput(gate) = signal_to_wire_endpoint(source) else {
+                return Err(format!("component output {:?} must come from a gate", port));
+            };
+            let output = plan
+                .outputs
+                .iter_mut()
+                .find(|output| output.id == port)
+                .ok_or_else(|| format!("missing component output {:?}", port))?;
+            output.gate = gate;
+            Ok(())
+        }
+        _ => Err(format!("invalid wire target {:?}", target)),
+    }
+}
+
+fn clear_target_source(
+    _plan: &mut ComponentPlan,
+    component: &mut EditableComponentDef,
+    target: WireEndpoint,
+) -> Result<(), String> {
+    match target {
+        WireEndpoint::ChildInput { child, port } => {
+            let before_len = component.child_input_connections.len();
+            component
+                .child_input_connections
+                .retain(|connection| !(connection.child == child && connection.input == port));
+            if component.child_input_connections.len() == before_len {
+                return Err(format!("missing child input {:?}:{:?}", child, port));
+            }
+            Ok(())
+        }
+        WireEndpoint::GateInput { .. } | WireEndpoint::ComponentOutput(_) => {
+            Err(format!("target {:?} cannot be disconnected", target))
+        }
+        _ => Err(format!("invalid wire target {:?}", target)),
+    }
+}
+
+fn set_gate_input_ref(gate: Gate, input: usize, source: SignalRef) -> Result<Gate, String> {
+    match (gate, input) {
+        (Gate::BitNAND { b, .. }, 0) => Ok(Gate::BitNAND { a: source, b }),
+        (Gate::BitNAND { a, .. }, 1) => Ok(Gate::BitNAND { a, b: source }),
+        (Gate::BitAND { b, .. }, 0) => Ok(Gate::BitAND { a: source, b }),
+        (Gate::BitAND { a, .. }, 1) => Ok(Gate::BitAND { a, b: source }),
+        (Gate::BitOR { b, .. }, 0) => Ok(Gate::BitOR { a: source, b }),
+        (Gate::BitOR { a, .. }, 1) => Ok(Gate::BitOR { a, b: source }),
+        (Gate::BitNOR { b, .. }, 0) => Ok(Gate::BitNOR { a: source, b }),
+        (Gate::BitNOR { a, .. }, 1) => Ok(Gate::BitNOR { a, b: source }),
+        (Gate::BitXOR { b, .. }, 0) => Ok(Gate::BitXOR { a: source, b }),
+        (Gate::BitXOR { a, .. }, 1) => Ok(Gate::BitXOR { a, b: source }),
+        (Gate::BitXNOR { b, .. }, 0) => Ok(Gate::BitXNOR { a: source, b }),
+        (Gate::BitXNOR { a, .. }, 1) => Ok(Gate::BitXNOR { a, b: source }),
+        (Gate::BitNot { .. }, 0) => Ok(Gate::BitNot { src: source }),
+        (Gate::BitNop { .. }, 0) => Ok(Gate::BitNop { src: source }),
+        _ => Err(format!("gate input index {input} is out of range")),
+    }
+}
+
+fn move_wire_layout(
+    component: &mut EditableComponentDef,
+    from: WireEndpoint,
+    to: WireEndpoint,
+    new_from: WireEndpoint,
+    new_to: WireEndpoint,
+) -> bool {
+    let Some(layout) = component
+        .layout
+        .wires
+        .iter_mut()
+        .find(|wire| wire.from == from && wire.to == to)
+    else {
+        return false;
+    };
+    layout.from = new_from;
+    layout.to = new_to;
+    true
+}
+
+fn swap_wire_layout_targets(
+    component: &mut EditableComponentDef,
+    from: WireEndpoint,
+    to: WireEndpoint,
+    displaced_from: WireEndpoint,
+    new_to: WireEndpoint,
+    new_from: WireEndpoint,
+) -> bool {
+    let Some(first_index) = component
+        .layout
+        .wires
+        .iter()
+        .position(|wire| wire.from == from && wire.to == to)
+    else {
+        return false;
+    };
+    let Some(second_index) = component
+        .layout
+        .wires
+        .iter()
+        .position(|wire| wire.from == displaced_from && wire.to == new_to)
+    else {
+        return false;
+    };
+    if first_index == second_index {
+        component.layout.wires[first_index].from = new_from;
+        component.layout.wires[first_index].to = new_to;
+        return true;
+    }
+    if first_index < second_index {
+        let (left, right) = component.layout.wires.split_at_mut(second_index);
+        let first = &mut left[first_index];
+        let second = &mut right[0];
+        first.from = new_from;
+        first.to = new_to;
+        second.from = displaced_from;
+        second.to = to;
+    } else {
+        let (left, right) = component.layout.wires.split_at_mut(first_index);
+        let second = &mut left[second_index];
+        let first = &mut right[0];
+        first.from = new_from;
+        first.to = new_to;
+        second.from = displaced_from;
+        second.to = to;
+    }
+    true
 }
 
 fn infer_child_placement(
@@ -1440,14 +2018,14 @@ fn wire_points(layout: &WireLayout, lookup: &Lookup) -> Option<Vec<Pos2>> {
     Some(points)
 }
 
-fn local_wire_point_to_pos(point: &WirePoint) -> Pos2 {
+pub(crate) fn local_wire_point_to_pos(point: &WirePoint) -> Pos2 {
     Pos2::new(
         PAD + (point.x as f32 / WIRE_POINT_UNITS_PER_CELL) * CELL,
         PAD + 36.0 + (point.y as f32 / WIRE_POINT_UNITS_PER_CELL) * CELL,
     )
 }
 
-fn pos_to_wire_point(pos: Pos2) -> WirePoint {
+pub(crate) fn pos_to_wire_point(pos: Pos2) -> WirePoint {
     WirePoint {
         x: (((pos.x - PAD) / CELL) * WIRE_POINT_UNITS_PER_CELL).round() as i32,
         y: (((pos.y - PAD - 36.0) / CELL) * WIRE_POINT_UNITS_PER_CELL).round() as i32,
@@ -1637,9 +2215,11 @@ mod tests {
         let mut document = sample_document();
         let before = document.component(ComponentDefId(1)).unwrap().clone();
 
-        assert!(document
-            .move_child_by(ComponentDefId(1), ChildId(0), [-2, -2])
-            .expect("move should succeed"));
+        assert!(
+            document
+                .move_child_by(ComponentDefId(1), ChildId(0), [-2, -2])
+                .expect("move should succeed")
+        );
         assert_eq!(document.history().applied_len(), 1);
         assert_eq!(document.history().redo_len(), 0);
         assert_ne!(
@@ -1669,9 +2249,11 @@ mod tests {
     fn move_child_detaches_into_dangling_wires_instead_of_deleting_connections() {
         let mut document = sample_document();
 
-        assert!(document
-            .move_child_by(ComponentDefId(1), ChildId(0), [-2, -2])
-            .expect("move should succeed"));
+        assert!(
+            document
+                .move_child_by(ComponentDefId(1), ChildId(0), [-2, -2])
+                .expect("move should succeed")
+        );
 
         let component = document.component(ComponentDefId(1)).unwrap();
         assert!(component.child_input_connections.is_empty());
@@ -1694,12 +2276,16 @@ mod tests {
         let mut document = sample_document();
         let original = document.component(ComponentDefId(1)).unwrap().clone();
 
-        assert!(document
-            .move_child_by(ComponentDefId(1), ChildId(0), [-2, -2])
-            .expect("move away should succeed"));
-        assert!(document
-            .move_child_by(ComponentDefId(1), ChildId(0), [2, 2])
-            .expect("move back should succeed"));
+        assert!(
+            document
+                .move_child_by(ComponentDefId(1), ChildId(0), [-2, -2])
+                .expect("move away should succeed")
+        );
+        assert!(
+            document
+                .move_child_by(ComponentDefId(1), ChildId(0), [2, 2])
+                .expect("move back should succeed")
+        );
 
         let component = document.component(ComponentDefId(1)).unwrap();
         assert_eq!(
@@ -1707,6 +2293,170 @@ mod tests {
             original.child_input_connections
         );
         assert!(component.dangling_wires.is_empty());
+    }
+
+    #[test]
+    fn move_gate_moves_slot_contents_without_remapping_refs() {
+        let mut document = sample_document();
+
+        assert!(
+            document
+                .move_gate_by(ComponentDefId(1), GateId(0), [1, 0])
+                .expect("move should succeed")
+        );
+
+        let plan = document.plan(PlanId(1)).unwrap();
+        assert!(matches!(
+            plan.gate(GateId(0)).unwrap(),
+            Gate::BitNop {
+                src: SignalRef::ThisGate(GateId(0))
+            }
+        ));
+        assert!(matches!(
+            plan.gate(GateId(1)).unwrap(),
+            Gate::BitNot {
+                src: SignalRef::ThisGate(GateId(0))
+            }
+        ));
+        let component = document.component(ComponentDefId(1)).unwrap();
+        assert_eq!(
+            component
+                .child_input_connections
+                .iter()
+                .map(|connection| connection.src)
+                .collect::<Vec<_>>(),
+            vec![
+                SignalRef::ThisGate(GateId(0)),
+                SignalRef::ThisGate(GateId(1))
+            ]
+        );
+    }
+
+    #[test]
+    fn rewiring_source_endpoint_updates_gate_input_signal() {
+        let mut document = sample_document();
+
+        let rewired = document
+            .rewire_source_endpoint(
+                ComponentDefId(1),
+                WireEndpoint::GateOutput(GateId(1)),
+                WireEndpoint::GateInput {
+                    gate: GateId(2),
+                    input: 1,
+                },
+                WireEndpoint::GateOutput(GateId(0)),
+            )
+            .expect("rewire should succeed");
+
+        assert_eq!(
+            rewired,
+            Some((
+                WireEndpoint::GateOutput(GateId(0)),
+                WireEndpoint::GateInput {
+                    gate: GateId(2),
+                    input: 1,
+                },
+            ))
+        );
+        let plan = document.plan(PlanId(1)).unwrap();
+        assert!(matches!(
+            plan.gate(GateId(2)).unwrap(),
+            Gate::BitXOR {
+                a: SignalRef::ThisGate(GateId(0)),
+                b: SignalRef::ThisGate(GateId(0))
+            }
+        ));
+    }
+
+    #[test]
+    fn rewiring_target_endpoint_swaps_gate_input_sources() {
+        let mut document = sample_document();
+
+        let rewired = document
+            .rewire_target_endpoint(
+                ComponentDefId(1),
+                WireEndpoint::GateOutput(GateId(0)),
+                WireEndpoint::GateInput {
+                    gate: GateId(2),
+                    input: 0,
+                },
+                WireEndpoint::GateInput {
+                    gate: GateId(2),
+                    input: 1,
+                },
+            )
+            .expect("rewire should succeed");
+
+        assert_eq!(
+            rewired,
+            Some((
+                WireEndpoint::GateOutput(GateId(0)),
+                WireEndpoint::GateInput {
+                    gate: GateId(2),
+                    input: 1,
+                },
+            ))
+        );
+        let plan = document.plan(PlanId(1)).unwrap();
+        assert!(matches!(
+            plan.gate(GateId(2)).unwrap(),
+            Gate::BitXOR {
+                a: SignalRef::ThisGate(GateId(1)),
+                b: SignalRef::ThisGate(GateId(0))
+            }
+        ));
+    }
+
+    #[test]
+    fn wire_bends_can_be_inserted_and_moved() {
+        let mut document = sample_document();
+        let point = WirePoint { x: 128, y: 256 };
+
+        assert_eq!(
+            document
+                .insert_wire_bend(
+                    ComponentDefId(1),
+                    WireEndpoint::GateOutput(GateId(0)),
+                    WireEndpoint::GateInput {
+                        gate: GateId(2),
+                        input: 0,
+                    },
+                    0,
+                    point,
+                )
+                .expect("bend insert should succeed"),
+            Some(0)
+        );
+        assert!(
+            document
+                .move_wire_bend_to(
+                    ComponentDefId(1),
+                    WireEndpoint::GateOutput(GateId(0)),
+                    WireEndpoint::GateInput {
+                        gate: GateId(2),
+                        input: 0,
+                    },
+                    0,
+                    WirePoint { x: 192, y: 320 },
+                )
+                .expect("bend move should succeed")
+        );
+
+        let component = document.component(ComponentDefId(1)).unwrap();
+        let wire = component
+            .layout
+            .wires
+            .iter()
+            .find(|wire| {
+                wire.from == WireEndpoint::GateOutput(GateId(0))
+                    && wire.to
+                        == (WireEndpoint::GateInput {
+                            gate: GateId(2),
+                            input: 0,
+                        })
+            })
+            .expect("wire should exist");
+        assert_eq!(wire.bends, vec![WirePoint { x: 192, y: 320 }]);
     }
 
     fn sample_document() -> EditorDocument {

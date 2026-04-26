@@ -192,11 +192,13 @@ fn __align_up(x: u32, a: u32) -> u32 {
 impl ChargeAlloc {
     pub fn new(total_bits: u32) -> Self {
         assert!(total_bits >= 32);
-        Self {
+        let mut alloc = Self {
             cur_buffer: BufferId(0),
             bit_idx: 0,
             total_bits,
-        }
+        };
+        let _ = alloc.alloc_word();
+        alloc
     }
 
     fn next_buffer(&mut self) {
@@ -261,10 +263,10 @@ mod tests {
         let byte = alloc.alloc_byte();
         let word = alloc.alloc_word();
 
-        assert_eq!(bit, BitsIndex(BufferId(0), Bits(0)));
-        assert_eq!(byte, ByteIndex(BufferId(0), 1));
-        assert_eq!(word, WordIndex(BufferId(1), 0));
-        assert_eq!(alloc.cur_buffer, BufferId(1));
+        assert_eq!(bit, BitsIndex(BufferId(1), Bits(0)));
+        assert_eq!(byte, ByteIndex(BufferId(1), 1));
+        assert_eq!(word, WordIndex(BufferId(2), 0));
+        assert_eq!(alloc.cur_buffer, BufferId(2));
         assert_eq!(alloc.bit_idx, 32);
     }
 

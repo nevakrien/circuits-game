@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 
 MAGIC = b"CGDF"
-VERSION = 1
+VERSION = 2
 
 
 class DecodeError(Exception):
@@ -254,7 +254,7 @@ def decode_document(path: str) -> dict:
     if reader.take(4, "magic") != MAGIC:
         raise DecodeError("not a CGDF file")
     version = reader.u16("version")
-    if version != VERSION:
+    if version not in (1, VERSION):
         raise DecodeError(f"unsupported version {version}")
     reader.u16("reserved")
     section_count = reader.u32("section count")
@@ -273,7 +273,13 @@ def decode_document(path: str) -> dict:
             {
                 "id": plans_reader.u32("plan id"),
                 "grid": [plans_reader.u32("grid width"), plans_reader.u32("grid height")],
-                "gates": [read_gate(plans_reader) for _ in range(plans_reader.u32("gate count"))],
+                "gates": [
+                    {
+                        "id": (plans_reader.u32("gate id") if version >= 2 else gate_index),
+                        **read_gate(plans_reader),
+                    }
+                    for gate_index in range(plans_reader.u32("gate count"))
+                ],
                 "inputs": read_ports(plans_reader),
                 "outputs": read_ports(plans_reader),
             }
@@ -341,8 +347,10 @@ def encode_document(document: dict) -> bytes:
         plans.u32(plan["id"])
         plans.u32(plan["grid"][0])
         plans.u32(plan["grid"][1])
-        plans.u32(len(plan["gates"]))
-        for gate in plan["gates"]:
+        sorted_gates = sorted(plan["gates"], key=lambda gate: gate["id"])
+        plans.u32(len(sorted_gates))
+        for gate in sorted_gates:
+            plans.u32(gate["id"])
             write_gate(plans, gate)
         write_ports(plans, plan["inputs"])
         write_ports(plans, plan["outputs"])

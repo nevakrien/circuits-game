@@ -1,5 +1,5 @@
 use crate::charge_buffer::{
-    BitCrossWorker, Bits, BitsIndex, ChargeAlloc, PreparedBitCross, WorkingMem,
+    BitCrossWorker, Bits, BitsIndex, BufferId, ChargeAlloc, PreparedBitCross, WorkingMem,
 };
 use foldhash::{HashMap, HashSet};
 use rayon::prelude::*;
@@ -153,7 +153,7 @@ impl Gate {
 #[derive(Debug, Clone)]
 pub struct ComponentPlan {
     pub grid_size: [u32; 2],
-    pub gates: Vec<Gate>,
+    pub gates: HashMap<GateId, Gate>,
     pub inputs: Vec<ComponentPort>,
     pub outputs: Vec<ComponentPort>,
 }
@@ -162,7 +162,11 @@ impl ComponentPlan {
     pub fn new(gates: Vec<Gate>) -> Self {
         Self {
             grid_size: default_grid_size(gates.len() as u32),
-            gates,
+            gates: gates
+                .into_iter()
+                .enumerate()
+                .map(|(index, gate)| (GateId(index as u32), gate))
+                .collect(),
             inputs: Vec::new(),
             outputs: Vec::new(),
         }
@@ -175,10 +179,19 @@ impl ComponentPlan {
     ) -> Self {
         Self {
             grid_size: default_grid_size(gates.len() as u32),
-            gates,
+            gates: gates
+                .into_iter()
+                .enumerate()
+                .map(|(index, gate)| (GateId(index as u32), gate))
+                .collect(),
             inputs,
             outputs,
         }
+    }
+
+    pub fn with_gate_map(mut self, gates: HashMap<GateId, Gate>) -> Self {
+        self.gates = gates;
+        self
     }
 
     pub fn with_grid_size(mut self, grid_size: [u32; 2]) -> Self {
@@ -188,6 +201,30 @@ impl ComponentPlan {
 
     pub fn gate_count(&self) -> u32 {
         self.gates.len() as u32
+    }
+
+    pub fn gate(&self, id: GateId) -> Option<Gate> {
+        self.gates.get(&id).copied()
+    }
+
+    pub fn gate_mut(&mut self, id: GateId) -> Option<&mut Gate> {
+        self.gates.get_mut(&id)
+    }
+
+    pub fn ordered_gates(&self) -> Vec<(GateId, Gate)> {
+        let mut gates = self
+            .gates
+            .iter()
+            .map(|(&gate_id, &gate)| (gate_id, gate))
+            .collect::<Vec<_>>();
+        gates.sort_by_key(|(gate_id, _)| *gate_id);
+        gates
+    }
+
+    pub fn ordered_gate_ids(&self) -> Vec<GateId> {
+        let mut gate_ids = self.gates.keys().copied().collect::<Vec<_>>();
+        gate_ids.sort();
+        gate_ids
     }
 
     fn input_port(&self, id: PortId) -> Option<&ComponentPort> {
@@ -416,6 +453,7 @@ pub struct GpuPlan {
 
 pub struct GateCompiler {
     pub bits: HashMap<(NodeId, GateId), BitsIndex>,
+    pub zero_bit: BitsIndex,
     pub alloc: ChargeAlloc,
     pub mem: WorkingMem,
     pub components: HashMap<NodeId, CompiledComponentInfo>,
@@ -503,15 +541,6 @@ fn validate_plan_ports(node: NodeId, plan: &ComponentPlan) -> Result<(), Compile
                 kind: "input",
             });
         }
-        if port.gate.0 >= plan.gate_count() {
-            return Err(CompileError::TargetGateOutOfRange {
-                from_node: node,
-                from_gate: port.gate,
-                target_node: node,
-                target_gate: port.gate,
-                target_gate_count: plan.gate_count(),
-            });
-        }
     }
 
     let mut seen_outputs = HashSet::default();
@@ -521,15 +550,6 @@ fn validate_plan_ports(node: NodeId, plan: &ComponentPlan) -> Result<(), Compile
                 node,
                 port: port.id,
                 kind: "output",
-            });
-        }
-        if port.gate.0 >= plan.gate_count() {
-            return Err(CompileError::TargetGateOutOfRange {
-                from_node: node,
-                from_gate: port.gate,
-                target_node: node,
-                target_gate: port.gate,
-                target_gate_count: plan.gate_count(),
             });
         }
     }
@@ -627,9 +647,12 @@ pub fn compile_component_tree(
     validate_component_tree_with_index(root, plans, &by_id)?;
 
     let usage = collect_ref_usage(root, plans, &by_id)?;
+    let alloc = ChargeAlloc::new(total_bits_per_buffer);
+    let zero_bit = BitsIndex(BufferId(0), Bits(0));
     let mut compiler = GateCompiler {
         bits: HashMap::default(),
-        alloc: ChargeAlloc::new(total_bits_per_buffer),
+        zero_bit,
+        alloc,
         mem: WorkingMem {
             mem: Vec::new(),
             bit_cross: HashMap::default(),
@@ -654,13 +677,13 @@ fn gate_store_map(compiler: &GateCompiler) -> HashMap<(NodeId, GateId), GateStor
         .bits
         .iter()
         .map(|(&(node, gate), &bit_index)| {
-            let bit_in_word = (bit_index.1 .0 % 32) as u8;
+            let bit_in_word = (bit_index.1.0 % 32) as u8;
             (
                 (node, gate),
                 GateStoreLocation {
                     buffer: bit_index.0,
                     bit: bit_index.1,
-                    word_byte_offset: (bit_index.1 .0 >> 5) << 2,
+                    word_byte_offset: (bit_index.1.0 >> 5) << 2,
                     bit_in_word,
                 },
             )
@@ -736,8 +759,7 @@ fn lower_basic_gate_groups(
         let ctx = child_ctx(parent_stack, node.id, &child_ids, child_index_in_parent);
         let plan = component_plan(node, plans)?;
 
-        for (gate_i, gate) in plan.gates.iter().copied().enumerate() {
-            let gate_id = GateId(gate_i as u32);
+        for (gate_id, gate) in plan.ordered_gates() {
             let dst = compiler.bits.get(&(node.id, gate_id)).copied().ok_or(
                 CompileError::MissingBitsForGate {
                     node: node.id,
@@ -757,7 +779,7 @@ fn lower_basic_gate_groups(
                 None => src_a,
             };
 
-            let tgt_word_byte_offset = (dst.1 .0 >> 5) << 2;
+            let tgt_word_byte_offset = (dst.1.0 >> 5) << 2;
             grouped
                 .entry(dst.0)
                 .or_default()
@@ -765,7 +787,7 @@ fn lower_basic_gate_groups(
                 .or_default()
                 .push(BasicGateInstruction {
                     op: BasicGateOp::from_gate(gate),
-                    dst_bit_in_word: Bits(dst.1 .0 % 32),
+                    dst_bit_in_word: Bits(dst.1.0 % 32),
                     src_a,
                     src_b,
                 });
@@ -908,21 +930,21 @@ fn lower_output_write_groups(
     let mut by_word: HashMap<u32, Vec<OutputWriteInstruction>> = HashMap::default();
     let root_plan = component_plan(root, plans)?;
 
-    for (gate_i, _) in root_plan.gates.iter().enumerate() {
-        let gate_id = GateId(gate_i as u32);
+    for (dense_index, gate_id) in root_plan.ordered_gate_ids().into_iter().enumerate() {
         let src = compiler.bits.get(&(root.id, gate_id)).copied().ok_or(
             CompileError::MissingBitsForGate {
                 node: root.id,
                 gate: gate_id,
             },
         )?;
-        let output_word_index = gate_id.0 / 32;
+        let dense_index = dense_index as u32;
+        let output_word_index = dense_index / 32;
         by_word
             .entry(output_word_index)
             .or_default()
             .push(OutputWriteInstruction {
                 src,
-                dst_bit_in_word: Bits(gate_id.0 % 32),
+                dst_bit_in_word: Bits(dense_index % 32),
             });
     }
 
@@ -997,16 +1019,7 @@ fn resolve_gate_bits(
     compiler: &GateCompiler,
 ) -> Result<BitsIndex, CompileError> {
     match r {
-        SignalRef::ThisGate(gate) => {
-            compiler
-                .bits
-                .get(&(node.id, gate))
-                .copied()
-                .ok_or(CompileError::MissingBitsForGate {
-                    node: node.id,
-                    gate,
-                })
-        }
+        SignalRef::ThisGate(gate) => Ok(resolved_gate_or_zero(compiler, node.id, gate)),
         SignalRef::InputPort(port) => {
             resolve_input_port_bits(node, from_gate, port, ctx, plans, by_id, compiler)
         }
@@ -1030,14 +1043,7 @@ fn resolve_gate_bits(
                     node: target_node,
                     port,
                 })?;
-            compiler
-                .bits
-                .get(&(target_node, output.gate))
-                .copied()
-                .ok_or(CompileError::MissingBitsForGate {
-                    node: target_node,
-                    gate: output.gate,
-                })
+            Ok(resolved_gate_or_zero(compiler, target_node, output.gate))
         }
         SignalRef::AncestorOutput { depth, port } => {
             let depth = depth.0 as usize;
@@ -1061,16 +1067,17 @@ fn resolve_gate_bits(
                     node: target_node,
                     port,
                 })?;
-            compiler
-                .bits
-                .get(&(target_node, output.gate))
-                .copied()
-                .ok_or(CompileError::MissingBitsForGate {
-                    node: target_node,
-                    gate: output.gate,
-                })
+            Ok(resolved_gate_or_zero(compiler, target_node, output.gate))
         }
     }
+}
+
+fn resolved_gate_or_zero(compiler: &GateCompiler, node: NodeId, gate: GateId) -> BitsIndex {
+    compiler
+        .bits
+        .get(&(node, gate))
+        .copied()
+        .unwrap_or(compiler.zero_bit)
 }
 
 fn resolve_input_port_bits(
@@ -1092,12 +1099,7 @@ fn resolve_input_port_bits(
                     node: node.id,
                     port,
                 })?;
-            return compiler.bits.get(&(node.id, input.gate)).copied().ok_or(
-                CompileError::MissingBitsForGate {
-                    node: node.id,
-                    gate: input.gate,
-                },
-            );
+            return Ok(resolved_gate_or_zero(compiler, node.id, input.gate));
         }
     };
 
@@ -1124,12 +1126,7 @@ fn resolve_input_port_bits(
                 port,
             })?;
         // TODO(UI): surface disconnected component inputs so the player can fix them.
-        return compiler.bits.get(&(node.id, input.gate)).copied().ok_or(
-            CompileError::MissingBitsForGate {
-                node: node.id,
-                gate: input.gate,
-            },
-        );
+        return Ok(resolved_gate_or_zero(compiler, node.id, input.gate));
     };
 
     let parent_child_ids: Vec<NodeId> = parent.children.iter().map(|c| c.id).collect();
@@ -1249,8 +1246,7 @@ fn validate_component_tree_with_index(
             )?;
         }
 
-        for (gate_i, gate) in plan.gates.iter().copied().enumerate() {
-            let gate_id = GateId(gate_i as u32);
+        for (gate_id, gate) in plan.ordered_gates() {
             validate_gate(node.id, gate_id, gate, &ctx, plans, by_id)?;
         }
 
@@ -1307,23 +1303,7 @@ fn validate_gate_ref(
     by_id: &HashMap<NodeId, &Component>,
 ) -> Result<(), CompileError> {
     match r {
-        SignalRef::ThisGate(gate) => {
-            let node = by_id
-                .get(&ctx.current)
-                .copied()
-                .ok_or(CompileError::MissingNode(ctx.current))?;
-            let plan = component_plan(node, plans)?;
-            if gate.0 >= plan.gate_count() {
-                return Err(CompileError::TargetGateOutOfRange {
-                    from_node,
-                    from_gate,
-                    target_node: ctx.current,
-                    target_gate: gate,
-                    target_gate_count: plan.gate_count(),
-                });
-            }
-            Ok(())
-        }
+        SignalRef::ThisGate(_) => Ok(()),
         SignalRef::InputPort(port) => {
             let node = by_id
                 .get(&ctx.current)
@@ -1414,9 +1394,7 @@ fn collect_ref_usage(
         let ctx = child_ctx(parent_stack, node.id, &child_ids, child_index);
         let plan = component_plan(node, plans)?;
 
-        for (gate_i, gate) in plan.gates.iter().copied().enumerate() {
-            let from_gate = GateId(gate_i as u32);
-
+        for (from_gate, gate) in plan.ordered_gates() {
             for r in gate_inputs(gate) {
                 validate_gate_ref(node.id, from_gate, r, &ctx, plans, by_id)?;
 
@@ -1523,12 +1501,12 @@ fn compile_component_rec(
 
     let outline = decide_outline_plan(plan.gate_count(), usage.get(&node.id));
 
-    let mut self_bits = Vec::with_capacity(plan.gates.len());
+    let ordered_gate_ids = plan.ordered_gate_ids();
+    let mut self_bits = Vec::with_capacity(ordered_gate_ids.len());
 
     match outline.layout {
         CompileLayout::Inline => {
-            for gate_i in 0..plan.gates.len() {
-                let gate_id = GateId(gate_i as u32);
+            for gate_id in ordered_gate_ids.iter().copied() {
                 let bit = compiler.alloc.alloc_bit();
                 compiler.bits.insert((node.id, gate_id), bit);
                 self_bits.push(bit);
@@ -1536,14 +1514,14 @@ fn compile_component_rec(
         }
         CompileLayout::Outline => {
             let total_slots = plan.gate_count() + outline.input_count + outline.output_count;
-            for slot_i in 0..total_slots {
+            for gate_id in ordered_gate_ids.iter().copied() {
                 let word = compiler.alloc.alloc_word();
                 let bit = BitsIndex(word.0, Bits(word.1 * 8));
-                if slot_i < plan.gates.len() as u32 {
-                    let gate_id = GateId(slot_i);
-                    compiler.bits.insert((node.id, gate_id), bit);
-                    self_bits.push(bit);
-                }
+                compiler.bits.insert((node.id, gate_id), bit);
+                self_bits.push(bit);
+            }
+            for _ in ordered_gate_ids.len() as u32..total_slots {
+                let _ = compiler.alloc.alloc_word();
             }
         }
     }
@@ -1610,16 +1588,9 @@ fn lower_cross_component_edges(
             by_id,
             compiler,
         )?;
-        let dst = compiler
-            .bits
-            .get(&(child_node, input.gate))
-            .copied()
-            .ok_or(CompileError::MissingBitsForGate {
-                node: child_node,
-                gate: input.gate,
-            })?;
+        let dst = resolved_gate_or_zero(compiler, child_node, input.gate);
 
-        if src.0 != dst.0 || src.1 != dst.1 {
+        if dst != compiler.zero_bit && (src.0 != dst.0 || src.1 != dst.1) {
             let _ = compiler.mem.queue_bit_write(src, dst);
         }
     }
@@ -1775,6 +1746,7 @@ mod tests {
         let usage = collect_ref_usage(root, plans, &by_id)?;
         let mut compiler = GateCompiler {
             bits: HashMap::default(),
+            zero_bit: BitsIndex(BufferId(0), Bits(0)),
             alloc: ChargeAlloc::new(total_bits_per_buffer),
             mem: WorkingMem {
                 mem: Vec::new(),
@@ -1825,7 +1797,7 @@ mod tests {
 
         assert_eq!(info.outline.layout, CompileLayout::Inline);
         assert_eq!(info.self_bits.len(), 40);
-        assert!(info.self_bits.iter().all(|bit| bit.1 .0 < 32));
+        assert!(info.self_bits.iter().all(|bit| bit.1.0 < 32));
         assert!(
             info.self_bits
                 .iter()
@@ -1865,13 +1837,13 @@ mod tests {
         let src = compiler.bits[&(root_id, GateId(5))];
         let dst = compiler.bits[&(child_id, GateId(0))];
 
-        assert_eq!(src, BitsIndex(BufferId(0), Bits(5)));
-        assert_eq!(dst, BitsIndex(BufferId(1), Bits(0)));
+        assert_eq!(src, BitsIndex(BufferId(1), Bits(5)));
+        assert_eq!(dst, BitsIndex(BufferId(2), Bits(0)));
 
         let queued = compiler
             .mem
             .bit_cross
-            .get(&(BufferId(0), WordIndex(BufferId(1), 0)))
+            .get(&(BufferId(1), WordIndex(BufferId(2), 0)))
             .expect("expected cross-buffer child input write");
         assert!(queued.contains(&(Bits(5), 0)));
     }

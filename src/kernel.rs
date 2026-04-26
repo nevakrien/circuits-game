@@ -618,8 +618,8 @@ mod tests {
 
         assert!(!basic_gate_workers.is_empty());
         assert!(!basic_gate_instructions.is_empty());
-        assert_eq!(cross_write_workers[0].tgt_word_index, 1);
-        assert_eq!(cross_write_instructions[0].src_bit_index, 5);
+        assert_eq!(cross_write_workers[0].tgt_word_index, 2);
+        assert_eq!(cross_write_instructions[0].src_bit_index, 37);
         assert_eq!(cross_write_instructions[0].tgt_bit_in_word, 0);
         assert_eq!(output_write_workers[0].tgt_word_index, 0);
         assert_eq!(output_write_instructions[31].tgt_bit_in_word, 31);
@@ -654,20 +654,28 @@ mod tests {
             .collect();
         assert!(used_buffers.len() > 1, "test should span multiple buffers");
 
-        let buffer_count = gate_count.div_ceil(bits_per_buffer);
+        let buffer_count = compiled
+            .gate_store
+            .values()
+            .map(|store| store.buffer.0)
+            .max()
+            .unwrap_or(0)
+            + 1;
         let storage_words = buffer_count * compiled.gpu_plan.words_per_buffer;
-        let input_words = vec![
+        let mut input_words = vec![
+            0,
             0xA5A5_5A5A,
             0x3CC3_F00F,
             0x9669_6996,
             0xF0F0_0F0F,
             0x1357_9BDF,
         ];
+        input_words.resize(storage_words as usize, 0);
         assert_eq!(input_words.len() as u32, storage_words);
 
         let mut expected_write_words = vec![0u32; storage_words as usize];
         for gate in 0..gate_count {
-            let src_word = gate / bits_per_buffer;
+            let src_word = 1 + gate / bits_per_buffer;
             let src_bit = gate % bits_per_buffer;
             let bit = (input_words[src_word as usize] >> src_bit) & 1;
             expected_write_words[src_word as usize] |= bit << src_bit;
@@ -675,7 +683,7 @@ mod tests {
 
         let mut expected_output_words = vec![0u32; compiled.gpu_plan.output_words as usize];
         for gate in 0..gate_count {
-            let src_word = gate / bits_per_buffer;
+            let src_word = 1 + gate / bits_per_buffer;
             let src_bit = gate % bits_per_buffer;
             let bit = (input_words[src_word as usize] >> src_bit) & 1;
             expected_output_words[(gate / 32) as usize] |= bit << (gate % 32);

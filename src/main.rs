@@ -6,12 +6,13 @@ use std::{
 use circuits_game::{
     editor::{ComponentDefId, EditableComponentDef, EditorDocument},
     editor_interaction::{
-        EditInteractionState, EditSceneAction, child_at_pointer, interact_edit_scene,
+        EditInteractionState, EditSceneAction, apply_edit_scene_drag_preview, child_at_pointer,
+        interact_edit_scene,
     },
     gate_plans::{
         ChildId, ChildInputConnection, ChildPlacement, Component, ComponentLayout, ComponentPlan,
         ComponentPlans, ComponentPort, Gate, GateId, PlanId, PortId, PortLocation, SignalRef,
-        compile_component_tree,
+        WireEndpoint, compile_component_tree,
     },
     kernel::{GateKernel, UploadedGpuPlan},
     scene_render::SceneRenderer,
@@ -62,6 +63,103 @@ fn upload_viewer_scene(
     }
 }
 
+fn rebuild_and_upload_viewer_scene(
+    scene_renderer: &mut SceneRenderer,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    viewer: &mut ViewerState,
+    runtime: Option<&DemoRuntime>,
+    document: &EditorDocument,
+    hover_world: Option<egui::Pos2>,
+) -> Result<(), String> {
+    viewer.rebuild_scene(runtime, document, hover_world)?;
+    upload_viewer_scene(scene_renderer, device, queue, viewer);
+    Ok(())
+}
+
+fn upload_drag_preview_if_needed(
+    scene_renderer: &mut SceneRenderer,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    viewer: &mut ViewerState,
+    pointer_world: Option<egui::Pos2>,
+) {
+    let interaction = viewer.edit_interaction;
+    if apply_edit_scene_drag_preview(&mut viewer.scene, &interaction, pointer_world) {
+        upload_viewer_scene(scene_renderer, device, queue, viewer);
+    }
+}
+
+fn draw_edit_selection_overlay(ui: &egui::Ui, viewer: &ViewerState, viewport_rect: egui::Rect) {
+    let Some(selection) = viewer.selected_edit_target else {
+        return;
+    };
+    let stroke = egui::Stroke::new(3.0, egui::Color32::from_rgb(255, 220, 120));
+    match selection {
+        EditSelection::Child(child_id) => {
+            if let Some(child) = viewer
+                .scene
+                .children
+                .iter()
+                .find(|child| child.id == child_id)
+            {
+                ui.painter().rect_stroke(
+                    world_rect_to_screen(viewport_rect, &viewer.viewport, child.rect.expand(6.0)),
+                    8.0,
+                    stroke,
+                    egui::StrokeKind::Outside,
+                );
+            }
+        }
+        EditSelection::Gate(gate_id) => {
+            if let Some(gate) = viewer.scene.gates.iter().find(|gate| gate.id == gate_id) {
+                ui.painter().rect_stroke(
+                    world_rect_to_screen(viewport_rect, &viewer.viewport, gate.rect.expand(4.0)),
+                    6.0,
+                    stroke,
+                    egui::StrokeKind::Outside,
+                );
+            }
+        }
+        EditSelection::Wire { from, to } => {
+            if let Some(wire) = viewer
+                .scene
+                .wires
+                .iter()
+                .find(|wire| wire.from == Some(from) && wire.to == Some(to))
+            {
+                let points = wire
+                    .points
+                    .iter()
+                    .map(|point| world_to_screen(viewport_rect, &viewer.viewport, *point))
+                    .collect::<Vec<_>>();
+                if points.len() >= 2 {
+                    ui.painter().add(egui::Shape::line(points, stroke));
+                }
+            }
+        }
+    }
+}
+
+fn world_to_screen(
+    viewport_rect: egui::Rect,
+    viewport: &ViewportState,
+    point: egui::Pos2,
+) -> egui::Pos2 {
+    viewport_rect.min + viewport.pan + point.to_vec2() * viewport.zoom
+}
+
+fn world_rect_to_screen(
+    viewport_rect: egui::Rect,
+    viewport: &ViewportState,
+    rect: egui::Rect,
+) -> egui::Rect {
+    egui::Rect::from_min_max(
+        world_to_screen(viewport_rect, viewport, rect.min),
+        world_to_screen(viewport_rect, viewport, rect.max),
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DemoSceneKind {
     Starter,
@@ -106,6 +204,7 @@ async fn run() {
     let mut scene_label = initial_scene.label;
     let mut document = initial_scene.document;
     let mut runtime: Option<DemoRuntime> = None;
+    let mut runtime_error: Option<String> = None;
     let mut viewer = ViewerState::new(&document).expect("viewer should build initial scene");
     let animation_started_at = Instant::now();
     let mut scene_renderer = SceneRenderer::new(device, config.format);
@@ -147,15 +246,20 @@ async fn run() {
 
                     if hotkeys.switch_to_edit && viewer.is_running_mode() {
                         runtime = None;
+                        runtime_error = None;
                         viewer.enter_edit(&document).expect("edit scene should rebuild");
                         upload_viewer_scene(&mut scene_renderer, device, queue, &viewer);
                     }
                     if hotkeys.switch_to_run && viewer.is_editing() {
-                        let compiled = DemoRuntime::new(device, queue, scene_label, &document)
-                            .expect("run mode compile should succeed");
-                        viewer.enter_run(&compiled).expect("run scene should rebuild");
-                        upload_viewer_scene(&mut scene_renderer, device, queue, &viewer);
-                        runtime = Some(compiled);
+                        match DemoRuntime::new(device, queue, scene_label, &document) {
+                            Ok(compiled) => {
+                                runtime_error = None;
+                                viewer.enter_run(&compiled).expect("run scene should rebuild");
+                                upload_viewer_scene(&mut scene_renderer, device, queue, &viewer);
+                                runtime = Some(compiled);
+                            }
+                            Err(error) => runtime_error = Some(error),
+                        }
                     }
                     if viewer.is_editing() && hotkeys.undo {
                         if document.undo().expect("undo should succeed") {
@@ -210,6 +314,10 @@ async fn run() {
                                         viewer.scene.wires.len()
                                     )),
                                 };
+                                if let Some(error) = runtime_error.as_ref() {
+                                    ui.separator();
+                                    ui.colored_label(egui::Color32::from_rgb(255, 140, 140), error);
+                                }
                             });
                             ui.horizontal(|ui| {
                                 ui.label("Scene:");
@@ -245,6 +353,7 @@ async fn run() {
                                     && viewer.is_running_mode()
                                 {
                                     runtime = None;
+                                    runtime_error = None;
                                     viewer.enter_edit(&document).expect("edit scene should rebuild");
                                     upload_viewer_scene(&mut scene_renderer, device, queue, &viewer);
                                 }
@@ -253,11 +362,15 @@ async fn run() {
                                     .clicked()
                                     && viewer.is_editing()
                                 {
-                                    let compiled = DemoRuntime::new(device, queue, scene_label, &document)
-                                        .expect("run mode compile should succeed");
-                                    viewer.enter_run(&compiled).expect("run scene should rebuild");
-                                    upload_viewer_scene(&mut scene_renderer, device, queue, &viewer);
-                                    runtime = Some(compiled);
+                                    match DemoRuntime::new(device, queue, scene_label, &document) {
+                                        Ok(compiled) => {
+                                            runtime_error = None;
+                                            viewer.enter_run(&compiled).expect("run scene should rebuild");
+                                            upload_viewer_scene(&mut scene_renderer, device, queue, &viewer);
+                                            runtime = Some(compiled);
+                                        }
+                                        Err(error) => runtime_error = Some(error),
+                                    }
                                 }
                             });
                             ui.add_enabled_ui(viewer.is_running_mode(), |ui| {
@@ -389,6 +502,7 @@ async fn run() {
                                 .show(ctx, |ui| {
                                     let active = viewer.active_edit_component();
                                     if let Some(component) = document.component(active) {
+                                        let plan = document.plan(component.plan);
                                         ui.heading(format!("Def {}", active.0));
                                         ui.monospace(format!(
                                             "plan {:?} | {} children",
@@ -440,6 +554,46 @@ async fn run() {
                                                 ));
                                             }
                                         }
+                                        if let Some(plan) = plan {
+                                            ui.separator();
+                                            ui.label("Gates:");
+                                            for (gate_id, gate) in plan.ordered_gates() {
+                                                if ui
+                                                    .selectable_label(
+                                                        viewer.selected_edit_gate() == Some(gate_id),
+                                                        format!("Gate {}: {}", gate_id.0, gate.label()),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    viewer.select_edit_gate(Some(gate_id));
+                                                }
+                                            }
+                                        }
+
+                                        match viewer.selected_edit_target {
+                                            Some(EditSelection::Gate(gate_id)) => {
+                                                if let Some(plan) = plan {
+                                                    if let Some(gate) = plan.gate(gate_id) {
+                                                        ui.separator();
+                                                        ui.label(format!("Selected gate {}", gate_id.0));
+                                                        ui.monospace(gate.label());
+                                                        let width = plan.grid_size[0].max(1);
+                                                        ui.monospace(format!(
+                                                            "grid [{}, {}]",
+                                                            gate_id.0 % width,
+                                                            gate_id.0 / width
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                            Some(EditSelection::Wire { from, to }) => {
+                                                ui.separator();
+                                                ui.label("Selected wire");
+                                                ui.monospace(format!("from {:?}", from));
+                                                ui.monospace(format!("to   {:?}", to));
+                                            }
+                                            _ => {}
+                                        }
                                     }
                                 });
                         }
@@ -477,9 +631,24 @@ async fn run() {
                                 };
                                 if let Some(action) = action {
                                     match action {
+                                        EditSceneAction::ClearSelection => {
+                                            if viewer.is_editing() {
+                                                viewer.clear_edit_selection();
+                                            }
+                                        }
                                         EditSceneAction::SelectChild(child) => {
                                             if viewer.is_editing() {
                                                 viewer.select_edit_child(Some(child));
+                                            }
+                                        }
+                                        EditSceneAction::SelectGate(gate) => {
+                                            if viewer.is_editing() {
+                                                viewer.select_edit_gate(Some(gate));
+                                            }
+                                        }
+                                        EditSceneAction::SelectWire { from, to } => {
+                                            if viewer.is_editing() {
+                                                viewer.select_edit_wire(Some((from, to)));
                                             }
                                         }
                                         EditSceneAction::MoveChild { child, delta_cells } => {
@@ -489,14 +658,183 @@ async fn run() {
                                                     .expect("drag move should succeed")
                                             {
                                                 viewer.select_edit_child(Some(child));
-                                                viewer.rebuild_scene(
+                                                rebuild_and_upload_viewer_scene(
+                                                    &mut scene_renderer,
+                                                    device,
+                                                    queue,
+                                                    &mut viewer,
                                                     runtime.as_ref(),
                                                     &document,
                                                     hover_world,
                                                 )
-                                                    .expect("scene should rebuild after drag move");
-                                                upload_viewer_scene(&mut scene_renderer, device, queue, &viewer);
+                                                .expect("scene should rebuild after drag move");
                                                 scene_rebuilt = true;
+                                            }
+                                        }
+                                        EditSceneAction::MoveGate { gate, delta_cells } => {
+                                            if viewer.is_editing() {
+                                                match document.move_gate_by(
+                                                    viewer.active_edit_component(),
+                                                    gate,
+                                                    delta_cells,
+                                                ) {
+                                                    Ok(true) => {
+                                                        if rebuild_and_upload_viewer_scene(
+                                                            &mut scene_renderer,
+                                                            device,
+                                                            queue,
+                                                            &mut viewer,
+                                                        runtime.as_ref(),
+                                                        &document,
+                                                        hover_world,
+                                                    )
+                                                    .is_ok()
+                                                    {
+                                                        viewer.select_edit_gate(Some(gate));
+                                                        scene_rebuilt = true;
+                                                    } else {
+                                                        viewer.edit_interaction.clear();
+                                                    }
+                                                    }
+                                                    Ok(false) => {}
+                                                    Err(_) => viewer.edit_interaction.clear(),
+                                                }
+                                            }
+                                        }
+                                        EditSceneAction::MoveWireBend {
+                                            from,
+                                            to,
+                                            bend_index,
+                                            point,
+                                        } => {
+                                            if viewer.is_editing() {
+                                                match document.move_wire_bend_to(
+                                                    viewer.active_edit_component(),
+                                                    from,
+                                                    to,
+                                                    bend_index,
+                                                    point,
+                                                ) {
+                                                    Ok(true) => {
+                                                        if rebuild_and_upload_viewer_scene(
+                                                            &mut scene_renderer,
+                                                            device,
+                                                            queue,
+                                                            &mut viewer,
+                                                        runtime.as_ref(),
+                                                        &document,
+                                                        hover_world,
+                                                    )
+                                                    .is_ok()
+                                                    {
+                                                        viewer.select_edit_wire(Some((from, to)));
+                                                        scene_rebuilt = true;
+                                                    } else {
+                                                        viewer.edit_interaction.clear();
+                                                    }
+                                                    }
+                                                    Ok(false) => {}
+                                                    Err(_) => viewer.edit_interaction.clear(),
+                                                }
+                                            }
+                                        }
+                                        EditSceneAction::InsertWireBend {
+                                            from,
+                                            to,
+                                            bend_index,
+                                            point,
+                                        } => {
+                                            if viewer.is_editing() {
+                                                match document.insert_wire_bend(
+                                                    viewer.active_edit_component(),
+                                                    from,
+                                                    to,
+                                                    bend_index,
+                                                    point,
+                                                ) {
+                                                    Ok(Some(_)) => {
+                                                        if rebuild_and_upload_viewer_scene(
+                                                            &mut scene_renderer,
+                                                            device,
+                                                            queue,
+                                                            &mut viewer,
+                                                        runtime.as_ref(),
+                                                        &document,
+                                                        hover_world,
+                                                    )
+                                                    .is_ok()
+                                                    {
+                                                        viewer.select_edit_wire(Some((from, to)));
+                                                        scene_rebuilt = true;
+                                                    } else {
+                                                        viewer.edit_interaction.clear();
+                                                    }
+                                                    }
+                                                    Ok(None) => viewer.edit_interaction.clear(),
+                                                    Err(_) => viewer.edit_interaction.clear(),
+                                                }
+                                            }
+                                        }
+                                        EditSceneAction::RewireWireSource { from, to, new_from } => {
+                                            if viewer.is_editing() {
+                                                match document.rewire_source_endpoint(
+                                                    viewer.active_edit_component(),
+                                                    from,
+                                                    to,
+                                                    new_from,
+                                                ) {
+                                                    Ok(Some(_)) => {
+                                                        if rebuild_and_upload_viewer_scene(
+                                                            &mut scene_renderer,
+                                                            device,
+                                                            queue,
+                                                            &mut viewer,
+                                                            runtime.as_ref(),
+                                                            &document,
+                                                            hover_world,
+                                                        )
+                                                        .is_ok()
+                                                        {
+                                                            viewer.select_edit_wire(Some((new_from, to)));
+                                                            scene_rebuilt = true;
+                                                        } else {
+                                                            viewer.edit_interaction.clear();
+                                                        }
+                                                    }
+                                                    Ok(None) => {}
+                                                    Err(_) => viewer.edit_interaction.clear(),
+                                                }
+                                            }
+                                        }
+                                        EditSceneAction::RewireWireTarget { from, to, new_to } => {
+                                            if viewer.is_editing() {
+                                                match document.rewire_target_endpoint(
+                                                    viewer.active_edit_component(),
+                                                    from,
+                                                    to,
+                                                    new_to,
+                                                ) {
+                                                    Ok(Some(_)) => {
+                                                        if rebuild_and_upload_viewer_scene(
+                                                            &mut scene_renderer,
+                                                            device,
+                                                            queue,
+                                                            &mut viewer,
+                                                            runtime.as_ref(),
+                                                            &document,
+                                                            hover_world,
+                                                        )
+                                                        .is_ok()
+                                                        {
+                                                            viewer.select_edit_wire(Some((from, new_to)));
+                                                            scene_rebuilt = true;
+                                                        } else {
+                                                            viewer.edit_interaction.clear();
+                                                        }
+                                                    }
+                                                    Ok(None) => {}
+                                                    Err(_) => viewer.edit_interaction.clear(),
+                                                }
                                             }
                                         }
                                         EditSceneAction::FocusChild(node) => {
@@ -506,22 +844,37 @@ async fn run() {
                                                 viewer.focus_runtime_child(node);
                                             }
                                             viewer.reset_camera();
-                                            viewer.rebuild_scene(runtime.as_ref(), &document, None)
-                                                .expect("child focus scene should rebuild");
-                                            upload_viewer_scene(&mut scene_renderer, device, queue, &viewer);
+                                            rebuild_and_upload_viewer_scene(
+                                                &mut scene_renderer,
+                                                device,
+                                                queue,
+                                                &mut viewer,
+                                                runtime.as_ref(),
+                                                &document,
+                                                None,
+                                            )
+                                            .expect("child focus scene should rebuild");
                                             scene_rebuilt = true;
                                         }
                                     }
                                 }
-                                if viewer.is_editing()
-                                    && !scene_rebuilt
-                                    && (viewport_output.viewport_changed
-                                        || size_changed
-                                        || hover_changed)
-                                {
-                                    viewer.rebuild_edit_scene(&document, hover_world)
-                                        .expect("edit scene should rebuild after viewport or hover change");
-                                    upload_viewer_scene(&mut scene_renderer, device, queue, &viewer);
+                                if viewer.is_editing() && !scene_rebuilt {
+                                    if viewer.edit_interaction.is_dragging() {
+                                        upload_drag_preview_if_needed(
+                                            &mut scene_renderer,
+                                            device,
+                                            queue,
+                                            &mut viewer,
+                                            viewport_output.hover_world,
+                                        );
+                                    } else if viewport_output.viewport_changed || size_changed || hover_changed {
+                                        viewer.rebuild_edit_scene(&document, hover_world)
+                                            .expect("edit scene should rebuild after viewport or hover change");
+                                        upload_viewer_scene(&mut scene_renderer, device, queue, &viewer);
+                                    }
+                                }
+                                if viewer.is_editing() {
+                                    draw_edit_selection_overlay(ui, &viewer, viewport_output.rect);
                                 }
                             });
                     });
@@ -728,7 +1081,7 @@ impl DemoRuntime {
 struct ViewerState {
     mode: AppMode,
     edit_focus_stack: Vec<ComponentDefId>,
-    selected_edit_child: Option<ChildId>,
+    selected_edit_target: Option<EditSelection>,
     edit_hover_world: Option<egui::Pos2>,
     edit_interaction: EditInteractionState,
     run_focus_node: circuits_game::gate_plans::NodeId,
@@ -752,12 +1105,22 @@ enum SimulationMode {
     Paused,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditSelection {
+    Child(ChildId),
+    Gate(GateId),
+    Wire {
+        from: WireEndpoint,
+        to: WireEndpoint,
+    },
+}
+
 impl ViewerState {
     fn new(document: &EditorDocument) -> Result<Self, String> {
         let mut viewer = Self {
             mode: AppMode::Edit,
             edit_focus_stack: vec![document.root],
-            selected_edit_child: None,
+            selected_edit_target: None,
             edit_hover_world: None,
             edit_interaction: EditInteractionState::default(),
             run_focus_node: circuits_game::gate_plans::NodeId(0),
@@ -892,7 +1255,7 @@ impl ViewerState {
     fn reset_to_document_root(&mut self, document: &EditorDocument) -> Result<(), String> {
         self.edit_focus_stack.clear();
         self.edit_focus_stack.push(document.root);
-        self.selected_edit_child = None;
+        self.selected_edit_target = None;
         self.edit_hover_world = None;
         self.edit_interaction.clear();
         self.child_ids.clear();
@@ -903,7 +1266,7 @@ impl ViewerState {
 
     fn reset_to_runtime_root(&mut self, runtime: &DemoRuntime) -> Result<(), String> {
         self.run_focus_node = runtime.root.id;
-        self.selected_edit_child = None;
+        self.selected_edit_target = None;
         self.edit_hover_world = None;
         self.edit_interaction.clear();
         self.rebuild_run_scene(runtime)?;
@@ -924,24 +1287,46 @@ impl ViewerState {
 
     fn pop_edit_focus_to(&mut self, len: usize) {
         self.edit_focus_stack.truncate(len);
-        self.selected_edit_child = None;
+        self.selected_edit_target = None;
         self.edit_hover_world = None;
         self.edit_interaction.clear();
     }
 
     fn push_edit_focus(&mut self, component: ComponentDefId) {
         self.edit_focus_stack.push(component);
-        self.selected_edit_child = None;
+        self.selected_edit_target = None;
         self.edit_hover_world = None;
         self.edit_interaction.clear();
     }
 
     fn select_edit_child(&mut self, child: Option<ChildId>) {
-        self.selected_edit_child = child;
+        self.selected_edit_target = child.map(EditSelection::Child);
     }
 
     fn selected_edit_child(&self) -> Option<ChildId> {
-        self.selected_edit_child
+        match self.selected_edit_target {
+            Some(EditSelection::Child(child)) => Some(child),
+            _ => None,
+        }
+    }
+
+    fn select_edit_gate(&mut self, gate: Option<GateId>) {
+        self.selected_edit_target = gate.map(EditSelection::Gate);
+    }
+
+    fn selected_edit_gate(&self) -> Option<GateId> {
+        match self.selected_edit_target {
+            Some(EditSelection::Gate(gate)) => Some(gate),
+            _ => None,
+        }
+    }
+
+    fn select_edit_wire(&mut self, wire: Option<(WireEndpoint, WireEndpoint)>) {
+        self.selected_edit_target = wire.map(|(from, to)| EditSelection::Wire { from, to });
+    }
+
+    fn clear_edit_selection(&mut self) {
+        self.selected_edit_target = None;
     }
 
     fn rebuild_scene(

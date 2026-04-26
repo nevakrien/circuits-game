@@ -93,6 +93,9 @@ pub struct VisualWire {
     pub source_gate: Option<(NodeId, GateId)>,
     pub color: Color32,
     pub points: Vec<Pos2>,
+    pub from: Option<WireEndpoint>,
+    pub to: Option<WireEndpoint>,
+    pub bends: Vec<WirePoint>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -177,20 +180,17 @@ fn build_focused_scene_with_index(
         .collect();
 
     let gates = plan
-        .gates
-        .par_iter()
-        .copied()
-        .enumerate()
-        .map(|(index, gate)| {
-            let index = index as u32;
-            let gx = index % grid_dims[0];
-            let gy = index / grid_dims[0];
+        .ordered_gates()
+        .into_par_iter()
+        .map(|(gate_id, gate)| {
+            let gx = gate_id.0 % grid_dims[0];
+            let gy = gate_id.0 / grid_dims[0];
             let min = grid_rect.min + Vec2::new(gx as f32 * CELL, gy as f32 * CELL);
             let input_sources = gate.input_refs().map(|source| {
                 source.and_then(|signal| source_gate_of_ref(focus, signal, &ctx, plans, by_id).ok())
             });
             PlacedGate {
-                id: GateId(index),
+                id: gate_id,
                 gate,
                 input_sources,
                 rect: Rect::from_min_size(min, Vec2::splat(CELL)),
@@ -717,6 +717,9 @@ fn build_component_wires(
                 source_gate: expected_wire.source_gate,
                 color: palette_color(wires.len()),
                 points,
+                from: Some(layout.from),
+                to: Some(layout.to),
+                bends: layout.bends.clone(),
             });
         }
     }
@@ -732,8 +735,7 @@ fn expected_component_wires(
 ) -> Result<Vec<ExpectedWire>, CompileError> {
     let mut wires = Vec::new();
 
-    for (gate_i, gate) in plan.gates.iter().copied().enumerate() {
-        let target_gate = GateId(gate_i as u32);
+    for (target_gate, gate) in plan.ordered_gates() {
         for (input_i, source_ref) in gate.input_refs().into_iter().flatten().enumerate() {
             wires.push(ExpectedWire {
                 layout: WireLayout {
