@@ -23,8 +23,7 @@ use circuits_game::{
     },
     viewer_frame::{ViewerRenderMode, render_viewer_frame},
     visual_ui::{
-        FocusedScene, ViewportState, build_focused_scene, child_ids_of, interact_focused_scene,
-        parent_stack_to,
+        FocusedScene, ViewportState, build_focused_scene, interact_focused_scene, parent_stack_to,
     },
 };
 use egui_wgpu::wgpu;
@@ -299,12 +298,12 @@ async fn run() {
                                 ui.separator();
                                 match runtime.as_ref() {
                                     Some(runtime) if viewer.is_running_mode() => ui.monospace(format!(
-                                        "{} | run | read buffer {} | {} logical buffers | node {} | {} child components | {} wires",
+                                        "{} | run | read buffer {} | {} logical buffers | node {} | {} visible children | {} wires",
                                         runtime.scene_label,
                                         runtime.current_read,
                                         runtime.buffer_count,
                                         viewer.run_focus_node.0,
-                                        viewer.child_ids.len(),
+                                        viewer.scene.children.len(),
                                         viewer.scene.wires.len()
                                     )),
                                     _ => ui.monospace(format!(
@@ -503,97 +502,87 @@ async fn run() {
                                     let active = viewer.active_edit_component();
                                     if let Some(component) = document.component(active) {
                                         let plan = document.plan(component.plan);
+                                        let child_counts = component_child_counts(&document, active);
+                                        let all_components = ordered_component_defs(&document, active);
                                         ui.heading(format!("Def {}", active.0));
                                         ui.monospace(format!(
-                                            "plan {:?} | {} children",
+                                            "plan {:?} | {} child instances | {} defs",
                                             component.plan,
-                                            component.children.len()
+                                            component.children.len(),
+                                            document.components.len()
                                         ));
-                                        ui.separator();
-                                        ui.label("Children:");
-                                        for (index, child_component) in component.children.iter().copied().enumerate() {
-                                            let child_id = ChildId(index as u32);
-                                            let selected = viewer.selected_edit_child() == Some(child_id);
-                                            if ui
-                                                .selectable_label(
-                                                    selected,
-                                                    format!("Child {} -> def {}", index, child_component.0),
-                                                )
-                                                .clicked()
-                                            {
-                                                viewer.select_edit_child(Some(child_id));
-                                            }
-                                        }
-                                        if let Some(child_id) = viewer.selected_edit_child() {
-                                            ui.separator();
-                                            ui.label(format!("Selected child {}", child_id.0));
-                                            if let Some(child_component) =
-                                                document.child_component(active, child_id)
-                                            {
-                                                ui.monospace(format!("def {}", child_component.0));
-                                                if ui.button("Open").clicked() {
-                                                    viewer.push_edit_focus(child_component);
-                                                    viewer.reset_camera();
-                                                    viewer.rebuild_scene(
-                                                        runtime.as_ref(),
-                                                        &document,
-                                                        None,
-                                                    )
-                                                        .expect("child edit scene should rebuild");
-                                                    upload_viewer_scene(&mut scene_renderer, device, queue, &viewer);
-                                                }
-                                            }
-                                            if let Some(placement) = component
-                                                .layout
-                                                .child_placements
-                                                .get(child_id.0 as usize)
-                                            {
-                                                ui.monospace(format!(
-                                                    "grid [{}, {}]",
-                                                    placement.min[0], placement.min[1]
-                                                ));
-                                            }
-                                        }
                                         if let Some(plan) = plan {
-                                            ui.separator();
-                                            ui.label("Gates:");
-                                            for (gate_id, gate) in plan.ordered_gates() {
-                                                if ui
-                                                    .selectable_label(
-                                                        viewer.selected_edit_gate() == Some(gate_id),
-                                                        format!("Gate {}: {}", gate_id.0, gate.label()),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    viewer.select_edit_gate(Some(gate_id));
-                                                }
-                                            }
+                                            ui.monospace(format!("{} gates | grid {}x{}", plan.gates.len(), plan.grid_size[0], plan.grid_size[1]));
                                         }
-
-                                        match viewer.selected_edit_target {
-                                            Some(EditSelection::Gate(gate_id)) => {
-                                                if let Some(plan) = plan {
-                                                    if let Some(gate) = plan.gate(gate_id) {
-                                                        ui.separator();
-                                                        ui.label(format!("Selected gate {}", gate_id.0));
-                                                        ui.monospace(gate.label());
-                                                        let width = plan.grid_size[0].max(1);
-                                                        ui.monospace(format!(
-                                                            "grid [{}, {}]",
-                                                            gate_id.0 % width,
-                                                            gate_id.0 / width
-                                                        ));
+                                        let remaining_height = ui.available_height().max(240.0);
+                                        let current_children_height = (remaining_height * 0.22).clamp(96.0, 180.0);
+                                        let all_components_height = (remaining_height - current_children_height - 24.0).max(180.0);
+                                        ui.separator();
+                                        ui.label("Current Children");
+                                        egui::ScrollArea::vertical()
+                                            .id_salt("current-children-scroll")
+                                            .max_height(current_children_height)
+                                            .auto_shrink([false, false])
+                                            .show(ui, |ui| {
+                                                if child_counts.is_empty() {
+                                                    ui.monospace("No direct children");
+                                                }
+                                                for (component_id, direct_instances) in &child_counts {
+                                                    let selected = *component_id == active;
+                                                    let label = format!(
+                                                        "Def {} | {} direct | {} total children",
+                                                        component_id.0,
+                                                        direct_instances,
+                                                        document
+                                                            .component(*component_id)
+                                                            .map(|entry| entry.children.len())
+                                                            .unwrap_or(0)
+                                                    );
+                                                    if ui.selectable_label(selected, label).clicked() {
+                                                        viewer.focus_edit_component(*component_id);
+                                                        viewer.reset_camera();
+                                                        viewer.rebuild_scene(runtime.as_ref(), &document, None)
+                                                            .expect("component scene should rebuild");
+                                                        upload_viewer_scene(&mut scene_renderer, device, queue, &viewer);
                                                     }
                                                 }
-                                            }
-                                            Some(EditSelection::Wire { from, to }) => {
-                                                ui.separator();
-                                                ui.label("Selected wire");
-                                                ui.monospace(format!("from {:?}", from));
-                                                ui.monospace(format!("to   {:?}", to));
-                                            }
-                                            _ => {}
-                                        }
+                                            });
+                                        ui.separator();
+                                        ui.label("All Components");
+                                        egui::ScrollArea::vertical()
+                                            .id_salt("all-components-scroll")
+                                            .max_height(all_components_height)
+                                            .auto_shrink([false, false])
+                                            .show(ui, |ui| {
+                                                for component_id in &all_components {
+                                                    let Some(entry) = document.component(*component_id) else {
+                                                        continue;
+                                                    };
+                                                    let gate_count = document
+                                                        .plan(entry.plan)
+                                                        .map(|plan| plan.gates.len())
+                                                        .unwrap_or(0);
+                                                    let direct_instances = child_counts
+                                                        .iter()
+                                                        .find(|(candidate, _)| candidate == component_id)
+                                                        .map(|(_, count)| *count)
+                                                        .unwrap_or(0);
+                                                    let label = format!(
+                                                        "Def {} | {} gates | {} direct here | {} children",
+                                                        component_id.0,
+                                                        gate_count,
+                                                        direct_instances,
+                                                        entry.children.len()
+                                                    );
+                                                    if ui.selectable_label(*component_id == active, label).clicked() {
+                                                        viewer.focus_edit_component(*component_id);
+                                                        viewer.reset_camera();
+                                                        viewer.rebuild_scene(runtime.as_ref(), &document, None)
+                                                            .expect("component scene should rebuild");
+                                                        upload_viewer_scene(&mut scene_renderer, device, queue, &viewer);
+                                                    }
+                                                }
+                                            });
                                     }
                                 });
                         }
@@ -1099,7 +1088,6 @@ struct ViewerState {
     edit_hover_world: Option<egui::Pos2>,
     edit_interaction: EditInteractionState,
     run_focus_node: circuits_game::gate_plans::NodeId,
-    child_ids: Vec<circuits_game::gate_plans::NodeId>,
     scene: FocusedScene,
     viewport: ViewportState,
     edit_available_size: egui::Vec2,
@@ -1138,7 +1126,6 @@ impl ViewerState {
             edit_hover_world: None,
             edit_interaction: EditInteractionState::default(),
             run_focus_node: circuits_game::gate_plans::NodeId(0),
-            child_ids: Vec::new(),
             scene: document.build_edit_scene(
                 document.root,
                 &ViewportState::default(),
@@ -1251,7 +1238,6 @@ impl ViewerState {
             runtime.words_per_buffer,
         )
         .map_err(|error| format!("failed to rebuild focused scene: {error:?}"))?;
-        self.child_ids = child_ids_of(&runtime.root, self.run_focus_node);
         Ok(())
     }
 
@@ -1272,7 +1258,6 @@ impl ViewerState {
         self.selected_edit_target = None;
         self.edit_hover_world = None;
         self.edit_interaction.clear();
-        self.child_ids.clear();
         self.rebuild_edit_scene(document, None)?;
         self.reset_camera();
         Ok(())
@@ -1313,26 +1298,24 @@ impl ViewerState {
         self.edit_interaction.clear();
     }
 
+    fn focus_edit_component(&mut self, component: ComponentDefId) {
+        if let Some(index) = self.edit_focus_stack.iter().position(|entry| *entry == component) {
+            self.pop_edit_focus_to(index + 1);
+        } else {
+            self.edit_focus_stack.clear();
+            self.edit_focus_stack.push(component);
+            self.selected_edit_target = None;
+            self.edit_hover_world = None;
+            self.edit_interaction.clear();
+        }
+    }
+
     fn select_edit_child(&mut self, child: Option<ChildId>) {
         self.selected_edit_target = child.map(EditSelection::Child);
     }
 
-    fn selected_edit_child(&self) -> Option<ChildId> {
-        match self.selected_edit_target {
-            Some(EditSelection::Child(child)) => Some(child),
-            _ => None,
-        }
-    }
-
     fn select_edit_gate(&mut self, gate: Option<GateId>) {
         self.selected_edit_target = gate.map(EditSelection::Gate);
-    }
-
-    fn selected_edit_gate(&self) -> Option<GateId> {
-        match self.selected_edit_target {
-            Some(EditSelection::Gate(gate)) => Some(gate),
-            _ => None,
-        }
     }
 
     fn select_edit_wire(&mut self, wire: Option<(WireEndpoint, WireEndpoint)>) {
@@ -1440,6 +1423,39 @@ impl ViewerState {
 
 fn count_components(root: &Component) -> u64 {
     1 + root.children.iter().map(count_components).sum::<u64>()
+}
+
+fn component_child_counts(
+    document: &EditorDocument,
+    parent: ComponentDefId,
+) -> Vec<(ComponentDefId, usize)> {
+    let direct_counts = document
+        .component(parent)
+        .map(|component| {
+            component
+                .children
+                .iter()
+                .copied()
+                .fold(foldhash::HashMap::default(), |mut counts, child| {
+                    *counts.entry(child).or_insert(0usize) += 1;
+                    counts
+                })
+        })
+        .unwrap_or_default();
+    let mut components = direct_counts.into_iter().collect::<Vec<_>>();
+    components.sort_by_key(|(component_id, _)| component_id.0);
+    components
+}
+
+fn ordered_component_defs(document: &EditorDocument, active: ComponentDefId) -> Vec<ComponentDefId> {
+    let mut components = document
+        .components
+        .iter()
+        .enumerate()
+        .map(|(index, _)| ComponentDefId(index))
+        .collect::<Vec<_>>();
+    components.sort_by_key(|component_id| (*component_id != active, component_id.0));
+    components
 }
 
 fn count_gates(root: &Component, plans: &ComponentPlans) -> Result<u64, String> {
