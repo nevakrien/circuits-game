@@ -60,6 +60,18 @@ impl ChildPlacement {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GatePlacement {
+    pub gate: GateId,
+    pub min: [u32; 2],
+}
+
+impl GatePlacement {
+    pub const fn at(gate: GateId, min: [u32; 2]) -> Self {
+        Self { gate, min }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WireEndpoint {
     GateOutput(GateId),
@@ -86,6 +98,7 @@ pub struct WireLayout {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ComponentLayout {
+    pub gate_placements: Vec<GatePlacement>,
     pub child_placements: Vec<ChildPlacement>,
     pub wires: Vec<WireLayout>,
 }
@@ -93,6 +106,11 @@ pub struct ComponentLayout {
 impl ComponentLayout {
     pub fn with_child_placements(mut self, child_placements: Vec<ChildPlacement>) -> Self {
         self.child_placements = child_placements;
+        self
+    }
+
+    pub fn with_gate_placements(mut self, gate_placements: Vec<GatePlacement>) -> Self {
+        self.gate_placements = gate_placements;
         self
     }
 

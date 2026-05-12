@@ -6,13 +6,13 @@ use crate::{
     editor::{ComponentDefId, EditableComponentDef, EditorDocument},
     gate_plans::{
         AncestorDepth, ChildId, ChildInputConnection, ChildPlacement, ComponentLayout,
-        ComponentPlan, ComponentPort, Gate, GateId, PlanId, PortId, PortLocation, SignalRef,
-        WireEndpoint, WireLayout, WirePoint,
+        ComponentPlan, ComponentPort, Gate, GateId, GatePlacement, PlanId, PortId, PortLocation,
+        SignalRef, WireEndpoint, WireLayout, WirePoint,
     },
 };
 
 const MAGIC: [u8; 4] = *b"CGDF";
-const VERSION: u16 = 2;
+const VERSION: u16 = 3;
 const SECTION_PLANS: [u8; 4] = *b"PLNS";
 const SECTION_COMPONENTS: [u8; 4] = *b"CMPS";
 const SECTION_ROOT: [u8; 4] = *b"ROOT";
@@ -178,11 +178,12 @@ pub fn decode_document(bytes: &[u8]) -> Result<EditorDocument, DocumentFormatErr
         plans_section.ok_or(DocumentFormatError::MissingSection { tag: SECTION_PLANS })?,
         version,
     )?;
-    let components = decode_components(components_section.ok_or(
-        DocumentFormatError::MissingSection {
+    let components = decode_components(
+        components_section.ok_or(DocumentFormatError::MissingSection {
             tag: SECTION_COMPONENTS,
-        },
-    )?)?;
+        })?,
+        version,
+    )?;
     let root = decode_root(
         root_section.ok_or(DocumentFormatError::MissingSection { tag: SECTION_ROOT })?,
     )?;
@@ -236,6 +237,19 @@ fn encode_components(
             put_u32(out, connection.child.0);
             put_u32(out, connection.input.0);
             encode_signal_ref(out, connection.src);
+        }
+
+        put_u32(
+            out,
+            as_u32(
+                component.layout.gate_placements.len(),
+                "gate placement count",
+            )?,
+        );
+        for placement in &component.layout.gate_placements {
+            put_u32(out, placement.gate.0);
+            put_u32(out, placement.min[0]);
+            put_u32(out, placement.min[1]);
         }
 
         put_u32(
@@ -300,6 +314,7 @@ fn decode_plans(
 
 fn decode_components(
     mut reader: Reader<'_>,
+    version: u16,
 ) -> Result<Vec<EditableComponentDef>, DocumentFormatError> {
     let component_count = reader.read_u32("component count")?;
     let mut components = Vec::with_capacity(component_count as usize);
@@ -322,6 +337,21 @@ fn decode_components(
                 input: PortId(reader.read_u32("child connection input port id")?),
                 src: decode_signal_ref(&mut reader)?,
             });
+        }
+
+        let mut gate_placements = Vec::new();
+        if version >= 3 {
+            let placement_count = reader.read_u32("gate placement count")?;
+            gate_placements = Vec::with_capacity(placement_count as usize);
+            for _ in 0..placement_count {
+                gate_placements.push(GatePlacement::at(
+                    GateId(reader.read_u32("gate placement gate id")?),
+                    [
+                        reader.read_u32("gate placement x")?,
+                        reader.read_u32("gate placement y")?,
+                    ],
+                ));
+            }
         }
 
         let placement_count = reader.read_u32("child placement count")?;
@@ -355,6 +385,7 @@ fn decode_components(
             child_input_connections,
             dangling_wires: Vec::new(),
             layout: ComponentLayout {
+                gate_placements,
                 child_placements,
                 wires,
             },
@@ -1019,6 +1050,7 @@ mod tests {
                 .read_bytes(SIGNAL_REF_SIZE, "child connection signal ref")
                 .expect("child connection signal ref should decode");
         }
+        skip_gate_placements(&mut reader);
         let placement_count = reader
             .read_u32("child placement count")
             .expect("placement count should decode");
@@ -1026,7 +1058,7 @@ mod tests {
             placement_count >= 1,
             "sample document should have a child placement"
         );
-        let offset = reader.pos;
+        let offset = reader.absolute_offset();
         offset
     }
 
@@ -1056,6 +1088,7 @@ mod tests {
                 .read_bytes(SIGNAL_REF_SIZE, "child connection signal ref")
                 .expect("child connection signal ref should decode");
         }
+        skip_gate_placements(reader);
         let placement_count = reader
             .read_u32("child placement count")
             .expect("placement count should decode");
@@ -1084,6 +1117,23 @@ mod tests {
                     .read_i32("wire bend y")
                     .expect("wire bend y should decode");
             }
+        }
+    }
+
+    fn skip_gate_placements(reader: &mut Reader<'_>) {
+        let placement_count = reader
+            .read_u32("gate placement count")
+            .expect("gate placement count should decode");
+        for _ in 0..placement_count {
+            reader
+                .read_u32("gate placement gate id")
+                .expect("gate placement gate id should decode");
+            reader
+                .read_u32("gate placement x")
+                .expect("gate placement x should decode");
+            reader
+                .read_u32("gate placement y")
+                .expect("gate placement y should decode");
         }
     }
 

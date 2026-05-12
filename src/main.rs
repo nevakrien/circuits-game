@@ -89,6 +89,115 @@ fn upload_drag_preview_if_needed(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppliedEditDocumentAction {
+    NoChange,
+    Rejected,
+    RefreshScene,
+    SelectChild(ChildId),
+    SelectGate(GateId),
+    SelectWire(WireEndpoint, WireEndpoint),
+}
+
+fn apply_edit_document_action(
+    document: &mut EditorDocument,
+    active_component: ComponentDefId,
+    action: EditSceneAction,
+) -> AppliedEditDocumentAction {
+    match action {
+        EditSceneAction::MoveChild { child, delta_cells } => {
+            match document.move_child_by(active_component, child, delta_cells) {
+                Ok(true) => AppliedEditDocumentAction::SelectChild(child),
+                Ok(false) => AppliedEditDocumentAction::NoChange,
+                Err(_) => AppliedEditDocumentAction::Rejected,
+            }
+        }
+        EditSceneAction::MoveGate { gate, delta_cells } => {
+            match document.move_gate_by(active_component, gate, delta_cells) {
+                Ok(true) => AppliedEditDocumentAction::SelectGate(gate),
+                Ok(false) => AppliedEditDocumentAction::NoChange,
+                Err(_) => AppliedEditDocumentAction::Rejected,
+            }
+        }
+        EditSceneAction::MoveWireBend {
+            from,
+            to,
+            bend_index,
+            point,
+        } => match document.move_wire_bend_to(active_component, from, to, bend_index, point) {
+            Ok(true) => AppliedEditDocumentAction::SelectWire(from, to),
+            Ok(false) => AppliedEditDocumentAction::NoChange,
+            Err(_) => AppliedEditDocumentAction::Rejected,
+        },
+        EditSceneAction::InsertWireBend {
+            from,
+            to,
+            bend_index,
+            point,
+        } => match document.insert_wire_bend(active_component, from, to, bend_index, point) {
+            Ok(Some(_)) => AppliedEditDocumentAction::SelectWire(from, to),
+            Ok(None) => AppliedEditDocumentAction::Rejected,
+            Err(_) => AppliedEditDocumentAction::Rejected,
+        },
+        EditSceneAction::RewireWireSource { from, to, new_from } => {
+            match document.rewire_source_endpoint(active_component, from, to, new_from) {
+                Ok(Some(_)) => AppliedEditDocumentAction::SelectWire(new_from, to),
+                Ok(None) => AppliedEditDocumentAction::NoChange,
+                Err(_) => AppliedEditDocumentAction::Rejected,
+            }
+        }
+        EditSceneAction::RewireWireTarget { from, to, new_to } => {
+            match document.rewire_target_endpoint(active_component, from, to, new_to) {
+                Ok(Some(_)) => AppliedEditDocumentAction::SelectWire(from, new_to),
+                Ok(None) => AppliedEditDocumentAction::NoChange,
+                Err(_) => AppliedEditDocumentAction::Rejected,
+            }
+        }
+        EditSceneAction::ConnectWire { from, to } => {
+            match document.connect_wire(active_component, from, to) {
+                Ok(Some(_)) => AppliedEditDocumentAction::SelectWire(from, to),
+                Ok(None) => AppliedEditDocumentAction::NoChange,
+                Err(_) => AppliedEditDocumentAction::Rejected,
+            }
+        }
+        EditSceneAction::CreateDanglingWire { from, point } => {
+            match document.create_dangling_wire(active_component, from, point) {
+                Ok(true) => AppliedEditDocumentAction::RefreshScene,
+                Ok(false) => AppliedEditDocumentAction::NoChange,
+                Err(_) => AppliedEditDocumentAction::Rejected,
+            }
+        }
+        EditSceneAction::MoveDanglingWire {
+            from,
+            from_point,
+            to_point,
+        } => match document.move_dangling_wire(active_component, from, from_point, to_point) {
+            Ok(true) => AppliedEditDocumentAction::RefreshScene,
+            Ok(false) => AppliedEditDocumentAction::NoChange,
+            Err(_) => AppliedEditDocumentAction::Rejected,
+        },
+        EditSceneAction::ConnectDanglingWire { from, point, to } => {
+            match document.connect_dangling_wire(active_component, from, point, to) {
+                Ok(Some(_)) => AppliedEditDocumentAction::SelectWire(from, to),
+                Ok(None) => AppliedEditDocumentAction::NoChange,
+                Err(_) => AppliedEditDocumentAction::Rejected,
+            }
+        }
+        EditSceneAction::DetachWire { from, to, point } => {
+            match document.detach_wire(active_component, from, to, point) {
+                Ok(true) => AppliedEditDocumentAction::RefreshScene,
+                Ok(false) => AppliedEditDocumentAction::NoChange,
+                Err(_) => AppliedEditDocumentAction::Rejected,
+            }
+        }
+        EditSceneAction::ClearSelection
+        | EditSceneAction::FocusChild(_)
+        | EditSceneAction::SelectChild(_)
+        | EditSceneAction::SelectGate(_)
+        | EditSceneAction::SelectWire { .. } => AppliedEditDocumentAction::NoChange,
+    }
+}
+
 fn draw_edit_selection_overlay(ui: &egui::Ui, viewer: &ViewerState, viewport_rect: egui::Rect) {
     let Some(selection) = viewer.selected_edit_target else {
         return;
@@ -490,7 +599,8 @@ async fn run() {
                                     ));
                                 });
                             }
-                            ui.label("Drag child blocks to move them, middle-drag or WASD/arrow keys to pan, ctrl/cmd+wheel or trackpad pinch to zoom, double-click child blocks to drill into them.");
+                            ui.label("Drag child blocks to move them. Drag wire targets off inputs to leave dangling wires; drag source ports or dangling wire ends onto inputs to connect.");
+                            ui.label("Middle-drag or WASD/arrow keys to pan, ctrl/cmd+wheel or trackpad pinch to zoom, double-click child blocks to drill into them.");
                             ui.label("Hotkeys: E edit mode, R run mode, ctrl/cmd+z undo, ctrl/cmd+y redo, T step, F fast, P pause, Space single-step.");
                         });
 
@@ -605,6 +715,7 @@ async fn run() {
                                 let hover_changed = viewer.edit_hover_world != hover_world;
                                 viewer.edit_hover_world = hover_world;
                                 let mut scene_rebuilt = false;
+                                let was_dragging = viewer.edit_interaction.is_dragging();
                                 let action = if viewer.is_editing() {
                                     interact_edit_scene(
                                         &viewer.scene,
@@ -641,33 +752,44 @@ async fn run() {
                                             }
                                         }
                                         EditSceneAction::MoveChild { child, delta_cells } => {
-                                            if viewer.is_editing()
-                                                && document
-                                                    .move_child_by(viewer.active_edit_component(), child, delta_cells)
-                                                    .expect("drag move should succeed")
-                                            {
-                                                viewer.select_edit_child(Some(child));
-                                                rebuild_and_upload_viewer_scene(
-                                                    &mut scene_renderer,
-                                                    device,
-                                                    queue,
-                                                    &mut viewer,
-                                                    runtime.as_ref(),
-                                                    &document,
-                                                    hover_world,
-                                                )
-                                                .expect("scene should rebuild after drag move");
-                                                scene_rebuilt = true;
+                                            if viewer.is_editing() {
+                                                match apply_edit_document_action(
+                                                    &mut document,
+                                                    viewer.active_edit_component(),
+                                                    EditSceneAction::MoveChild { child, delta_cells },
+                                                ) {
+                                                    AppliedEditDocumentAction::SelectChild(child) => {
+                                                        viewer.select_edit_child(Some(child));
+                                                        rebuild_and_upload_viewer_scene(
+                                                            &mut scene_renderer,
+                                                            device,
+                                                            queue,
+                                                            &mut viewer,
+                                                            runtime.as_ref(),
+                                                            &document,
+                                                            hover_world,
+                                                        )
+                                                        .expect("scene should rebuild after drag move");
+                                                        scene_rebuilt = true;
+                                                    }
+                                                    AppliedEditDocumentAction::Rejected => {
+                                                        viewer.edit_interaction.clear()
+                                                    }
+                                                    AppliedEditDocumentAction::NoChange
+                                                    | AppliedEditDocumentAction::RefreshScene
+                                                    | AppliedEditDocumentAction::SelectGate(_)
+                                                    | AppliedEditDocumentAction::SelectWire(_, _) => {}
+                                                }
                                             }
                                         }
                                         EditSceneAction::MoveGate { gate, delta_cells } => {
                                             if viewer.is_editing() {
-                                                match document.move_gate_by(
+                                                match apply_edit_document_action(
+                                                    &mut document,
                                                     viewer.active_edit_component(),
-                                                    gate,
-                                                    delta_cells,
+                                                    EditSceneAction::MoveGate { gate, delta_cells },
                                                 ) {
-                                                    Ok(true) => {
+                                                    AppliedEditDocumentAction::SelectGate(gate) => {
                                                         if rebuild_and_upload_viewer_scene(
                                                             &mut scene_renderer,
                                                             device,
@@ -683,10 +805,15 @@ async fn run() {
                                                         scene_rebuilt = true;
                                                     } else {
                                                         viewer.edit_interaction.clear();
+                                                        }
                                                     }
+                                                    AppliedEditDocumentAction::Rejected => {
+                                                        viewer.edit_interaction.clear()
                                                     }
-                                                    Ok(false) => {}
-                                                    Err(_) => viewer.edit_interaction.clear(),
+                                                    AppliedEditDocumentAction::NoChange
+                                                    | AppliedEditDocumentAction::RefreshScene
+                                                    | AppliedEditDocumentAction::SelectChild(_)
+                                                    | AppliedEditDocumentAction::SelectWire(_, _) => {}
                                                 }
                                             }
                                         }
@@ -697,14 +824,17 @@ async fn run() {
                                             point,
                                         } => {
                                             if viewer.is_editing() {
-                                                match document.move_wire_bend_to(
+                                                match apply_edit_document_action(
+                                                    &mut document,
                                                     viewer.active_edit_component(),
-                                                    from,
-                                                    to,
-                                                    bend_index,
-                                                    point,
+                                                    EditSceneAction::MoveWireBend {
+                                                        from,
+                                                        to,
+                                                        bend_index,
+                                                        point,
+                                                    },
                                                 ) {
-                                                    Ok(true) => {
+                                                    AppliedEditDocumentAction::SelectWire(from, to) => {
                                                         if rebuild_and_upload_viewer_scene(
                                                             &mut scene_renderer,
                                                             device,
@@ -720,10 +850,15 @@ async fn run() {
                                                         scene_rebuilt = true;
                                                     } else {
                                                         viewer.edit_interaction.clear();
+                                                        }
                                                     }
+                                                    AppliedEditDocumentAction::Rejected => {
+                                                        viewer.edit_interaction.clear()
                                                     }
-                                                    Ok(false) => {}
-                                                    Err(_) => viewer.edit_interaction.clear(),
+                                                    AppliedEditDocumentAction::NoChange
+                                                    | AppliedEditDocumentAction::RefreshScene
+                                                    | AppliedEditDocumentAction::SelectChild(_)
+                                                    | AppliedEditDocumentAction::SelectGate(_) => {}
                                                 }
                                             }
                                         }
@@ -734,14 +869,17 @@ async fn run() {
                                             point,
                                         } => {
                                             if viewer.is_editing() {
-                                                match document.insert_wire_bend(
+                                                match apply_edit_document_action(
+                                                    &mut document,
                                                     viewer.active_edit_component(),
-                                                    from,
-                                                    to,
-                                                    bend_index,
-                                                    point,
+                                                    EditSceneAction::InsertWireBend {
+                                                        from,
+                                                        to,
+                                                        bend_index,
+                                                        point,
+                                                    },
                                                 ) {
-                                                    Ok(Some(_)) => {
+                                                    AppliedEditDocumentAction::SelectWire(from, to) => {
                                                         if rebuild_and_upload_viewer_scene(
                                                             &mut scene_renderer,
                                                             device,
@@ -757,22 +895,26 @@ async fn run() {
                                                         scene_rebuilt = true;
                                                     } else {
                                                         viewer.edit_interaction.clear();
+                                                        }
                                                     }
+                                                    AppliedEditDocumentAction::Rejected => {
+                                                        viewer.edit_interaction.clear()
                                                     }
-                                                    Ok(None) => viewer.edit_interaction.clear(),
-                                                    Err(_) => viewer.edit_interaction.clear(),
+                                                    AppliedEditDocumentAction::NoChange
+                                                    | AppliedEditDocumentAction::RefreshScene
+                                                    | AppliedEditDocumentAction::SelectChild(_)
+                                                    | AppliedEditDocumentAction::SelectGate(_) => {}
                                                 }
                                             }
                                         }
                                         EditSceneAction::RewireWireSource { from, to, new_from } => {
                                             if viewer.is_editing() {
-                                                match document.rewire_source_endpoint(
+                                                match apply_edit_document_action(
+                                                    &mut document,
                                                     viewer.active_edit_component(),
-                                                    from,
-                                                    to,
-                                                    new_from,
+                                                    EditSceneAction::RewireWireSource { from, to, new_from },
                                                 ) {
-                                                    Ok(Some(_)) => {
+                                                    AppliedEditDocumentAction::SelectWire(new_from, to) => {
                                                         if rebuild_and_upload_viewer_scene(
                                                             &mut scene_renderer,
                                                             device,
@@ -790,20 +932,24 @@ async fn run() {
                                                             viewer.edit_interaction.clear();
                                                         }
                                                     }
-                                                    Ok(None) => {}
-                                                    Err(_) => viewer.edit_interaction.clear(),
+                                                    AppliedEditDocumentAction::Rejected => {
+                                                        viewer.edit_interaction.clear()
+                                                    }
+                                                    AppliedEditDocumentAction::NoChange
+                                                    | AppliedEditDocumentAction::RefreshScene
+                                                    | AppliedEditDocumentAction::SelectChild(_)
+                                                    | AppliedEditDocumentAction::SelectGate(_) => {}
                                                 }
                                             }
                                         }
                                         EditSceneAction::RewireWireTarget { from, to, new_to } => {
                                             if viewer.is_editing() {
-                                                match document.rewire_target_endpoint(
+                                                match apply_edit_document_action(
+                                                    &mut document,
                                                     viewer.active_edit_component(),
-                                                    from,
-                                                    to,
-                                                    new_to,
+                                                    EditSceneAction::RewireWireTarget { from, to, new_to },
                                                 ) {
-                                                    Ok(Some(_)) => {
+                                                    AppliedEditDocumentAction::SelectWire(from, new_to) => {
                                                         if rebuild_and_upload_viewer_scene(
                                                             &mut scene_renderer,
                                                             device,
@@ -821,8 +967,86 @@ async fn run() {
                                                             viewer.edit_interaction.clear();
                                                         }
                                                     }
-                                                    Ok(None) => {}
-                                                    Err(_) => viewer.edit_interaction.clear(),
+                                                    AppliedEditDocumentAction::Rejected => {
+                                                        viewer.edit_interaction.clear()
+                                                    }
+                                                    AppliedEditDocumentAction::NoChange
+                                                    | AppliedEditDocumentAction::RefreshScene
+                                                    | AppliedEditDocumentAction::SelectChild(_)
+                                                    | AppliedEditDocumentAction::SelectGate(_) => {}
+                                                }
+                                            }
+                                        }
+                                        EditSceneAction::ConnectWire { .. }
+                                        | EditSceneAction::ConnectDanglingWire { .. } => {
+                                            if viewer.is_editing() {
+                                                match apply_edit_document_action(
+                                                    &mut document,
+                                                    viewer.active_edit_component(),
+                                                    action,
+                                                ) {
+                                                    AppliedEditDocumentAction::SelectWire(from, to) => {
+                                                        if rebuild_and_upload_viewer_scene(
+                                                            &mut scene_renderer,
+                                                            device,
+                                                            queue,
+                                                            &mut viewer,
+                                                            runtime.as_ref(),
+                                                            &document,
+                                                            hover_world,
+                                                        )
+                                                        .is_ok()
+                                                        {
+                                                            viewer.select_edit_wire(Some((from, to)));
+                                                            scene_rebuilt = true;
+                                                        } else {
+                                                            viewer.edit_interaction.clear();
+                                                        }
+                                                    }
+                                                    AppliedEditDocumentAction::Rejected => {
+                                                        viewer.edit_interaction.clear()
+                                                    }
+                                                    AppliedEditDocumentAction::NoChange
+                                                    | AppliedEditDocumentAction::RefreshScene
+                                                    | AppliedEditDocumentAction::SelectChild(_)
+                                                    | AppliedEditDocumentAction::SelectGate(_) => {}
+                                                }
+                                            }
+                                        }
+                                        EditSceneAction::CreateDanglingWire { .. }
+                                        | EditSceneAction::MoveDanglingWire { .. }
+                                        | EditSceneAction::DetachWire { .. } => {
+                                            if viewer.is_editing() {
+                                                match apply_edit_document_action(
+                                                    &mut document,
+                                                    viewer.active_edit_component(),
+                                                    action,
+                                                ) {
+                                                    AppliedEditDocumentAction::RefreshScene => {
+                                                        if rebuild_and_upload_viewer_scene(
+                                                            &mut scene_renderer,
+                                                            device,
+                                                            queue,
+                                                            &mut viewer,
+                                                            runtime.as_ref(),
+                                                            &document,
+                                                            hover_world,
+                                                        )
+                                                        .is_ok()
+                                                        {
+                                                            viewer.clear_edit_selection();
+                                                            scene_rebuilt = true;
+                                                        } else {
+                                                            viewer.edit_interaction.clear();
+                                                        }
+                                                    }
+                                                    AppliedEditDocumentAction::Rejected => {
+                                                        viewer.edit_interaction.clear()
+                                                    }
+                                                    AppliedEditDocumentAction::NoChange
+                                                    | AppliedEditDocumentAction::SelectChild(_)
+                                                    | AppliedEditDocumentAction::SelectGate(_)
+                                                    | AppliedEditDocumentAction::SelectWire(_, _) => {}
                                                 }
                                             }
                                         }
@@ -846,6 +1070,23 @@ async fn run() {
                                             scene_rebuilt = true;
                                         }
                                     }
+                                }
+                                if viewer.is_editing()
+                                    && was_dragging
+                                    && viewport_output.primary_drag_stopped
+                                    && !scene_rebuilt
+                                {
+                                    rebuild_and_upload_viewer_scene(
+                                        &mut scene_renderer,
+                                        device,
+                                        queue,
+                                        &mut viewer,
+                                        runtime.as_ref(),
+                                        &document,
+                                        hover_world,
+                                    )
+                                    .expect("scene should rebuild after cancelled drag");
+                                    scene_rebuilt = true;
                                 }
                                 if viewer.is_editing() && !scene_rebuilt {
                                     if viewer.edit_interaction.is_dragging() {
@@ -1299,7 +1540,11 @@ impl ViewerState {
     }
 
     fn focus_edit_component(&mut self, component: ComponentDefId) {
-        if let Some(index) = self.edit_focus_stack.iter().position(|entry| *entry == component) {
+        if let Some(index) = self
+            .edit_focus_stack
+            .iter()
+            .position(|entry| *entry == component)
+        {
             self.pop_edit_focus_to(index + 1);
         } else {
             self.edit_focus_stack.clear();
@@ -1432,14 +1677,13 @@ fn component_child_counts(
     let direct_counts = document
         .component(parent)
         .map(|component| {
-            component
-                .children
-                .iter()
-                .copied()
-                .fold(foldhash::HashMap::default(), |mut counts, child| {
+            component.children.iter().copied().fold(
+                foldhash::HashMap::default(),
+                |mut counts, child| {
                     *counts.entry(child).or_insert(0usize) += 1;
                     counts
-                })
+                },
+            )
         })
         .unwrap_or_default();
     let mut components = direct_counts.into_iter().collect::<Vec<_>>();
@@ -1447,7 +1691,10 @@ fn component_child_counts(
     components
 }
 
-fn ordered_component_defs(document: &EditorDocument, active: ComponentDefId) -> Vec<ComponentDefId> {
+fn ordered_component_defs(
+    document: &EditorDocument,
+    active: ComponentDefId,
+) -> Vec<ComponentDefId> {
     let mut components = document
         .components
         .iter()
@@ -1754,5 +2001,100 @@ fn port_named(id: PortId, gate: u32, x: u16, y: u16, label: &'static str) -> Com
         gate: GateId(gate),
         location: PortLocation { x, y },
         label: Some(label.to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_edit_document_action_rejects_overlapping_child_move() {
+        let mut document = small_overlap_document();
+
+        let result = apply_edit_document_action(
+            &mut document,
+            ComponentDefId(2),
+            EditSceneAction::MoveChild {
+                child: ChildId(1),
+                delta_cells: [-4, -2],
+            },
+        );
+
+        assert_eq!(result, AppliedEditDocumentAction::Rejected);
+        assert_eq!(
+            document
+                .component(ComponentDefId(2))
+                .unwrap()
+                .layout
+                .child_placements,
+            vec![ChildPlacement::at([0, 0]), ChildPlacement::at([4, 2])]
+        );
+    }
+
+    #[test]
+    fn apply_edit_document_action_does_not_commit_wire_release_off_endpoint() {
+        let mut document = build_starter_demo_circuit().document;
+
+        let result = apply_edit_document_action(
+            &mut document,
+            ComponentDefId(1),
+            EditSceneAction::RewireWireSource {
+                from: WireEndpoint::GateOutput(GateId(0)),
+                to: WireEndpoint::GateInput {
+                    gate: GateId(2),
+                    input: 0,
+                },
+                new_from: WireEndpoint::GateOutput(GateId(0)),
+            },
+        );
+
+        assert_eq!(result, AppliedEditDocumentAction::NoChange);
+    }
+
+    fn small_overlap_document() -> EditorDocument {
+        let child_plan = PlanId(0);
+        let root_plan = PlanId(1);
+        let mut plans = foldhash::HashMap::default();
+        plans.insert(
+            child_plan,
+            ComponentPlan::new(vec![Gate::BitNot { src: this_ref(0) }]).with_grid_size([2, 3]),
+        );
+        plans.insert(
+            root_plan,
+            ComponentPlan::new(Vec::new()).with_grid_size([8, 8]),
+        );
+
+        EditorDocument::new(
+            plans,
+            vec![
+                EditableComponentDef {
+                    plan: child_plan,
+                    children: Vec::new(),
+                    child_input_connections: Vec::new(),
+                    dangling_wires: Vec::new(),
+                    layout: ComponentLayout::default(),
+                },
+                EditableComponentDef {
+                    plan: child_plan,
+                    children: Vec::new(),
+                    child_input_connections: Vec::new(),
+                    dangling_wires: Vec::new(),
+                    layout: ComponentLayout::default(),
+                },
+                EditableComponentDef {
+                    plan: root_plan,
+                    children: vec![ComponentDefId(0), ComponentDefId(1)],
+                    child_input_connections: Vec::new(),
+                    dangling_wires: Vec::new(),
+                    layout: ComponentLayout::default().with_child_placements(vec![
+                        ChildPlacement::at([0, 0]),
+                        ChildPlacement::at([4, 2]),
+                    ]),
+                },
+            ],
+            ComponentDefId(2),
+        )
+        .expect("small overlap document should build")
     }
 }

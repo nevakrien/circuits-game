@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 
 MAGIC = b"CGDF"
-VERSION = 2
+VERSION = 3
 
 
 class DecodeError(Exception):
@@ -246,6 +246,12 @@ def write_section(writer: Writer, tag: bytes, payload: bytes) -> None:
     writer.put(payload)
 
 
+def default_gate_placement(gate_id: int, grid: list[int]) -> dict:
+    width = max(grid[0], 1)
+    height = max(grid[1], 1)
+    return {"gate": gate_id, "min": [gate_id % width, min(gate_id // width, height - 1)]}
+
+
 def decode_document(path: str) -> dict:
     with open(path, "rb") as f:
         data = f.read()
@@ -254,7 +260,7 @@ def decode_document(path: str) -> dict:
     if reader.take(4, "magic") != MAGIC:
         raise DecodeError("not a CGDF file")
     version = reader.u16("version")
-    if version not in (1, VERSION):
+    if version < 1 or version > VERSION:
         raise DecodeError(f"unsupported version {version}")
     reader.u16("reserved")
     section_count = reader.u32("section count")
@@ -293,6 +299,7 @@ def decode_document(path: str) -> dict:
             "plan": components_reader.u32("component plan id"),
             "children": [],
             "child_input_connections": [],
+            "gate_placements": [],
             "child_placements": [],
             "wires": [],
         }
@@ -307,6 +314,18 @@ def decode_document(path: str) -> dict:
                     "src": read_signal_ref(components_reader),
                 }
             )
+        if version >= 3:
+            placement_count = components_reader.u32("gate placement count")
+            for _ in range(placement_count):
+                component["gate_placements"].append(
+                    {
+                        "gate": components_reader.u32("gate placement gate id"),
+                        "min": [
+                            components_reader.u32("gate placement x"),
+                            components_reader.u32("gate placement y"),
+                        ],
+                    }
+                )
         placement_count = components_reader.u32("child placement count")
         for _ in range(placement_count):
             component["child_placements"].append(
@@ -326,6 +345,16 @@ def decode_document(path: str) -> dict:
                 )
             component["wires"].append(wire)
         components.append(component)
+
+    plans_by_id = {plan["id"]: plan for plan in plans}
+    for component in components:
+        if component["gate_placements"]:
+            continue
+        plan = plans_by_id[component["plan"]]
+        component["gate_placements"] = [
+            default_gate_placement(gate["id"], plan["grid"])
+            for gate in sorted(plan["gates"], key=lambda gate: gate["id"])
+        ]
 
     root_reader = sections["ROOT"]
     root = root_reader.u32("root component id")
@@ -370,6 +399,12 @@ def encode_document(document: dict) -> bytes:
             components.u32(connection["child"])
             components.u32(connection["input"])
             write_signal_ref(components, connection["src"])
+
+        components.u32(len(component.get("gate_placements", [])))
+        for placement in component.get("gate_placements", []):
+            components.u32(placement["gate"])
+            components.u32(placement["min"][0])
+            components.u32(placement["min"][1])
 
         components.u32(len(component["child_placements"]))
         for x, y in component["child_placements"]:

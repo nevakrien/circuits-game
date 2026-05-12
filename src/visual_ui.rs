@@ -4,8 +4,8 @@ use rayon::prelude::*;
 use std::sync::Arc;
 
 use crate::gate_plans::{
-    ChildId, ChildPlacement, CompileError, Component, ComponentPlans, Gate, GateId,
-    GateStoreLocation, NodeId, PortId, PortLocation, SignalRef, WireEndpoint, WireLayout,
+    ChildId, ChildPlacement, CompileError, Component, ComponentLayout, ComponentPlans, Gate,
+    GateId, GateStoreLocation, NodeId, PortId, PortLocation, SignalRef, WireEndpoint, WireLayout,
     WirePoint,
 };
 use crate::ui_config::{CELL, CHILD_PORT_INSET, PAD};
@@ -183,8 +183,9 @@ fn build_focused_scene_with_index(
         .ordered_gates()
         .into_par_iter()
         .map(|(gate_id, gate)| {
-            let gx = gate_id.0 % grid_dims[0];
-            let gy = gate_id.0 / grid_dims[0];
+            let placement = gate_placement(&focus.layout, gate_id, grid_dims);
+            let gx = placement[0];
+            let gy = placement[1];
             let min = grid_rect.min + Vec2::new(gx as f32 * CELL, gy as f32 * CELL);
             let input_sources = gate.input_refs().map(|source| {
                 source.and_then(|signal| source_gate_of_ref(focus, signal, &ctx, plans, by_id).ok())
@@ -520,6 +521,19 @@ fn child_rect_from_placement(
     let footprint = Rect::from_min_size(min, Vec2::new(width as f32 * CELL, height as f32 * CELL));
     let scaled_size = footprint.size() * CHILD_FOOTPRINT_FILL;
     Rect::from_center_size(footprint.center(), scaled_size)
+}
+
+fn gate_placement(layout: &ComponentLayout, gate: GateId, grid_dims: [u32; 2]) -> [u32; 2] {
+    layout
+        .gate_placements
+        .iter()
+        .find(|placement| placement.gate == gate)
+        .map(|placement| placement.min)
+        .unwrap_or_else(|| {
+            let width = grid_dims[0].max(1);
+            let height = grid_dims[1].max(1);
+            [gate.0 % width, (gate.0 / width).min(height - 1)]
+        })
 }
 
 fn gate_anchor(rect: Rect, gate: Gate, input: Option<usize>) -> Pos2 {

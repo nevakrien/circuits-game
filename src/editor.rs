@@ -5,8 +5,8 @@ use foldhash::{HashMap, HashSet};
 
 use crate::gate_plans::{
     AncestorDepth, ChildId, ChildInputConnection, ChildPlacement, Component, ComponentLayout,
-    ComponentPlan, ComponentPlans, Gate, GateId, NodeId, PlanId, PortId, PortLocation, SignalRef,
-    WireEndpoint, WireLayout, WirePoint,
+    ComponentPlan, ComponentPlans, Gate, GateId, GatePlacement, NodeId, PlanId, PortId,
+    PortLocation, SignalRef, WireEndpoint, WireLayout, WirePoint,
 };
 use crate::ui_config::{CELL, CHILD_PORT_INSET, PAD};
 use crate::visual_ui::{
@@ -247,6 +247,8 @@ impl EditorDocument {
                     component.layout.child_placements.len()
                 ));
             }
+            self.validate_gate_placements(ComponentDefId(component_id))?;
+            self.validate_child_placements(ComponentDefId(component_id))?;
             self.validate_component_wires(ComponentDefId(component_id))?;
         }
         self.components
@@ -382,15 +384,16 @@ impl EditorDocument {
         }
         let width = plan.grid_size[0].max(1) as i32;
         let height = plan.grid_size[1].max(1) as i32;
-        let from_x = gate.0 as i32 % width;
-        let from_y = gate.0 as i32 / width;
+        let from_placement = gate_placement(&editable.layout, gate, plan.grid_size);
+        let from_x = from_placement.min[0] as i32;
+        let from_y = from_placement.min[1] as i32;
         let target_x = (from_x + delta[0]).clamp(0, width.saturating_sub(1));
         let target_y = (from_y + delta[1]).clamp(0, height.saturating_sub(1));
-        let target_index = (target_y.saturating_mul(width) + target_x) as u32;
-        if target_index == gate.0 {
+        let target_min = [target_x as u32, target_y as u32];
+        if target_min == from_placement.min {
             return Ok(false);
         }
-        let command = self.move_gate_command(editable.plan, gate, GateId(target_index))?;
+        let command = self.move_gate_command(component, editable.plan, gate, target_min)?;
         self.apply_command(EditorCommand::Batch(BatchCommand { commands: command }))?;
         Ok(true)
     }
@@ -545,6 +548,156 @@ impl EditorDocument {
         Ok(Some((new_from, new_to)))
     }
 
+    pub fn connect_wire(
+        &mut self,
+        component: ComponentDefId,
+        from: WireEndpoint,
+        to: WireEndpoint,
+    ) -> Result<Option<(WireEndpoint, WireEndpoint)>, String> {
+        let Some(signal) = signal_ref_from_wire_endpoint(from) else {
+            return Ok(None);
+        };
+        let (plan_id, mut after_plan) = self.plan_for_component(component)?;
+        let before_plan = after_plan.clone();
+        let before_component = self
+            .component(component)
+            .cloned()
+            .ok_or_else(|| format!("missing component {:?}", component))?;
+        let mut after_component = before_component.clone();
+        if optional_target_signal_ref(&after_plan, &after_component, to).ok() == Some(Some(signal))
+        {
+            return Ok(None);
+        }
+        if assign_target_source(&mut after_plan, &mut after_component, to, signal).is_err() {
+            return Ok(None);
+        }
+        self.apply_plan_component_edits(
+            vec![(plan_id, before_plan, after_plan)],
+            vec![(component, before_component, after_component)],
+        )?;
+        Ok(Some((from, to)))
+    }
+
+    pub fn create_dangling_wire(
+        &mut self,
+        component: ComponentDefId,
+        from: WireEndpoint,
+        point: WirePoint,
+    ) -> Result<bool, String> {
+        let Some(src) = signal_ref_from_wire_endpoint(from) else {
+            return Ok(false);
+        };
+        let before_component = self
+            .component(component)
+            .cloned()
+            .ok_or_else(|| format!("missing component {:?}", component))?;
+        let mut after_component = before_component.clone();
+        after_component
+            .dangling_wires
+            .push(DanglingWire { src, target: point });
+        self.apply_component_edit(component, before_component, after_component)?;
+        Ok(true)
+    }
+
+    pub fn move_dangling_wire(
+        &mut self,
+        component: ComponentDefId,
+        from: WireEndpoint,
+        from_point: WirePoint,
+        to_point: WirePoint,
+    ) -> Result<bool, String> {
+        if from_point == to_point {
+            return Ok(false);
+        }
+        let Some(src) = signal_ref_from_wire_endpoint(from) else {
+            return Ok(false);
+        };
+        let before_component = self
+            .component(component)
+            .cloned()
+            .ok_or_else(|| format!("missing component {:?}", component))?;
+        let mut after_component = before_component.clone();
+        let Some(wire) = after_component
+            .dangling_wires
+            .iter_mut()
+            .find(|wire| wire.src == src && wire.target == from_point)
+        else {
+            return Ok(false);
+        };
+        wire.target = to_point;
+        self.apply_component_edit(component, before_component, after_component)?;
+        Ok(true)
+    }
+
+    pub fn connect_dangling_wire(
+        &mut self,
+        component: ComponentDefId,
+        from: WireEndpoint,
+        point: WirePoint,
+        to: WireEndpoint,
+    ) -> Result<Option<(WireEndpoint, WireEndpoint)>, String> {
+        let Some(signal) = signal_ref_from_wire_endpoint(from) else {
+            return Ok(None);
+        };
+        let (plan_id, mut after_plan) = self.plan_for_component(component)?;
+        let before_plan = after_plan.clone();
+        let before_component = self
+            .component(component)
+            .cloned()
+            .ok_or_else(|| format!("missing component {:?}", component))?;
+        let mut after_component = before_component.clone();
+        let Some(index) = after_component
+            .dangling_wires
+            .iter()
+            .position(|wire| wire.src == signal && wire.target == point)
+        else {
+            return Ok(None);
+        };
+        if assign_target_source(&mut after_plan, &mut after_component, to, signal).is_err() {
+            return Ok(None);
+        }
+        after_component.dangling_wires.remove(index);
+        self.apply_plan_component_edits(
+            vec![(plan_id, before_plan, after_plan)],
+            vec![(component, before_component, after_component)],
+        )?;
+        Ok(Some((from, to)))
+    }
+
+    pub fn detach_wire(
+        &mut self,
+        component: ComponentDefId,
+        from: WireEndpoint,
+        to: WireEndpoint,
+        point: WirePoint,
+    ) -> Result<bool, String> {
+        let (plan_id, mut after_plan) = self.plan_for_component(component)?;
+        let before_plan = after_plan.clone();
+        let before_component = self
+            .component(component)
+            .cloned()
+            .ok_or_else(|| format!("missing component {:?}", component))?;
+        let mut after_component = before_component.clone();
+        let Ok(current_signal) = target_signal_ref(&after_plan, &after_component, to) else {
+            return Ok(false);
+        };
+        if signal_to_wire_endpoint(current_signal) != from {
+            return Ok(false);
+        }
+        if clear_target_source(&mut after_plan, &mut after_component, to).is_err() {
+            return Ok(false);
+        }
+        after_component.dangling_wires.push(DanglingWire {
+            src: current_signal,
+            target: point,
+        });
+        self.apply_plan_component_edits(
+            vec![(plan_id, before_plan, after_plan)],
+            vec![(component, before_component, after_component)],
+        )?;
+        Ok(true)
+    }
+
     fn move_child_command(
         &self,
         component: ComponentDefId,
@@ -561,23 +714,13 @@ impl EditorDocument {
             .get(child.0 as usize)
             .ok_or_else(|| format!("missing child placement {:?}", child))?;
         let mut after_component = before_component.clone();
-        let detached_wires = self.detached_child_dangling_wires(component, child, from)?;
         let slot = after_component
             .layout
             .child_placements
             .get_mut(child.0 as usize)
             .ok_or_else(|| format!("missing child placement {:?}", child))?;
         *slot = to;
-        after_component
-            .child_input_connections
-            .retain(|connection| connection.child != child);
-        after_component.dangling_wires.extend(detached_wires);
-        let (reattached, retained_dangling) =
-            self.auto_attach_child_inputs(component, child, to, &after_component.dangling_wires)?;
-        after_component.dangling_wires = retained_dangling;
-        after_component.child_input_connections.extend(reattached);
-        after_component.layout.wires =
-            self.refreshed_component_wires(component, &after_component)?;
+        self.validate_child_placements_for_component(component, &after_component)?;
         Ok(MoveChildCommand {
             component,
             child,
@@ -590,38 +733,35 @@ impl EditorDocument {
 
     fn move_gate_command(
         &self,
+        component: ComponentDefId,
         plan_id: PlanId,
-        from: GateId,
-        to: GateId,
+        gate: GateId,
+        to: [u32; 2],
     ) -> Result<Vec<EditorCommand>, String> {
-        let before_plan = self
+        let plan = self
             .plan(plan_id)
-            .cloned()
             .ok_or_else(|| format!("missing plan {:?}", plan_id))?;
-        let width = before_plan.grid_size[0].max(1);
-        let height = before_plan.grid_size[1].max(1);
-        let max_gate_id = width.saturating_mul(height);
-        if from.0 >= max_gate_id || to.0 >= max_gate_id {
-            return Err(format!("gate move {:?} -> {:?} is out of range", from, to));
+        if to[0] >= plan.grid_size[0].max(1) || to[1] >= plan.grid_size[1].max(1) {
+            return Err(format!("gate move {:?} -> {:?} is out of range", gate, to));
         }
-        if !before_plan.gates.contains_key(&from) {
-            return Err(format!("missing gate {:?}", from));
+        if !plan.gates.contains_key(&gate) {
+            return Err(format!("missing gate {:?}", gate));
         }
-        let mut after_plan = before_plan.clone();
-        let moved_gate = after_plan
-            .gates
-            .remove(&from)
-            .ok_or_else(|| format!("missing gate {:?}", from))?;
-        let displaced_gate = after_plan.gates.remove(&to);
-        after_plan.gates.insert(to, moved_gate);
-        if let Some(displaced_gate) = displaced_gate {
-            after_plan.gates.insert(from, displaced_gate);
+        let before_component = self
+            .component(component)
+            .cloned()
+            .ok_or_else(|| format!("missing component {:?}", component))?;
+        let mut after_component = before_component.clone();
+        let from = gate_placement(&after_component.layout, gate, plan.grid_size).min;
+        set_gate_placement(&mut after_component.layout, gate, to);
+        if let Some(displaced_gate) = gate_at_layout_position(&after_component.layout, gate, to) {
+            set_gate_placement(&mut after_component.layout, displaced_gate, from);
         }
-        Ok(vec![EditorCommand::EditPlan(PlanEditCommand {
-            changes: vec![PlanStateChange {
-                plan: plan_id,
-                before: before_plan,
-                after: after_plan,
+        Ok(vec![EditorCommand::EditComponent(ComponentEditCommand {
+            changes: vec![ComponentStateChange {
+                component,
+                before: before_component,
+                after: after_component,
             }],
         })])
     }
@@ -786,8 +926,9 @@ impl EditorDocument {
             .ordered_gates()
             .into_iter()
             .map(|(gate_id, gate)| {
-                let gx = gate_id.0 % grid_dims[0].max(1);
-                let gy = gate_id.0 / grid_dims[0].max(1);
+                let placement = gate_placement(&component.layout, gate_id, grid_dims);
+                let gx = placement.min[0];
+                let gy = placement.min[1];
                 let min = grid_rect.min + Vec2::new(gx as f32 * CELL, gy as f32 * CELL);
                 let input_sources = gate.input_refs().map(|source| {
                     source.and_then(|signal| source_gate_of_ref(focused, signal, &ctx, self).ok())
@@ -1053,153 +1194,6 @@ impl EditorDocument {
         }
 
         Ok(changed)
-    }
-
-    fn refreshed_component_wires(
-        &self,
-        component_id: ComponentDefId,
-        next_component: &EditableComponentDef,
-    ) -> Result<Vec<WireLayout>, String> {
-        let mut temp = self.clone();
-        let previous_component = temp
-            .components
-            .get_mut(component_id.0)
-            .ok_or_else(|| format!("missing component {:?}", component_id))?;
-        *previous_component = next_component.clone();
-        let ctx = VisualCtx {
-            parent_stack: &[],
-            child_defs: &next_component.children,
-        };
-        let expected = temp.expected_component_wires(component_id, &ctx)?;
-        let preserved: HashMap<_, _> = next_component
-            .layout
-            .wires
-            .iter()
-            .cloned()
-            .map(|wire| ((wire.from, wire.to), wire))
-            .collect();
-        Ok(expected
-            .into_iter()
-            .map(|wire| {
-                preserved
-                    .get(&(wire.layout.from, wire.layout.to))
-                    .cloned()
-                    .unwrap_or(wire.layout)
-            })
-            .collect())
-    }
-
-    fn auto_attach_child_inputs(
-        &self,
-        component_id: ComponentDefId,
-        child_id: ChildId,
-        placement: ChildPlacement,
-        dangling_wires: &[DanglingWire],
-    ) -> Result<(Vec<ChildInputConnection>, Vec<DanglingWire>), String> {
-        let mut temp = self.clone();
-        let component = temp
-            .components
-            .get_mut(component_id.0)
-            .ok_or_else(|| format!("missing component {:?}", component_id))?;
-        let slot = component
-            .layout
-            .child_placements
-            .get_mut(child_id.0 as usize)
-            .ok_or_else(|| format!("missing child placement {:?}", child_id))?;
-        *slot = placement;
-        component
-            .child_input_connections
-            .retain(|connection| connection.child != child_id);
-        component.dangling_wires = dangling_wires.to_vec();
-
-        let scene = temp.build_edit_probe_scene(component_id)?;
-        let target_child = scene
-            .children
-            .get(child_id.0 as usize)
-            .ok_or_else(|| format!("missing child scene {:?}", child_id))?;
-        let mut connections = Vec::new();
-        let mut remaining_dangling = dangling_wires.to_vec();
-        let mut used_wire_indices = HashSet::default();
-        for port in &target_child.inputs {
-            let best_match = remaining_dangling
-                .iter()
-                .enumerate()
-                .filter_map(|(index, wire)| {
-                    (!used_wire_indices.contains(&index)).then_some((
-                        index,
-                        wire.src,
-                        port.anchor.distance(local_wire_point_to_pos(&wire.target)),
-                    ))
-                })
-                .filter(|(_, src, _)| {
-                    !matches!(
-                        src,
-                        SignalRef::ChildOutput {
-                            child: source_child,
-                            ..
-                        } if *source_child == child_id
-                    )
-                })
-                .filter(|(_, _, distance)| *distance <= CELL * 0.35)
-                .min_by(|a, b| a.2.total_cmp(&b.2));
-            if let Some((wire_index, src, _)) = best_match {
-                used_wire_indices.insert(wire_index);
-                connections.push(ChildInputConnection {
-                    child: child_id,
-                    input: port.id,
-                    src,
-                });
-            }
-        }
-        remaining_dangling = remaining_dangling
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, wire)| (!used_wire_indices.contains(&index)).then_some(wire))
-            .collect();
-        connections.sort_by_key(|connection| connection.input.0);
-        Ok((connections, remaining_dangling))
-    }
-
-    fn detached_child_dangling_wires(
-        &self,
-        component_id: ComponentDefId,
-        child_id: ChildId,
-        placement: ChildPlacement,
-    ) -> Result<Vec<DanglingWire>, String> {
-        let mut temp = self.clone();
-        let component = temp
-            .components
-            .get_mut(component_id.0)
-            .ok_or_else(|| format!("missing component {:?}", component_id))?;
-        let slot = component
-            .layout
-            .child_placements
-            .get_mut(child_id.0 as usize)
-            .ok_or_else(|| format!("missing child placement {:?}", child_id))?;
-        *slot = placement;
-        let scene = temp.build_edit_probe_scene(component_id)?;
-        let target_child = scene
-            .children
-            .get(child_id.0 as usize)
-            .ok_or_else(|| format!("missing child scene {:?}", child_id))?;
-        let editable = self
-            .component(component_id)
-            .ok_or_else(|| format!("missing component {:?}", component_id))?;
-        Ok(editable
-            .child_input_connections
-            .iter()
-            .filter(|connection| connection.child == child_id)
-            .filter_map(|connection| {
-                target_child
-                    .inputs
-                    .iter()
-                    .find(|port| port.id == connection.input)
-                    .map(|port| DanglingWire {
-                        src: connection.src,
-                        target: pos_to_wire_point(port.anchor),
-                    })
-            })
-            .collect())
     }
 }
 
@@ -1480,6 +1474,48 @@ fn child_rect_from_placement(
     Rect::from_center_size(footprint.center(), scaled_size)
 }
 
+fn gate_placement(layout: &ComponentLayout, gate: GateId, grid_dims: [u32; 2]) -> GatePlacement {
+    layout
+        .gate_placements
+        .iter()
+        .find(|placement| placement.gate == gate)
+        .copied()
+        .unwrap_or_else(|| default_gate_placement(gate, grid_dims))
+}
+
+fn default_gate_placement(gate: GateId, grid_dims: [u32; 2]) -> GatePlacement {
+    let width = grid_dims[0].max(1);
+    let height = grid_dims[1].max(1);
+    GatePlacement::at(gate, [gate.0 % width, (gate.0 / width).min(height - 1)])
+}
+
+fn set_gate_placement(layout: &mut ComponentLayout, gate: GateId, min: [u32; 2]) {
+    if let Some(placement) = layout
+        .gate_placements
+        .iter_mut()
+        .find(|placement| placement.gate == gate)
+    {
+        placement.min = min;
+    } else {
+        layout.gate_placements.push(GatePlacement::at(gate, min));
+        layout
+            .gate_placements
+            .sort_by_key(|placement| placement.gate.0);
+    }
+}
+
+fn gate_at_layout_position(
+    layout: &ComponentLayout,
+    exclude: GateId,
+    min: [u32; 2],
+) -> Option<GateId> {
+    layout
+        .gate_placements
+        .iter()
+        .find(|placement| placement.gate != exclude && placement.min == min)
+        .map(|placement| placement.gate)
+}
+
 fn effective_child_grid_size(grid_dims: [u32; 2], child_dims: [u32; 2]) -> [u32; 2] {
     if child_dims[0] >= grid_dims[0] || child_dims[1] >= grid_dims[1] {
         [(grid_dims[0] / 2).max(1), (grid_dims[1] / 2).max(1)]
@@ -1558,6 +1594,19 @@ impl EditorDocument {
         let component_ids: Vec<_> = (0..self.components.len()).map(ComponentDefId).collect();
 
         for component_id in component_ids.iter().copied() {
+            let inferred = self.infer_missing_gate_placements(component_id)?;
+            let component = self
+                .components
+                .get_mut(component_id.0)
+                .ok_or_else(|| format!("missing component {:?}", component_id))?;
+            component.layout.gate_placements.extend(inferred);
+            component
+                .layout
+                .gate_placements
+                .sort_by_key(|placement| placement.gate.0);
+        }
+
+        for component_id in component_ids.iter().copied() {
             let inferred = self.infer_missing_child_placements(component_id)?;
             let component = self
                 .components
@@ -1592,6 +1641,39 @@ impl EditorDocument {
         }
 
         Ok(())
+    }
+
+    fn infer_missing_gate_placements(
+        &self,
+        component_id: ComponentDefId,
+    ) -> Result<Vec<GatePlacement>, String> {
+        let component = self
+            .component(component_id)
+            .ok_or_else(|| format!("missing component {:?}", component_id))?;
+        let plan = self
+            .plan(component.plan)
+            .ok_or_else(|| format!("missing plan {:?}", component.plan))?;
+        let mut seen = HashSet::default();
+        for placement in &component.layout.gate_placements {
+            if !plan.gates.contains_key(&placement.gate) {
+                return Err(format!(
+                    "component {:?} has placement for missing gate {:?}",
+                    component_id, placement.gate
+                ));
+            }
+            if !seen.insert(placement.gate) {
+                return Err(format!(
+                    "component {:?} contains duplicate placement for gate {:?}",
+                    component_id, placement.gate
+                ));
+            }
+        }
+        Ok(plan
+            .ordered_gates()
+            .into_iter()
+            .filter(|(gate, _)| !seen.contains(gate))
+            .map(|(gate, _)| default_gate_placement(gate, plan.grid_size))
+            .collect())
     }
 
     fn infer_missing_child_placements(
@@ -1682,6 +1764,108 @@ impl EditorDocument {
                     component_id, wire.from, wire.to
                 ));
             }
+        }
+        Ok(())
+    }
+
+    fn validate_child_placements(&self, component_id: ComponentDefId) -> Result<(), String> {
+        let component = self
+            .component(component_id)
+            .ok_or_else(|| format!("missing component {:?}", component_id))?;
+        self.validate_child_placements_for_component(component_id, component)
+    }
+
+    fn validate_gate_placements(&self, component_id: ComponentDefId) -> Result<(), String> {
+        let component = self
+            .component(component_id)
+            .ok_or_else(|| format!("missing component {:?}", component_id))?;
+        let plan = self
+            .plan(component.plan)
+            .ok_or_else(|| format!("missing plan {:?}", component.plan))?;
+        let mut gates = HashSet::default();
+        let mut positions = HashSet::default();
+        for placement in &component.layout.gate_placements {
+            if !plan.gates.contains_key(&placement.gate) {
+                return Err(format!(
+                    "component {:?} has placement for missing gate {:?}",
+                    component_id, placement.gate
+                ));
+            }
+            if placement.min[0] >= plan.grid_size[0].max(1)
+                || placement.min[1] >= plan.grid_size[1].max(1)
+            {
+                return Err(format!(
+                    "component {:?} gate {:?} placement {:?} is outside grid {:?}",
+                    component_id, placement.gate, placement.min, plan.grid_size
+                ));
+            }
+            if !gates.insert(placement.gate) {
+                return Err(format!(
+                    "component {:?} contains duplicate placement for gate {:?}",
+                    component_id, placement.gate
+                ));
+            }
+            if !positions.insert(placement.min) {
+                return Err(format!(
+                    "component {:?} contains overlapping gate placement {:?}",
+                    component_id, placement.min
+                ));
+            }
+        }
+        for gate in plan.gates.keys() {
+            if !gates.contains(gate) {
+                return Err(format!(
+                    "component {:?} is missing placement for gate {:?}",
+                    component_id, gate
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_child_placements_for_component(
+        &self,
+        component_id: ComponentDefId,
+        component: &EditableComponentDef,
+    ) -> Result<(), String> {
+        let plan = self
+            .plan(component.plan)
+            .ok_or_else(|| format!("missing plan {:?}", component.plan))?;
+        let mut seen = Vec::with_capacity(component.layout.child_placements.len());
+        for (index, placement) in component.layout.child_placements.iter().enumerate() {
+            let child_id = ChildId(index as u32);
+            let child_component = component
+                .children
+                .get(index)
+                .copied()
+                .ok_or_else(|| format!("missing child {:?}", child_id))?;
+            let child_plan = self
+                .component(child_component)
+                .and_then(|child| self.plan(child.plan))
+                .ok_or_else(|| format!("missing child plan for {:?}", child_component))?;
+            let dims = child_footprint_dims(plan.grid_size, child_plan.grid_size);
+            validate_child_placement_bounds(
+                component_id,
+                child_id,
+                *placement,
+                dims,
+                plan.grid_size,
+            )?;
+            for &(other_id, other_placement, other_dims) in &seen {
+                if placements_overlap(*placement, dims, other_placement, other_dims) {
+                    return Err(format!(
+                        "component {:?} child {:?} placement {:?} with footprint {:?} overlaps child {:?} at {:?} with footprint {:?}",
+                        component_id,
+                        child_id,
+                        placement.min,
+                        dims,
+                        other_id,
+                        other_placement.min,
+                        other_dims,
+                    ));
+                }
+            }
+            seen.push((child_id, *placement, dims));
         }
         Ok(())
     }
@@ -1782,7 +1966,7 @@ fn build_component_wires(
                     source_gate: source_gate_of_ref(component_id, dangling.src, ctx, doc).ok(),
                     color: palette_color(wires.len()),
                     points,
-                    from: None,
+                    from: Some(signal_to_wire_endpoint(dangling.src)),
                     to: None,
                     bends: Vec::new(),
                 });
@@ -1885,12 +2069,24 @@ fn assign_target_source(
             Ok(())
         }
         WireEndpoint::ChildInput { child, port } => {
-            let connection = component
+            if let Some(connection) = component
                 .child_input_connections
                 .iter_mut()
                 .find(|connection| connection.child == child && connection.input == port)
-                .ok_or_else(|| format!("missing child input {:?}:{:?}", child, port))?;
-            connection.src = source;
+            {
+                connection.src = source;
+            } else {
+                component
+                    .child_input_connections
+                    .push(ChildInputConnection {
+                        child,
+                        input: port,
+                        src: source,
+                    });
+                component
+                    .child_input_connections
+                    .sort_by_key(|connection| (connection.child.0, connection.input.0));
+            }
             Ok(())
         }
         WireEndpoint::ComponentOutput(port) => {
@@ -2275,35 +2471,6 @@ mod tests {
     const OUTPUT_Z: PortId = PortId(21);
 
     #[test]
-    fn auto_attach_does_not_snap_to_the_childs_own_outputs() {
-        let document = sample_document();
-        let component = document.component(ComponentDefId(1)).unwrap();
-        let placement = component.layout.child_placements[0];
-
-        let inferred = document
-            .auto_attach_child_inputs(
-                ComponentDefId(1),
-                ChildId(0),
-                placement,
-                &document
-                    .component(ComponentDefId(1))
-                    .unwrap()
-                    .dangling_wires,
-            )
-            .expect("current placement should infer child attachments");
-
-        assert!(inferred.0.iter().all(|connection| {
-            !matches!(
-                connection.src,
-                SignalRef::ChildOutput {
-                    child: ChildId(0),
-                    ..
-                }
-            )
-        }));
-    }
-
-    #[test]
     fn move_child_commands_round_trip_through_history() {
         let mut document = sample_document();
         let before = document.component(ComponentDefId(1)).unwrap().clone();
@@ -2339,8 +2506,9 @@ mod tests {
     }
 
     #[test]
-    fn move_child_detaches_into_dangling_wires_instead_of_deleting_connections() {
+    fn move_child_preserves_connections_instead_of_detaching() {
         let mut document = sample_document();
+        let before = document.component(ComponentDefId(1)).unwrap().clone();
 
         assert!(
             document
@@ -2349,48 +2517,114 @@ mod tests {
         );
 
         let component = document.component(ComponentDefId(1)).unwrap();
-        assert!(component.child_input_connections.is_empty());
-        assert_eq!(component.dangling_wires.len(), 2);
-        assert_eq!(
-            component
-                .dangling_wires
-                .iter()
-                .map(|wire| wire.src)
-                .collect::<Vec<_>>(),
-            vec![
-                SignalRef::ThisGate(GateId(0)),
-                SignalRef::ThisGate(GateId(1)),
-            ]
-        );
-    }
-
-    #[test]
-    fn move_child_back_onto_dangling_wires_reattaches_connections() {
-        let mut document = sample_document();
-        let original = document.component(ComponentDefId(1)).unwrap().clone();
-
-        assert!(
-            document
-                .move_child_by(ComponentDefId(1), ChildId(0), [-2, -2])
-                .expect("move away should succeed")
-        );
-        assert!(
-            document
-                .move_child_by(ComponentDefId(1), ChildId(0), [2, 2])
-                .expect("move back should succeed")
-        );
-
-        let component = document.component(ComponentDefId(1)).unwrap();
         assert_eq!(
             component.child_input_connections,
-            original.child_input_connections
+            before.child_input_connections
         );
         assert!(component.dangling_wires.is_empty());
     }
 
     #[test]
-    fn move_gate_moves_slot_contents_without_remapping_refs() {
+    fn detach_wire_creates_visible_dangling_wire() {
         let mut document = sample_document();
+
+        assert!(
+            document
+                .detach_wire(
+                    ComponentDefId(1),
+                    WireEndpoint::GateOutput(GateId(0)),
+                    WireEndpoint::ChildInput {
+                        child: ChildId(0),
+                        port: INPUT_A,
+                    },
+                    WirePoint { x: 7, y: 9 },
+                )
+                .expect("detach should succeed")
+        );
+
+        let component = document.component(ComponentDefId(1)).unwrap();
+        assert_eq!(component.child_input_connections.len(), 1);
+        assert_eq!(component.dangling_wires.len(), 1);
+        assert_eq!(
+            component.dangling_wires[0].src,
+            SignalRef::ThisGate(GateId(0))
+        );
+        assert_eq!(component.dangling_wires[0].target, WirePoint { x: 7, y: 9 });
+    }
+
+    #[test]
+    fn move_child_rejects_overlapping_full_child_footprints() {
+        let mut document = two_child_document();
+
+        let err = document
+            .move_child_by(ComponentDefId(3), ChildId(1), [0, -2])
+            .expect_err("overlapping move should be rejected");
+
+        assert!(err.contains("overlaps child"), "unexpected error: {err}");
+        assert_eq!(
+            document
+                .component(ComponentDefId(3))
+                .unwrap()
+                .layout
+                .child_placements,
+            vec![ChildPlacement::at([0, 0]), ChildPlacement::at([0, 2])]
+        );
+    }
+
+    #[test]
+    fn move_child_rejects_overlap_for_two_by_three_children_in_eight_by_eight_grid() {
+        let mut document = small_overlap_document();
+
+        let err = document
+            .move_child_by(ComponentDefId(2), ChildId(1), [-4, -2])
+            .expect_err("overlapping move should be rejected");
+
+        assert!(err.contains("overlaps child"), "unexpected error: {err}");
+        assert_eq!(
+            document
+                .component(ComponentDefId(2))
+                .unwrap()
+                .layout
+                .child_placements,
+            vec![ChildPlacement::at([0, 0]), ChildPlacement::at([4, 2])]
+        );
+    }
+
+    #[test]
+    fn document_validation_rejects_overlapping_child_footprints() {
+        let mut document = two_child_document();
+        let gate_placements = document.components[3].layout.gate_placements.clone();
+        document.components[3].layout = ComponentLayout::default()
+            .with_gate_placements(gate_placements)
+            .with_child_placements(vec![ChildPlacement::at([0, 0]), ChildPlacement::at([1, 0])]);
+
+        let err = document
+            .validate()
+            .expect_err("overlap should fail validation");
+
+        assert!(err.contains("overlaps child"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn document_validation_rejects_overlap_for_two_by_three_children_in_eight_by_eight_grid() {
+        let mut document = small_overlap_document();
+        let gate_placements = document.components[2].layout.gate_placements.clone();
+        document.components[2].layout = ComponentLayout::default()
+            .with_gate_placements(gate_placements)
+            .with_child_placements(vec![ChildPlacement::at([0, 0]), ChildPlacement::at([1, 1])]);
+
+        let err = document
+            .validate()
+            .expect_err("overlap should fail validation");
+
+        assert!(err.contains("overlaps child"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn move_gate_updates_layout_without_remapping_connections() {
+        let mut document = sample_document();
+        let before_plan = document.plan(PlanId(1)).unwrap().clone();
+        let before_component = document.component(ComponentDefId(1)).unwrap().clone();
 
         assert!(
             document
@@ -2399,29 +2633,25 @@ mod tests {
         );
 
         let plan = document.plan(PlanId(1)).unwrap();
-        assert!(matches!(
-            plan.gate(GateId(0)).unwrap(),
-            Gate::BitNop {
-                src: SignalRef::ThisGate(GateId(0))
-            }
-        ));
-        assert!(matches!(
-            plan.gate(GateId(1)).unwrap(),
-            Gate::BitNot {
-                src: SignalRef::ThisGate(GateId(0))
-            }
-        ));
+        assert_eq!(plan.grid_size, before_plan.grid_size);
+        assert_eq!(plan.gates, before_plan.gates);
+        assert_eq!(plan.inputs, before_plan.inputs);
+        assert_eq!(plan.outputs, before_plan.outputs);
         let component = document.component(ComponentDefId(1)).unwrap();
         assert_eq!(
+            component.child_input_connections,
+            before_component.child_input_connections
+        );
+        assert_eq!(component.layout.wires, before_component.layout.wires);
+        assert_eq!(
             component
-                .child_input_connections
+                .layout
+                .gate_placements
                 .iter()
-                .map(|connection| connection.src)
+                .filter(|placement| matches!(placement.gate, GateId(0) | GateId(1)))
+                .map(|placement| (placement.gate, placement.min))
                 .collect::<Vec<_>>(),
-            vec![
-                SignalRef::ThisGate(GateId(0)),
-                SignalRef::ThisGate(GateId(1))
-            ]
+            vec![(GateId(0), [1, 0]), (GateId(1), [0, 0])]
         );
     }
 
@@ -2665,6 +2895,105 @@ mod tests {
             ComponentDefId(1),
         )
         .expect("sample document should build")
+    }
+
+    fn two_child_document() -> EditorDocument {
+        let mut document = sample_document();
+        document.components.push(EditableComponentDef {
+            plan: PlanId(0),
+            children: Vec::new(),
+            child_input_connections: Vec::new(),
+            dangling_wires: Vec::new(),
+            layout: ComponentLayout::default(),
+        });
+        document.components.push(EditableComponentDef {
+            plan: PlanId(1),
+            children: vec![ComponentDefId(0), ComponentDefId(2)],
+            child_input_connections: vec![
+                ChildInputConnection {
+                    child: ChildId(0),
+                    input: INPUT_A,
+                    src: SignalRef::ThisGate(GateId(0)),
+                },
+                ChildInputConnection {
+                    child: ChildId(0),
+                    input: INPUT_B,
+                    src: SignalRef::ThisGate(GateId(1)),
+                },
+                ChildInputConnection {
+                    child: ChildId(1),
+                    input: INPUT_A,
+                    src: SignalRef::ThisGate(GateId(0)),
+                },
+                ChildInputConnection {
+                    child: ChildId(1),
+                    input: INPUT_B,
+                    src: SignalRef::ThisGate(GateId(1)),
+                },
+            ],
+            dangling_wires: Vec::new(),
+            layout: ComponentLayout::default().with_child_placements(vec![
+                ChildPlacement::at([0, 0]),
+                ChildPlacement::at([0, 2]),
+            ]),
+        });
+        document.root = ComponentDefId(3);
+        document
+            .repair_visual_layouts()
+            .expect("two-child document layout should repair");
+        document
+            .validate()
+            .expect("two-child document should validate");
+        document
+    }
+
+    fn small_overlap_document() -> EditorDocument {
+        let child_plan = PlanId(0);
+        let root_plan = PlanId(1);
+        let mut plans = HashMap::default();
+        plans.insert(
+            child_plan,
+            ComponentPlan::new(vec![Gate::BitNot {
+                src: SignalRef::ThisGate(GateId(0)),
+            }])
+            .with_grid_size([2, 3]),
+        );
+        plans.insert(
+            root_plan,
+            ComponentPlan::new(Vec::new()).with_grid_size([8, 8]),
+        );
+
+        EditorDocument::new(
+            plans,
+            vec![
+                EditableComponentDef {
+                    plan: child_plan,
+                    children: Vec::new(),
+                    child_input_connections: Vec::new(),
+                    dangling_wires: Vec::new(),
+                    layout: ComponentLayout::default(),
+                },
+                EditableComponentDef {
+                    plan: child_plan,
+                    children: Vec::new(),
+                    child_input_connections: Vec::new(),
+                    dangling_wires: Vec::new(),
+                    layout: ComponentLayout::default(),
+                },
+                EditableComponentDef {
+                    plan: root_plan,
+                    children: vec![ComponentDefId(0), ComponentDefId(1)],
+                    child_input_connections: Vec::new(),
+                    dangling_wires: Vec::new(),
+                    layout: ComponentLayout::default().with_child_placements(vec![
+                        ChildPlacement::at([0, 0]),
+                        ChildPlacement::at([4, 2]),
+                    ]),
+                },
+            ],
+            ComponentDefId(2),
+        )
+        .expect("small overlap document should build")
     }
 
     fn port(id: PortId, gate: u32, x: u16, y: u16, label: &str) -> ComponentPort {
