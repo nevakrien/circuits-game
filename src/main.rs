@@ -6,7 +6,9 @@ use std::{
 use circuits_game::{
     editor::{ComponentDefId, EditableComponentDef, EditorDocument},
     editor_interaction::{
-        EditInteractionState, EditSceneAction, apply_edit_scene_drag_preview, child_at_pointer,
+        EditInteractionState, EditSceneAction, EditScenePreviewChange,
+        apply_edit_scene_create_dangling_wire, apply_edit_scene_detach_wire,
+        apply_edit_scene_drag_preview, apply_edit_scene_move_dangling_wire, child_at_pointer,
         interact_edit_scene,
     },
     gate_plans::{
@@ -62,7 +64,10 @@ fn upload_viewer_scene(
     }
 }
 
-fn rebuild_and_upload_viewer_scene(
+// Slow path: rebuilds everything from the CPU model and re-uploads all GPU buffers.
+// Do NOT use for editor interactions (wire drag, detach, move, etc.) — use
+// upload_edit_scene_root_wires or another targeted mutation instead.
+fn slow_rebuild_and_upload_viewer_scene(
     scene_renderer: &mut SceneRenderer,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -84,8 +89,16 @@ fn upload_drag_preview_if_needed(
     pointer_world: Option<egui::Pos2>,
 ) {
     let interaction = viewer.edit_interaction;
-    if apply_edit_scene_drag_preview(&mut viewer.scene, &interaction, pointer_world) {
-        upload_viewer_scene(scene_renderer, device, queue, viewer);
+    match apply_edit_scene_drag_preview(&mut viewer.scene, &interaction, pointer_world) {
+        Some(EditScenePreviewChange::Wires) => {
+            if !scene_renderer.upload_edit_scene_root_wires(device, queue, &viewer.scene) {
+                upload_viewer_scene(scene_renderer, device, queue, viewer);
+            }
+        }
+        Some(EditScenePreviewChange::Scene) => {
+            upload_viewer_scene(scene_renderer, device, queue, viewer)
+        }
+        None => {}
     }
 }
 
@@ -183,13 +196,16 @@ fn apply_edit_document_action(
                 Err(_) => AppliedEditDocumentAction::Rejected,
             }
         }
-        EditSceneAction::DetachWire { from, to, point } => {
-            match document.detach_wire(active_component, from, to, point) {
-                Ok(true) => AppliedEditDocumentAction::RefreshScene,
-                Ok(false) => AppliedEditDocumentAction::NoChange,
-                Err(_) => AppliedEditDocumentAction::Rejected,
-            }
-        }
+        EditSceneAction::DetachWire {
+            from,
+            to,
+            point,
+            dangling_end,
+        } => match document.detach_wire(active_component, from, to, point, dangling_end) {
+            Ok(true) => AppliedEditDocumentAction::RefreshScene,
+            Ok(false) => AppliedEditDocumentAction::NoChange,
+            Err(_) => AppliedEditDocumentAction::Rejected,
+        },
         EditSceneAction::ClearSelection
         | EditSceneAction::FocusChild(_)
         | EditSceneAction::SelectChild(_)
@@ -760,7 +776,7 @@ async fn run() {
                                                 ) {
                                                     AppliedEditDocumentAction::SelectChild(child) => {
                                                         viewer.select_edit_child(Some(child));
-                                                        rebuild_and_upload_viewer_scene(
+                                                        slow_rebuild_and_upload_viewer_scene(
                                                             &mut scene_renderer,
                                                             device,
                                                             queue,
@@ -790,7 +806,7 @@ async fn run() {
                                                     EditSceneAction::MoveGate { gate, delta_cells },
                                                 ) {
                                                     AppliedEditDocumentAction::SelectGate(gate) => {
-                                                        if rebuild_and_upload_viewer_scene(
+                                                        if slow_rebuild_and_upload_viewer_scene(
                                                             &mut scene_renderer,
                                                             device,
                                                             queue,
@@ -835,7 +851,7 @@ async fn run() {
                                                     },
                                                 ) {
                                                     AppliedEditDocumentAction::SelectWire(from, to) => {
-                                                        if rebuild_and_upload_viewer_scene(
+                                                        if slow_rebuild_and_upload_viewer_scene(
                                                             &mut scene_renderer,
                                                             device,
                                                             queue,
@@ -880,7 +896,7 @@ async fn run() {
                                                     },
                                                 ) {
                                                     AppliedEditDocumentAction::SelectWire(from, to) => {
-                                                        if rebuild_and_upload_viewer_scene(
+                                                        if slow_rebuild_and_upload_viewer_scene(
                                                             &mut scene_renderer,
                                                             device,
                                                             queue,
@@ -915,7 +931,7 @@ async fn run() {
                                                     EditSceneAction::RewireWireSource { from, to, new_from },
                                                 ) {
                                                     AppliedEditDocumentAction::SelectWire(new_from, to) => {
-                                                        if rebuild_and_upload_viewer_scene(
+                                                        if slow_rebuild_and_upload_viewer_scene(
                                                             &mut scene_renderer,
                                                             device,
                                                             queue,
@@ -950,7 +966,7 @@ async fn run() {
                                                     EditSceneAction::RewireWireTarget { from, to, new_to },
                                                 ) {
                                                     AppliedEditDocumentAction::SelectWire(from, new_to) => {
-                                                        if rebuild_and_upload_viewer_scene(
+                                                        if slow_rebuild_and_upload_viewer_scene(
                                                             &mut scene_renderer,
                                                             device,
                                                             queue,
@@ -986,7 +1002,7 @@ async fn run() {
                                                     action,
                                                 ) {
                                                     AppliedEditDocumentAction::SelectWire(from, to) => {
-                                                        if rebuild_and_upload_viewer_scene(
+                                                        if slow_rebuild_and_upload_viewer_scene(
                                                             &mut scene_renderer,
                                                             device,
                                                             queue,
@@ -1023,7 +1039,49 @@ async fn run() {
                                                     action,
                                                 ) {
                                                     AppliedEditDocumentAction::RefreshScene => {
-                                                        if rebuild_and_upload_viewer_scene(
+                                                        let updated_without_rebuild = match action {
+                                                            EditSceneAction::CreateDanglingWire { from, point } => {
+                                                                apply_edit_scene_create_dangling_wire(
+                                                                    &mut viewer.scene,
+                                                                    from,
+                                                                    point,
+                                                                )
+                                                            }
+                                                            EditSceneAction::MoveDanglingWire { from, from_point, to_point } => {
+                                                                apply_edit_scene_move_dangling_wire(
+                                                                    &mut viewer.scene,
+                                                                    from,
+                                                                    from_point,
+                                                                    to_point,
+                                                                )
+                                                            }
+                                                            EditSceneAction::DetachWire { from, to, point, dangling_end } => {
+                                                                apply_edit_scene_detach_wire(
+                                                                    &mut viewer.scene,
+                                                                    from,
+                                                                    to,
+                                                                    point,
+                                                                    dangling_end,
+                                                                )
+                                                            }
+                                                            _ => false,
+                                                        };
+                                                        if updated_without_rebuild {
+                                                            if !scene_renderer.upload_edit_scene_root_wires(
+                                                                device,
+                                                                queue,
+                                                                &viewer.scene,
+                                                            ) {
+                                                                upload_viewer_scene(
+                                                                    &mut scene_renderer,
+                                                                    device,
+                                                                    queue,
+                                                                    &viewer,
+                                                                );
+                                                            }
+                                                            viewer.clear_edit_selection();
+                                                            scene_rebuilt = true;
+                                                        } else if slow_rebuild_and_upload_viewer_scene(
                                                             &mut scene_renderer,
                                                             device,
                                                             queue,
@@ -1057,7 +1115,7 @@ async fn run() {
                                                 viewer.focus_runtime_child(node);
                                             }
                                             viewer.reset_camera();
-                                            rebuild_and_upload_viewer_scene(
+                                            slow_rebuild_and_upload_viewer_scene(
                                                 &mut scene_renderer,
                                                 device,
                                                 queue,
@@ -1076,7 +1134,7 @@ async fn run() {
                                     && viewport_output.primary_drag_stopped
                                     && !scene_rebuilt
                                 {
-                                    rebuild_and_upload_viewer_scene(
+                                    slow_rebuild_and_upload_viewer_scene(
                                         &mut scene_renderer,
                                         device,
                                         queue,

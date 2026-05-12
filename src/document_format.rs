@@ -12,7 +12,7 @@ use crate::{
 };
 
 const MAGIC: [u8; 4] = *b"CGDF";
-const VERSION: u16 = 3;
+const VERSION: u16 = 4;
 const SECTION_PLANS: [u8; 4] = *b"PLNS";
 const SECTION_COMPONENTS: [u8; 4] = *b"CMPS";
 const SECTION_ROOT: [u8; 4] = *b"ROOT";
@@ -509,6 +509,13 @@ fn decode_ports(reader: &mut Reader<'_>) -> Result<Vec<ComponentPort>, DocumentF
 
 fn encode_signal_ref(out: &mut Vec<u8>, signal: SignalRef) {
     match signal {
+        SignalRef::Disconnected => {
+            put_u8(out, 0);
+            put_u8(out, 0);
+            put_u16(out, 0);
+            put_u32(out, 0);
+            put_u32(out, 0);
+        }
         SignalRef::ThisGate(gate) => {
             put_u8(out, 1);
             put_u8(out, 0);
@@ -548,6 +555,7 @@ fn decode_signal_ref(reader: &mut Reader<'_>) -> Result<SignalRef, DocumentForma
     let a = reader.read_u32("signal reference field a")?;
     let b = reader.read_u32("signal reference field b")?;
     match kind {
+        0 => Ok(SignalRef::Disconnected),
         1 => Ok(SignalRef::ThisGate(GateId(a))),
         2 => Ok(SignalRef::InputPort(PortId(a))),
         3 => Ok(SignalRef::ChildOutput {

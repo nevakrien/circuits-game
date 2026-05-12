@@ -179,6 +179,16 @@ struct SceneTransformKey {
     scale: u32,
 }
 
+impl SceneTransformKey {
+    fn identity() -> Self {
+        Self {
+            source_min: [0.0f32.to_bits(), 0.0f32.to_bits()],
+            target_min: [0.0f32.to_bits(), 0.0f32.to_bits()],
+            scale: 1.0f32.to_bits(),
+        }
+    }
+}
+
 struct UploadedEditSceneLevel {
     key: EditSceneLevelKey,
     clip_rect: Rect,
@@ -189,6 +199,15 @@ struct UploadedEditSceneLevel {
     child_frame_count: u32,
     wire_count: u32,
     words_per_buffer: u32,
+}
+
+#[derive(Clone, Copy)]
+struct EditSceneBufferDirty {
+    grid: bool,
+    gates: bool,
+    ports: bool,
+    child_frames: bool,
+    wires: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -428,6 +447,32 @@ impl SceneRenderer {
                 level,
             ));
         }
+    }
+
+    pub fn upload_edit_scene_root_wires(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: &FocusedScene,
+    ) -> bool {
+        let Some(level) = self.uploaded_edit_stack.first_mut() else {
+            return false;
+        };
+        if level.key.node != scene.node || level.key.transform != SceneTransformKey::identity() {
+            return false;
+        }
+
+        let wires = build_wire_instances(scene, SceneTransform::identity());
+        write_buffer_reuse(
+            device,
+            queue,
+            &mut level.buffers.wire_buffer,
+            WIRE_BUFFER_LABEL,
+            &wires,
+        );
+        level.key.wires = scene_wire_keys(scene);
+        level.wire_count = wires.len() as u32;
+        true
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1113,6 +1158,8 @@ fn upload_edit_scene_level(
     previous: Option<UploadedEditSceneLevel>,
     level: EditSceneLevelUpload<'_>,
 ) -> UploadedEditSceneLevel {
+    let dirty =
+        edit_scene_buffer_dirty(previous.as_ref().map(|previous| &previous.key), &level.key);
     let cached = build_scene_instances(level.scene, level.nested, level.transform);
     let mut buffers = previous
         .map(|level| level.buffers)
@@ -1128,41 +1175,51 @@ fn upload_edit_scene_level(
             ),
             wire_buffer: upload_buffer(device, queue, WIRE_BUFFER_LABEL, &[] as &[WireInstance]),
         });
-    write_buffer_reuse(
-        device,
-        queue,
-        &mut buffers.grid_buffer,
-        GRID_BUFFER_LABEL,
-        &cached.grids,
-    );
-    write_buffer_reuse(
-        device,
-        queue,
-        &mut buffers.gate_buffer,
-        GATE_BUFFER_LABEL,
-        &cached.gates,
-    );
-    write_buffer_reuse(
-        device,
-        queue,
-        &mut buffers.port_buffer,
-        PORT_BUFFER_LABEL,
-        &cached.ports,
-    );
-    write_buffer_reuse(
-        device,
-        queue,
-        &mut buffers.child_frame_buffer,
-        CHILD_FRAME_BUFFER_LABEL,
-        &cached.child_frames,
-    );
-    write_buffer_reuse(
-        device,
-        queue,
-        &mut buffers.wire_buffer,
-        WIRE_BUFFER_LABEL,
-        &cached.wires,
-    );
+    if dirty.grid {
+        write_buffer_reuse(
+            device,
+            queue,
+            &mut buffers.grid_buffer,
+            GRID_BUFFER_LABEL,
+            &cached.grids,
+        );
+    }
+    if dirty.gates {
+        write_buffer_reuse(
+            device,
+            queue,
+            &mut buffers.gate_buffer,
+            GATE_BUFFER_LABEL,
+            &cached.gates,
+        );
+    }
+    if dirty.ports {
+        write_buffer_reuse(
+            device,
+            queue,
+            &mut buffers.port_buffer,
+            PORT_BUFFER_LABEL,
+            &cached.ports,
+        );
+    }
+    if dirty.child_frames {
+        write_buffer_reuse(
+            device,
+            queue,
+            &mut buffers.child_frame_buffer,
+            CHILD_FRAME_BUFFER_LABEL,
+            &cached.child_frames,
+        );
+    }
+    if dirty.wires {
+        write_buffer_reuse(
+            device,
+            queue,
+            &mut buffers.wire_buffer,
+            WIRE_BUFFER_LABEL,
+            &cached.wires,
+        );
+    }
 
     UploadedEditSceneLevel {
         key: level.key,
@@ -1174,6 +1231,43 @@ fn upload_edit_scene_level(
         child_frame_count: cached.child_frames.len() as u32,
         wire_count: cached.wires.len() as u32,
         words_per_buffer: level.scene.words_per_buffer,
+    }
+}
+
+fn edit_scene_buffer_dirty(
+    previous: Option<&EditSceneLevelKey>,
+    next: &EditSceneLevelKey,
+) -> EditSceneBufferDirty {
+    let Some(previous) = previous else {
+        return EditSceneBufferDirty {
+            grid: true,
+            gates: true,
+            ports: true,
+            child_frames: true,
+            wires: true,
+        };
+    };
+
+    let transform_changed = previous.nested != next.nested || previous.transform != next.transform;
+    let grid_changed = transform_changed
+        || previous.node != next.node
+        || previous.bounds != next.bounds
+        || previous.grid_rect != next.grid_rect
+        || previous.grid_dims != next.grid_dims;
+    let gates_changed = transform_changed || previous.gates != next.gates;
+    let children_changed = previous.children != next.children;
+    let ports_changed = transform_changed
+        || previous.input_ports != next.input_ports
+        || previous.output_ports != next.output_ports
+        || previous.ancestor_ports != next.ancestor_ports
+        || previous.gates != next.gates
+        || children_changed;
+    EditSceneBufferDirty {
+        grid: grid_changed,
+        gates: gates_changed,
+        ports: ports_changed,
+        child_frames: transform_changed || children_changed,
+        wires: transform_changed || previous.wires != next.wires,
     }
 }
 
@@ -1260,15 +1354,7 @@ fn edit_scene_level_key(
                     .collect(),
             })
             .collect(),
-        wires: scene
-            .wires
-            .iter()
-            .map(|wire| SceneWireKey {
-                source_gate: wire.source_gate,
-                color: wire.color.to_array(),
-                points: wire.points.iter().map(|point| pos_key(*point)).collect(),
-            })
-            .collect(),
+        wires: scene_wire_keys(scene),
         nested,
         transform: SceneTransformKey {
             source_min: pos_key(transform.source_min),
@@ -1281,6 +1367,18 @@ fn edit_scene_level_key(
 
 fn pos_key(pos: Pos2) -> [u32; 2] {
     [pos.x.to_bits(), pos.y.to_bits()]
+}
+
+fn scene_wire_keys(scene: &FocusedScene) -> Vec<SceneWireKey> {
+    scene
+        .wires
+        .iter()
+        .map(|wire| SceneWireKey {
+            source_gate: wire.source_gate,
+            color: wire.color.to_array(),
+            points: wire.points.iter().map(|point| pos_key(*point)).collect(),
+        })
+        .collect()
 }
 
 struct CachedInstances {
@@ -1452,11 +1550,17 @@ fn build_scene_instances(
         }
     }
 
-    for wire in &scene.wires {
-        append_wire_instances(&mut cached.wires, scene, wire, transform);
-    }
+    cached.wires = build_wire_instances(scene, transform);
 
     cached
+}
+
+fn build_wire_instances(scene: &FocusedScene, transform: SceneTransform) -> Vec<WireInstance> {
+    let mut wires = Vec::new();
+    for wire in &scene.wires {
+        append_wire_instances(&mut wires, scene, wire, transform);
+    }
+    wires
 }
 
 fn append_wire_instances(
@@ -1819,8 +1923,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        gate_plans::{ChildId, GateId, PortId, PortLocation},
-        visual_ui::{FocusedScene, PlacedPort},
+        gate_plans::{ChildId, GateId, PortId, PortLocation, WireEndpoint},
+        visual_ui::{FocusedScene, PlacedPort, VisualWire},
     };
     use foldhash::HashMap;
 
@@ -1923,6 +2027,30 @@ mod tests {
         let after = edit_scene_level_key(&scene, false, SceneTransform::identity(), scene.bounds);
 
         assert!(before != after);
+    }
+
+    #[test]
+    fn wire_only_scene_change_marks_only_wire_buffer_dirty() {
+        let mut scene = test_scene(0, None, vec![]);
+        scene.wires.push(VisualWire {
+            source_gate: None,
+            color: Color32::WHITE,
+            points: vec![Pos2::new(10.0, 10.0), Pos2::new(20.0, 10.0)],
+            from: Some(WireEndpoint::GateOutput(GateId(0))),
+            to: None,
+            bends: Vec::new(),
+        });
+        let before = edit_scene_level_key(&scene, false, SceneTransform::identity(), scene.bounds);
+
+        scene.wires[0].points[1] = Pos2::new(24.0, 10.0);
+        let after = edit_scene_level_key(&scene, false, SceneTransform::identity(), scene.bounds);
+        let dirty = edit_scene_buffer_dirty(Some(&before), &after);
+
+        assert!(!dirty.grid);
+        assert!(!dirty.gates);
+        assert!(!dirty.ports);
+        assert!(!dirty.child_frames);
+        assert!(dirty.wires);
     }
 
     fn focused_scene_layer_order(scene: &FocusedScene) -> Vec<(NodeId, LayerKind)> {

@@ -122,6 +122,7 @@ impl ComponentLayout {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SignalRef {
+    Disconnected,
     ThisGate(GateId),
     InputPort(PortId),
     ChildOutput { child: ChildId, port: PortId },
@@ -1037,6 +1038,7 @@ fn resolve_gate_bits(
     compiler: &GateCompiler,
 ) -> Result<BitsIndex, CompileError> {
     match r {
+        SignalRef::Disconnected => Ok(compiler.zero_bit),
         SignalRef::ThisGate(gate) => Ok(resolved_gate_or_zero(compiler, node.id, gate)),
         SignalRef::InputPort(port) => {
             resolve_input_port_bits(node, from_gate, port, ctx, plans, by_id, compiler)
@@ -1321,6 +1323,7 @@ fn validate_gate_ref(
     by_id: &HashMap<NodeId, &Component>,
 ) -> Result<(), CompileError> {
     match r {
+        SignalRef::Disconnected => Ok(()),
         SignalRef::ThisGate(_) => Ok(()),
         SignalRef::InputPort(port) => {
             let node = by_id
@@ -1417,6 +1420,7 @@ fn collect_ref_usage(
                 validate_gate_ref(node.id, from_gate, r, &ctx, plans, by_id)?;
 
                 match r {
+                    SignalRef::Disconnected => {}
                     SignalRef::ThisGate(_) => {}
                     SignalRef::InputPort(port) => {
                         usage
@@ -1456,6 +1460,7 @@ fn collect_ref_usage(
                 by_id,
             )?;
             match connection.src {
+                SignalRef::Disconnected => {}
                 SignalRef::ThisGate(_) => {}
                 SignalRef::InputPort(port) => {
                     usage

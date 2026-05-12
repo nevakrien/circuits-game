@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 
 MAGIC = b"CGDF"
-VERSION = 3
+VERSION = 4
 
 
 class DecodeError(Exception):
@@ -98,6 +98,7 @@ def read_signal_ref(reader: Reader) -> SignalRef:
     a = reader.u32("signal ref field a")
     b = reader.u32("signal ref field b")
     names = {
+        0: "Disconnected",
         1: "ThisGate",
         2: "InputPort",
         3: "ChildOutput",
@@ -110,6 +111,7 @@ def read_signal_ref(reader: Reader) -> SignalRef:
 
 def write_signal_ref(writer: Writer, signal: SignalRef) -> None:
     kinds = {
+        "Disconnected": (0, 0, 0, 0),
         "ThisGate": (1, 0, signal.a, 0),
         "InputPort": (2, 0, signal.a, 0),
         "ChildOutput": (3, 0, signal.a, signal.b),

@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
 use egui::{Color32, Pos2, Rect, Vec2};
 use foldhash::{HashMap, HashSet};
@@ -26,9 +29,21 @@ pub struct EditableComponentDef {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DanglingWire {
-    pub src: SignalRef,
-    pub target: WirePoint,
+pub enum DanglingWire {
+    Destination {
+        src: SignalRef,
+        target: WirePoint,
+    },
+    Source {
+        target: WireEndpoint,
+        source: WirePoint,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DanglingWireEnd {
+    Source,
+    Destination,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -594,7 +609,7 @@ impl EditorDocument {
         let mut after_component = before_component.clone();
         after_component
             .dangling_wires
-            .push(DanglingWire { src, target: point });
+            .push(DanglingWire::Destination { src, target: point });
         self.apply_component_edit(component, before_component, after_component)?;
         Ok(true)
     }
@@ -617,14 +632,19 @@ impl EditorDocument {
             .cloned()
             .ok_or_else(|| format!("missing component {:?}", component))?;
         let mut after_component = before_component.clone();
-        let Some(wire) = after_component
-            .dangling_wires
-            .iter_mut()
-            .find(|wire| wire.src == src && wire.target == from_point)
-        else {
+        let Some(wire) = after_component.dangling_wires.iter_mut().find(|wire| {
+            matches!(
+                wire,
+                DanglingWire::Destination { src: wire_src, target }
+                    if *wire_src == src && *target == from_point
+            )
+        }) else {
             return Ok(false);
         };
-        wire.target = to_point;
+        let DanglingWire::Destination { target, .. } = wire else {
+            return Ok(false);
+        };
+        *target = to_point;
         self.apply_component_edit(component, before_component, after_component)?;
         Ok(true)
     }
@@ -646,11 +666,13 @@ impl EditorDocument {
             .cloned()
             .ok_or_else(|| format!("missing component {:?}", component))?;
         let mut after_component = before_component.clone();
-        let Some(index) = after_component
-            .dangling_wires
-            .iter()
-            .position(|wire| wire.src == signal && wire.target == point)
-        else {
+        let Some(index) = after_component.dangling_wires.iter().position(|wire| {
+            matches!(
+                wire,
+                DanglingWire::Destination { src, target }
+                    if *src == signal && *target == point
+            )
+        }) else {
             return Ok(None);
         };
         if assign_target_source(&mut after_plan, &mut after_component, to, signal).is_err() {
@@ -670,6 +692,7 @@ impl EditorDocument {
         from: WireEndpoint,
         to: WireEndpoint,
         point: WirePoint,
+        dangling_end: DanglingWireEnd,
     ) -> Result<bool, String> {
         let (plan_id, mut after_plan) = self.plan_for_component(component)?;
         let before_plan = after_plan.clone();
@@ -687,9 +710,19 @@ impl EditorDocument {
         if clear_target_source(&mut after_plan, &mut after_component, to).is_err() {
             return Ok(false);
         }
-        after_component.dangling_wires.push(DanglingWire {
-            src: current_signal,
-            target: point,
+        after_component
+            .layout
+            .wires
+            .retain(|wire| !(wire.from == from && wire.to == to));
+        after_component.dangling_wires.push(match dangling_end {
+            DanglingWireEnd::Source => DanglingWire::Source {
+                target: to,
+                source: point,
+            },
+            DanglingWireEnd::Destination => DanglingWire::Destination {
+                src: current_signal,
+                target: point,
+            },
         });
         self.apply_plan_component_edits(
             vec![(plan_id, before_plan, after_plan)],
@@ -1327,6 +1360,7 @@ fn source_gate_of_ref(
         .component(component_id)
         .ok_or_else(|| format!("missing component {:?}", component_id))?;
     match signal {
+        SignalRef::Disconnected => Err("disconnected signal has no source gate".to_owned()),
         SignalRef::ThisGate(gate) => Ok((component_node_id(component_id), gate)),
         SignalRef::InputPort(port) => {
             let plan = doc
@@ -1567,7 +1601,7 @@ fn orth_wire_points(start: Option<Pos2>, end: Option<Pos2>) -> Option<Vec<Pos2>>
     ])
 }
 
-fn palette_color(index: usize) -> Color32 {
+fn palette_color(index: u64) -> Color32 {
     const PALETTE: [Color32; 8] = [
         Color32::from_rgb(96, 214, 184),
         Color32::from_rgb(250, 176, 91),
@@ -1578,7 +1612,14 @@ fn palette_color(index: usize) -> Color32 {
         Color32::from_rgb(105, 234, 108),
         Color32::from_rgb(255, 146, 103),
     ];
-    PALETTE[index % PALETTE.len()]
+    PALETTE[index as usize % PALETTE.len()]
+}
+
+fn wire_color(from: WireEndpoint, to: Option<WireEndpoint>) -> Color32 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    from.hash(&mut hasher);
+    to.hash(&mut hasher);
+    palette_color(hasher.finish())
 }
 
 pub(crate) const WIRE_POINT_UNITS_PER_CELL: f32 = 256.0;
@@ -1884,7 +1925,12 @@ impl EditorDocument {
         let mut wires = Vec::new();
 
         for (target_gate, gate) in plan.ordered_gates() {
-            for (input_i, source_ref) in gate.input_refs().into_iter().flatten().enumerate() {
+            for (input_i, source_ref) in gate.input_refs().into_iter().enumerate() {
+                let Some(source_ref) =
+                    source_ref.filter(|signal| *signal != SignalRef::Disconnected)
+                else {
+                    continue;
+                };
                 wires.push(ExpectedWire {
                     layout: WireLayout {
                         from: signal_to_wire_endpoint(source_ref),
@@ -1950,7 +1996,7 @@ fn build_component_wires(
         if let Some(points) = wire_points(layout, lookup) {
             wires.push(VisualWire {
                 source_gate: expected_wire.source_gate,
-                color: palette_color(wires.len()),
+                color: wire_color(layout.from, Some(layout.to)),
                 points,
                 from: Some(layout.from),
                 to: Some(layout.to),
@@ -1959,17 +2005,36 @@ fn build_component_wires(
         }
     }
     for dangling in &component.dangling_wires {
-        if let Some(start) = lookup.anchor(signal_to_wire_endpoint(dangling.src)) {
-            let end = local_wire_point_to_pos(&dangling.target);
-            if let Some(points) = orth_wire_points(Some(start), Some(end)) {
-                wires.push(VisualWire {
-                    source_gate: source_gate_of_ref(component_id, dangling.src, ctx, doc).ok(),
-                    color: palette_color(wires.len()),
-                    points,
-                    from: Some(signal_to_wire_endpoint(dangling.src)),
-                    to: None,
-                    bends: Vec::new(),
-                });
+        match *dangling {
+            DanglingWire::Destination { src, target } => {
+                if let Some(start) = lookup.anchor(signal_to_wire_endpoint(src)) {
+                    let end = local_wire_point_to_pos(&target);
+                    if let Some(points) = orth_wire_points(Some(start), Some(end)) {
+                        wires.push(VisualWire {
+                            source_gate: source_gate_of_ref(component_id, src, ctx, doc).ok(),
+                            color: wire_color(signal_to_wire_endpoint(src), None),
+                            points,
+                            from: Some(signal_to_wire_endpoint(src)),
+                            to: None,
+                            bends: Vec::new(),
+                        });
+                    }
+                }
+            }
+            DanglingWire::Source { target, source } => {
+                if let Some(end) = lookup.anchor(target) {
+                    let start = local_wire_point_to_pos(&source);
+                    if let Some(points) = orth_wire_points(Some(start), Some(end)) {
+                        wires.push(VisualWire {
+                            source_gate: None,
+                            color: wire_color(target, None),
+                            points,
+                            from: None,
+                            to: Some(target),
+                            bends: Vec::new(),
+                        });
+                    }
+                }
             }
         }
     }
@@ -1978,6 +2043,7 @@ fn build_component_wires(
 
 fn signal_to_wire_endpoint(signal: SignalRef) -> WireEndpoint {
     match signal {
+        SignalRef::Disconnected => panic!("disconnected signal has no wire endpoint"),
         SignalRef::ThisGate(gate) => WireEndpoint::GateOutput(gate),
         SignalRef::InputPort(port) => WireEndpoint::ComponentInput(port),
         SignalRef::ChildOutput { child, port } => WireEndpoint::ChildOutput { child, port },
@@ -2009,6 +2075,7 @@ fn target_signal_ref(
             .gates
             .get(&gate)
             .and_then(|gate| gate.input_refs().get(input as usize).copied().flatten())
+            .filter(|signal| *signal != SignalRef::Disconnected)
             .ok_or_else(|| format!("missing gate input {:?}:{input}", gate)),
         WireEndpoint::ChildInput { child, port } => component
             .child_input_connections
@@ -2037,7 +2104,7 @@ fn optional_target_signal_ref(
             .get(&gate)
             .and_then(|gate| gate.input_refs().get(input as usize).copied().flatten())
             .ok_or_else(|| format!("missing gate input {:?}:{input}", gate))
-            .map(Some),
+            .map(|signal| (signal != SignalRef::Disconnected).then_some(signal)),
         WireEndpoint::ChildInput { child, port } => Ok(component
             .child_input_connections
             .iter()
@@ -2106,11 +2173,19 @@ fn assign_target_source(
 }
 
 fn clear_target_source(
-    _plan: &mut ComponentPlan,
+    plan: &mut ComponentPlan,
     component: &mut EditableComponentDef,
     target: WireEndpoint,
 ) -> Result<(), String> {
     match target {
+        WireEndpoint::GateInput { gate, input } => {
+            let gate_ref = plan
+                .gates
+                .get_mut(&gate)
+                .ok_or_else(|| format!("missing gate {:?}", gate))?;
+            *gate_ref = set_gate_input_ref(*gate_ref, input as usize, SignalRef::Disconnected)?;
+            Ok(())
+        }
         WireEndpoint::ChildInput { child, port } => {
             let before_len = component.child_input_connections.len();
             component
@@ -2121,7 +2196,7 @@ fn clear_target_source(
             }
             Ok(())
         }
-        WireEndpoint::GateInput { .. } | WireEndpoint::ComponentOutput(_) => {
+        WireEndpoint::ComponentOutput(_) => {
             Err(format!("target {:?} cannot be disconnected", target))
         }
         _ => Err(format!("invalid wire target {:?}", target)),
@@ -2538,6 +2613,7 @@ mod tests {
                         port: INPUT_A,
                     },
                     WirePoint { x: 7, y: 9 },
+                    DanglingWireEnd::Destination,
                 )
                 .expect("detach should succeed")
         );
@@ -2546,10 +2622,50 @@ mod tests {
         assert_eq!(component.child_input_connections.len(), 1);
         assert_eq!(component.dangling_wires.len(), 1);
         assert_eq!(
-            component.dangling_wires[0].src,
-            SignalRef::ThisGate(GateId(0))
+            component.dangling_wires[0],
+            DanglingWire::Destination {
+                src: SignalRef::ThisGate(GateId(0)),
+                target: WirePoint { x: 7, y: 9 },
+            }
         );
-        assert_eq!(component.dangling_wires[0].target, WirePoint { x: 7, y: 9 });
+    }
+
+    #[test]
+    fn detach_gate_input_leaves_input_disconnected_and_wire_dangling() {
+        let mut document = sample_document();
+
+        assert!(
+            document
+                .detach_wire(
+                    ComponentDefId(0),
+                    WireEndpoint::GateOutput(GateId(0)),
+                    WireEndpoint::GateInput {
+                        gate: GateId(2),
+                        input: 0,
+                    },
+                    WirePoint { x: 5, y: 6 },
+                    DanglingWireEnd::Source,
+                )
+                .expect("detach should succeed")
+        );
+
+        let component = document.component(ComponentDefId(0)).unwrap();
+        let plan = document.plan(component.plan).unwrap();
+        assert_eq!(
+            plan.gate(GateId(2)).unwrap().input_refs()[0],
+            Some(SignalRef::Disconnected)
+        );
+        assert_eq!(component.dangling_wires.len(), 1);
+        assert_eq!(
+            component.dangling_wires[0],
+            DanglingWire::Source {
+                target: WireEndpoint::GateInput {
+                    gate: GateId(2),
+                    input: 0,
+                },
+                source: WirePoint { x: 5, y: 6 },
+            }
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use egui::{Color32, Pos2, Rect, Vec2};
 
 use crate::{
-    editor::{local_wire_point_to_pos, pos_to_wire_point},
+    editor::{DanglingWireEnd, local_wire_point_to_pos, pos_to_wire_point},
     gate_plans::{ChildId, GateId, NodeId, WireEndpoint, WirePoint},
     ui_config::CELL,
     visual_ui::{
@@ -78,12 +78,19 @@ pub enum EditSceneAction {
         from: WireEndpoint,
         to: WireEndpoint,
         point: WirePoint,
+        dangling_end: DanglingWireEnd,
     },
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EditInteractionState {
     drag: Option<DragState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditScenePreviewChange {
+    Scene,
+    Wires,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -462,11 +469,20 @@ fn finish_wire_endpoint_drag(
     }
     match drag.side {
         WireEndpointSide::Source if drag.preview_from != Some(drag.original_from) => {
-            Some(EditSceneAction::RewireWireSource {
-                from: drag.original_from,
-                to: drag.original_to,
-                new_from: drag.preview_from?,
-            })
+            if let Some(new_from) = drag.preview_from {
+                Some(EditSceneAction::RewireWireSource {
+                    from: drag.original_from,
+                    to: drag.original_to,
+                    new_from,
+                })
+            } else {
+                Some(EditSceneAction::DetachWire {
+                    from: drag.original_from,
+                    to: drag.original_to,
+                    point: pos_to_wire_point(pointer_world),
+                    dangling_end: DanglingWireEnd::Source,
+                })
+            }
         }
         WireEndpointSide::Target if drag.preview_to != Some(drag.original_to) => {
             if let Some(new_to) = drag.preview_to {
@@ -480,6 +496,7 @@ fn finish_wire_endpoint_drag(
                     from: drag.original_from,
                     to: drag.original_to,
                     point: pos_to_wire_point(pointer_world),
+                    dangling_end: DanglingWireEnd::Destination,
                 })
             }
         }
@@ -542,26 +559,126 @@ pub fn apply_edit_scene_drag_preview(
     scene: &mut FocusedScene,
     state: &EditInteractionState,
     pointer_world: Option<Pos2>,
-) -> bool {
+) -> Option<EditScenePreviewChange> {
     match state.drag {
-        Some(DragState::Child(drag)) => preview_child_drag(scene, drag),
-        Some(DragState::Gate(drag)) => preview_gate_drag(scene, drag),
+        Some(DragState::Child(drag)) => {
+            preview_child_drag(scene, drag).then_some(EditScenePreviewChange::Scene)
+        }
+        Some(DragState::Gate(drag)) => {
+            preview_gate_drag(scene, drag).then_some(EditScenePreviewChange::Scene)
+        }
         Some(DragState::WireEndpoint(drag)) => {
             let Some(pointer_world) = pointer_world else {
-                return false;
+                return None;
             };
             preview_wire_endpoint_drag(scene, drag, pointer_world)
+                .then_some(EditScenePreviewChange::Wires)
         }
         Some(DragState::NewWire(drag)) => {
             let Some(pointer_world) = pointer_world else {
-                return false;
+                return None;
             };
             preview_new_wire_drag(scene, drag, pointer_world)
+                .then_some(EditScenePreviewChange::Wires)
         }
-        Some(DragState::DanglingWire(drag)) => preview_dangling_wire_drag(scene, drag),
-        Some(DragState::WireBend(drag)) => preview_wire_bend_drag(scene, drag),
-        None => false,
+        Some(DragState::DanglingWire(drag)) => {
+            preview_dangling_wire_drag(scene, drag).then_some(EditScenePreviewChange::Wires)
+        }
+        Some(DragState::WireBend(drag)) => {
+            preview_wire_bend_drag(scene, drag).then_some(EditScenePreviewChange::Wires)
+        }
+        None => None,
     }
+}
+
+pub fn apply_edit_scene_detach_wire(
+    scene: &mut FocusedScene,
+    from: WireEndpoint,
+    to: WireEndpoint,
+    point: WirePoint,
+    dangling_end: DanglingWireEnd,
+) -> bool {
+    let floating_point = local_wire_point_to_pos(&point);
+    let (start, end, next_from, next_to) = match dangling_end {
+        DanglingWireEnd::Source => {
+            let Some(end) = endpoint_anchor(scene, to) else {
+                return false;
+            };
+            (floating_point, end, None, Some(to))
+        }
+        DanglingWireEnd::Destination => {
+            let Some(start) = endpoint_anchor(scene, from) else {
+                return false;
+            };
+            (start, floating_point, Some(from), None)
+        }
+    };
+    let Some(wire) = scene
+        .wires
+        .iter_mut()
+        .find(|wire| wire.from == Some(from) && wire.to == Some(to))
+    else {
+        return false;
+    };
+    wire.points = wire_points_from_layout(start, end, &[]);
+    wire.from = next_from;
+    wire.to = next_to;
+    wire.bends.clear();
+    true
+}
+
+pub fn apply_edit_scene_create_dangling_wire(
+    scene: &mut FocusedScene,
+    from: WireEndpoint,
+    point: WirePoint,
+) -> bool {
+    let Some(start) = endpoint_anchor(scene, from) else {
+        return false;
+    };
+    let end = local_wire_point_to_pos(&point);
+    let points = wire_points_from_layout(start, end, &[]);
+    if let Some(wire) = scene
+        .wires
+        .iter_mut()
+        .find(|wire| wire.from == Some(from) && wire.to.is_none())
+    {
+        wire.points = points;
+    } else {
+        scene.wires.push(VisualWire {
+            source_gate: None,
+            color: Color32::from_rgb(120, 180, 255),
+            points,
+            from: Some(from),
+            to: None,
+            bends: Vec::new(),
+        });
+    }
+    true
+}
+
+pub fn apply_edit_scene_move_dangling_wire(
+    scene: &mut FocusedScene,
+    from: WireEndpoint,
+    from_point: WirePoint,
+    to_point: WirePoint,
+) -> bool {
+    let Some(start) = endpoint_anchor(scene, from) else {
+        return false;
+    };
+    let old_end = local_wire_point_to_pos(&from_point);
+    let new_end = local_wire_point_to_pos(&to_point);
+    let Some(wire) = scene.wires.iter_mut().find(|wire| {
+        wire.from == Some(from)
+            && wire.to.is_none()
+            && wire
+                .points
+                .last()
+                .is_some_and(|point| *point == old_end || *point == new_end)
+    }) else {
+        return false;
+    };
+    wire.points = wire_points_from_layout(start, new_end, &[]);
+    true
 }
 
 fn preview_child_drag(scene: &mut FocusedScene, drag: ChildDragState) -> bool {
@@ -1217,11 +1334,14 @@ mod tests {
         );
 
         let mut preview_scene = scene.clone();
-        assert!(apply_edit_scene_drag_preview(
-            &mut preview_scene,
-            &interaction,
-            Some(start + Vec2::new(-CELL * 1.2, 0.0)),
-        ));
+        assert_eq!(
+            apply_edit_scene_drag_preview(
+                &mut preview_scene,
+                &interaction,
+                Some(start + Vec2::new(-CELL * 1.2, 0.0)),
+            ),
+            Some(EditScenePreviewChange::Scene)
+        );
 
         let preview_child = preview_scene
             .children
@@ -1382,6 +1502,57 @@ mod tests {
                     input: 0,
                 },
                 new_from: WireEndpoint::GateOutput(GateId(1)),
+            })
+        );
+    }
+
+    #[test]
+    fn source_endpoint_release_off_endpoint_detaches_wire() {
+        let viewport = ViewportState::default();
+        let mut interaction = EditInteractionState::default();
+        let scene = simple_wire_scene();
+        let start = gate_output_anchor(
+            scene
+                .gates
+                .iter()
+                .find(|gate| gate.id == GateId(0))
+                .unwrap(),
+        );
+        let dangling_end = start + Vec2::new(-CELL, 0.0);
+
+        assert_eq!(
+            interact_edit_scene(
+                &scene,
+                &viewport,
+                &drag_output(start, DragPhase::Started),
+                &mut interaction,
+            ),
+            None
+        );
+        assert_eq!(
+            interact_edit_scene(
+                &scene,
+                &viewport,
+                &drag_output(dangling_end, DragPhase::Dragging),
+                &mut interaction,
+            ),
+            None
+        );
+        assert_eq!(
+            interact_edit_scene(
+                &scene,
+                &viewport,
+                &drag_output(dangling_end, DragPhase::Stopped),
+                &mut interaction,
+            ),
+            Some(EditSceneAction::DetachWire {
+                from: WireEndpoint::GateOutput(GateId(0)),
+                to: WireEndpoint::GateInput {
+                    gate: GateId(2),
+                    input: 0,
+                },
+                point: pos_to_wire_point(dangling_end),
+                dangling_end: DanglingWireEnd::Source,
             })
         );
     }

@@ -1,7 +1,10 @@
 use egui::{Color32, PointerButton, Pos2, Rect, Sense, Ui, Vec2};
 use foldhash::HashMap;
 use rayon::prelude::*;
-use std::sync::Arc;
+use std::{
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
 use crate::gate_plans::{
     ChildId, ChildPlacement, CompileError, Component, ComponentLayout, ComponentPlans, Gate,
@@ -573,6 +576,12 @@ fn source_gate_of_ref(
     by_id: &HashMap<NodeId, &Component>,
 ) -> Result<(NodeId, GateId), CompileError> {
     match signal {
+        SignalRef::Disconnected => Err(CompileError::InvalidGateRef {
+            from_node: node.id,
+            from_gate: GateId(u32::MAX),
+            bad_ref: signal,
+            reason: "disconnected signal has no source gate",
+        }),
         SignalRef::ThisGate(gate) => Ok((node.id, gate)),
         SignalRef::InputPort(port) => {
             let plan = plans
@@ -729,7 +738,7 @@ fn build_component_wires(
         if let Some(points) = wire_points(layout, lookup) {
             wires.push(VisualWire {
                 source_gate: expected_wire.source_gate,
-                color: palette_color(wires.len()),
+                color: wire_color(layout.from, Some(layout.to)),
                 points,
                 from: Some(layout.from),
                 to: Some(layout.to),
@@ -750,7 +759,11 @@ fn expected_component_wires(
     let mut wires = Vec::new();
 
     for (target_gate, gate) in plan.ordered_gates() {
-        for (input_i, source_ref) in gate.input_refs().into_iter().flatten().enumerate() {
+        for (input_i, source_ref) in gate.input_refs().into_iter().enumerate() {
+            let Some(source_ref) = source_ref.filter(|signal| *signal != SignalRef::Disconnected)
+            else {
+                continue;
+            };
             wires.push(ExpectedWire {
                 layout: WireLayout {
                     from: signal_to_wire_endpoint(source_ref),
@@ -795,6 +808,7 @@ fn expected_component_wires(
 
 fn signal_to_wire_endpoint(signal: SignalRef) -> WireEndpoint {
     match signal {
+        SignalRef::Disconnected => panic!("disconnected signal has no wire endpoint"),
         SignalRef::ThisGate(gate) => WireEndpoint::GateOutput(gate),
         SignalRef::InputPort(port) => WireEndpoint::ComponentInput(port),
         SignalRef::ChildOutput { child, port } => WireEndpoint::ChildOutput { child, port },
@@ -835,7 +849,7 @@ fn collect_components<'a>(root: &'a Component) -> HashMap<NodeId, &'a Component>
     out
 }
 
-fn palette_color(index: usize) -> Color32 {
+fn palette_color(index: u64) -> Color32 {
     const PALETTE: [Color32; 8] = [
         Color32::from_rgb(96, 214, 184),
         Color32::from_rgb(250, 176, 91),
@@ -846,5 +860,12 @@ fn palette_color(index: usize) -> Color32 {
         Color32::from_rgb(105, 234, 108),
         Color32::from_rgb(255, 146, 103),
     ];
-    PALETTE[index % PALETTE.len()]
+    PALETTE[index as usize % PALETTE.len()]
+}
+
+fn wire_color(from: WireEndpoint, to: Option<WireEndpoint>) -> Color32 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    from.hash(&mut hasher);
+    to.hash(&mut hasher);
+    palette_color(hasher.finish())
 }
